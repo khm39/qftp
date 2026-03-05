@@ -42,11 +42,13 @@ fn main() -> Result<()> {
     let cert_pem = cert.cert.pem();
     let key_pem = cert.key_pair.serialize_pem();
 
-    // Write cert and key to temp files for quiche.
-    let cert_path = std::env::temp_dir().join("qftp-server-cert.pem");
-    let key_path = std::env::temp_dir().join("qftp-server-key.pem");
+    // Write cert and key to temp files for quiche with restrictive permissions.
+    let cert_path = std::env::temp_dir().join(format!("qftp-server-cert-{}.pem", std::process::id()));
+    let key_path = std::env::temp_dir().join(format!("qftp-server-key-{}.pem", std::process::id()));
     fs::write(&cert_path, &cert_pem).context("failed to write cert PEM")?;
     fs::write(&key_path, &key_pem).context("failed to write key PEM")?;
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+        .context("failed to set key file permissions")?;
 
     let mut config = create_server_config(
         cert_path.to_str().unwrap(),
