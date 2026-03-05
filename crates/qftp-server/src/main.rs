@@ -12,6 +12,8 @@ use qftp_common::transport::*;
 mod handler;
 
 const SERVER: Token = Token(0);
+/// Maximum file size for Put operations (1 GB).
+const MAX_UPLOAD_SIZE: u64 = 1024 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "qftp-server", about = "QUIC File Transfer Protocol Server")]
@@ -204,6 +206,18 @@ fn main() -> Result<()> {
                                 }
 
                                 Request::Put { ref path, size, mode } => {
+                                    if size > MAX_UPLOAD_SIZE {
+                                        send_message(
+                                            c,
+                                            stream_id,
+                                            &Response::Err(format!(
+                                                "Upload too large: {} bytes (max {} bytes)",
+                                                size, MAX_UPLOAD_SIZE
+                                            )),
+                                        )?;
+                                        *state = StreamState::Done;
+                                        continue;
+                                    }
                                     let file_path = match handler::resolve_parent(&cwd, &root, path) {
                                         Ok(p) => p,
                                         Err(e) => {
