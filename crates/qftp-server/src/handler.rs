@@ -5,16 +5,19 @@ use std::time::UNIX_EPOCH;
 
 use qftp_common::protocol::{DirEntry, FileStat, Request, Response};
 
-/// Resolve a user-supplied path against the current working directory and root,
-/// returning an absolute canonical path that is guaranteed to be within root.
-pub fn resolve(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String> {
-    let raw = if user_path.starts_with('/') {
+/// Build the raw (non-canonical) path from a user-supplied string.
+fn raw_path(cwd: &Path, root: &Path, user_path: &str) -> PathBuf {
+    if user_path.starts_with('/') {
         root.join(user_path.trim_start_matches('/'))
     } else {
         cwd.join(user_path)
-    };
+    }
+}
 
-    let canonical = raw
+/// Resolve a user-supplied path against the current working directory and root,
+/// returning an absolute canonical path that is guaranteed to be within root.
+pub fn resolve(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String> {
+    let canonical = raw_path(cwd, root, user_path)
         .canonicalize()
         .map_err(|e| format!("No such file or directory: {e}"))?;
 
@@ -28,11 +31,7 @@ pub fn resolve(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, Stri
 /// Resolve a path whose final component may not yet exist (e.g. mkdir target,
 /// rename destination). The parent directory must exist and be within root.
 pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String> {
-    let raw = if user_path.starts_with('/') {
-        root.join(user_path.trim_start_matches('/'))
-    } else {
-        cwd.join(user_path)
-    };
+    let raw = raw_path(cwd, root, user_path);
 
     let file_name = raw
         .file_name()
