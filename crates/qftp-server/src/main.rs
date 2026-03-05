@@ -128,6 +128,18 @@ fn main() -> Result<()> {
 
                 log::info!("New QUIC connection from {}", from);
                 conn = Some(new_conn);
+            } else {
+                // Check if this is an Initial packet from a different client.
+                // Currently only one connection is supported at a time.
+                if let Ok(hdr) = quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+                    if hdr.ty == quiche::Type::Initial {
+                        log::warn!(
+                            "Rejecting new connection from {} (server only supports one concurrent connection)",
+                            from
+                        );
+                        continue;
+                    }
+                }
             }
 
             // Feed the packet into the connection.
