@@ -1,101 +1,101 @@
 # CLAUDE.md
 
-## Project Overview
+## プロジェクト概要
 
-QFTP (QUIC File Transfer Protocol) — a Rust file transfer system built on QUIC, providing secure file operations over UDP with TLS encryption. Uses the `quiche` library for QUIC transport and `bincode` for binary protocol serialization.
+QFTP (QUIC File Transfer Protocol) — QUICプロトコル上に構築されたRust製ファイル転送システム。UDP + TLS暗号化による安全なファイル操作を提供する。QUICトランスポートに`quiche`、バイナリプロトコルのシリアライズに`bincode`を使用。
 
-## Repository Structure
+## リポジトリ構成
 
 ```
 crates/
-├── qftp-common/       # Shared protocol definitions & QUIC transport layer
+├── qftp-common/       # 共通プロトコル定義 & QUICトランスポート層
 │   └── src/
-│       ├── lib.rs         # Re-exports protocol and transport modules
-│       ├── protocol.rs    # Request/Response enums, DirEntry, FileStat types
-│       └── transport.rs   # Length-prefixed messaging, QUIC config helpers
-├── qftp-server/       # File server (single-connection, mio event loop)
+│       ├── lib.rs         # protocol・transportモジュールの再エクスポート
+│       ├── protocol.rs    # Request/Responseのenum、DirEntry、FileStat型
+│       └── transport.rs   # 長さプレフィクス付きメッセージング、QUIC設定ヘルパー
+├── qftp-server/       # ファイルサーバー（単一接続、mioイベントループ）
 │   └── src/
-│       ├── main.rs        # Server startup, QUIC connection handling, event loop
-│       └── handler.rs     # Per-command request handlers (ls, get, put, etc.)
-└── qftp-client/       # Interactive client with REPL
+│       ├── main.rs        # サーバー起動、QUIC接続管理、イベントループ
+│       └── handler.rs     # コマンド別リクエストハンドラー（ls, get, put等）
+└── qftp-client/       # 対話型クライアント（REPL）
     └── src/
-        ├── main.rs        # Client startup, QUIC connection, stream management
-        └── repl.rs        # Command parsing, output formatting
+        ├── main.rs        # クライアント起動、QUIC接続、ストリーム管理
+        └── repl.rs        # コマンド解析、出力フォーマット
 ```
 
-## Build & Run
+## ビルド・実行
 
 ```sh
-# Build all crates
+# 全クレートをビルド
 cargo build
 
-# Build in release mode
+# リリースモードでビルド
 cargo build --release
 
-# Run the server (serves files from a root directory)
+# サーバー起動（指定ディレクトリをルートとして公開）
 cargo run -p qftp-server -- --root /path/to/serve
 
-# Run the client
+# クライアント起動
 cargo run -p qftp-client -- --host 127.0.0.1
 
-# Check code compiles without building
+# コンパイルチェックのみ
 cargo check
 
-# Run clippy lints
+# clippyリント実行
 cargo clippy --all-targets
 ```
 
-## Testing
+## テスト
 
-No automated tests exist yet. Testing is done manually by running the server and client.
+自動テストは未整備。サーバーとクライアントを手動で起動して動作確認を行う。
 
-## Architecture & Key Conventions
+## アーキテクチャと主要な設計方針
 
-### Protocol (`qftp-common/src/protocol.rs`)
-- Enum-based `Request`/`Response` with serde + bincode serialization
-- Supported commands: Ls, Cd, Pwd, Get, Put, Mkdir, Rmdir, Rm, Rename, Chmod, Stat, Quit
-- Structured types: `DirEntry` (directory listing), `FileStat` (file metadata)
+### プロトコル (`qftp-common/src/protocol.rs`)
+- enum型の`Request`/`Response`をserde + bincodeでシリアライズ
+- 対応コマンド: Ls, Cd, Pwd, Get, Put, Mkdir, Rmdir, Rm, Rename, Chmod, Stat, Quit
+- 構造化型: `DirEntry`（ディレクトリ一覧）、`FileStat`（ファイルメタデータ）
 
-### Transport (`qftp-common/src/transport.rs`)
-- Length-prefixed framing: 4-byte big-endian u32 header + payload
-- Max message size: 16 MB
-- Stream buffer: 64 KB chunks (`STREAM_BUF_SIZE`)
-- QUIC connection limits: 10 MB total, 1 MB per stream
-- ALPN protocol identifier: `"qftp"`
-- 30-second idle timeout
+### トランスポート層 (`qftp-common/src/transport.rs`)
+- 長さプレフィクス付きフレーミング: 4バイトビッグエンディアンu32ヘッダー + ペイロード
+- 最大メッセージサイズ: 16 MB
+- ストリームバッファ: 64 KBチャンク (`STREAM_BUF_SIZE`)
+- QUIC接続制限: 合計10 MB、ストリームあたり1 MB
+- ALPNプロトコル識別子: `"qftp"`
+- アイドルタイムアウト: 30秒
 
-### Server (`qftp-server/`)
-- Single connection at a time (rejects concurrent connections)
-- Per-stream state machine: `ReadingRequest` → `ReadingFileData` → `Done`
-- Root directory sandboxing via path canonicalization — all paths are resolved and verified against the root
-- Max upload size: 1 GB
-- Self-signed TLS certificates generated at startup via `rcgen`
+### サーバー (`qftp-server/`)
+- 同時接続数1（並行接続は拒否）
+- ストリームごとの状態機械: `ReadingRequest` → `ReadingFileData` → `Done`
+- ルートディレクトリのサンドボックス化 — パスの正規化により全パスをルート配下に制限
+- 最大アップロードサイズ: 1 GB
+- 起動時に`rcgen`で自己署名TLS証明書を自動生成
 
-### Client (`qftp-client/`)
-- Interactive REPL using `rustyline` with history support
-- Client-initiated bidirectional QUIC streams (IDs: 0, 4, 8, ...)
-- Pretty-printed output with human-readable file sizes and Unix permissions
+### クライアント (`qftp-client/`)
+- `rustyline`によるREPL（履歴機能付き）
+- クライアント起点の双方向QUICストリーム（ID: 0, 4, 8, ...）
+- 人間が読みやすいファイルサイズ（KB/MB/GB）とUnixパーミッション表示
 
-## Code Style
+## コードスタイル
 
 - **Rust edition 2021**
-- Error handling: `anyhow::Result` for application errors, `thiserror` for typed errors in common crate
-- Logging: `log` macros (`info!`, `warn!`, `error!`) with `env_logger`
-- CLI arguments: `clap` with derive macros
-- Idiomatic Rust: pattern matching, `?` error propagation, enum-based state machines
-- Commit messages: imperative mood, descriptive (e.g., "Extract config into shared function", "Fix ls to default to current directory")
+- エラー処理: アプリケーションエラーには`anyhow::Result`、commonクレートの型付きエラーには`thiserror`
+- ログ: `log`マクロ (`info!`, `warn!`, `error!`) + `env_logger`
+- CLI引数: `clap` deriveマクロ
+- Rustのイディオム: パターンマッチ、`?`によるエラー伝播、enum型の状態機械
+- コミットメッセージ: 命令形、内容を具体的に記述（例: "Extract config into shared function", "Fix ls to default to current directory"）
 
-## Key Constants
+## 主要な定数
 
-| Constant | Value | Location |
+| 定数 | 値 | 定義場所 |
 |---|---|---|
 | `MAX_MESSAGE_SIZE` | 16 MB | `transport.rs` |
 | `STREAM_BUF_SIZE` | 64 KB | `transport.rs` |
 | `MAX_UPLOAD_SIZE` | 1 GB | `handler.rs` |
-| QUIC max data | 10 MB | `transport.rs` |
-| QUIC max stream data | 1 MB | `transport.rs` |
-| Idle timeout | 30 s | `transport.rs` |
+| QUIC最大データ量 | 10 MB | `transport.rs` |
+| QUICストリーム最大データ量 | 1 MB | `transport.rs` |
+| アイドルタイムアウト | 30秒 | `transport.rs` |
 
-## Dependencies
+## 依存クレート
 
-Core: `quiche` (QUIC), `serde`+`bincode` (serialization), `mio` (async I/O), `clap` (CLI), `ring` (crypto), `anyhow`/`thiserror` (errors), `rcgen` (certs), `rustyline` (REPL)
+主要: `quiche`（QUIC）、`serde`+`bincode`（シリアライズ）、`mio`（非同期I/O）、`clap`（CLI）、`ring`（暗号）、`anyhow`/`thiserror`（エラー処理）、`rcgen`（証明書生成）、`rustyline`（REPL）
