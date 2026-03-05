@@ -19,6 +19,9 @@ const CLIENT: Token = Token(0);
 struct Args {
     #[arg(long, default_value = "127.0.0.1:4433")]
     host: String,
+    /// Verify the server's TLS certificate (disable for self-signed certs).
+    #[arg(long, default_value = "false")]
+    verify_peer: bool,
 }
 
 fn poll_response(
@@ -90,7 +93,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let mut config = create_client_config()?;
+    let mut config = create_client_config(args.verify_peer)?;
 
     let peer_addr = args.host.parse().context("failed to parse host address")?;
 
@@ -137,6 +140,8 @@ fn main() -> Result<()> {
     println!("Connected to {}", args.host);
 
     let mut rl = rustyline::DefaultEditor::new()?;
+    // QUIC client-initiated bidirectional streams use IDs 0, 4, 8, ...
+    // (stream_id % 4 == 0). Each command uses a fresh stream.
     let mut next_stream_id: u64 = 0;
 
     loop {
@@ -162,7 +167,7 @@ fn main() -> Result<()> {
             repl::Command::Remote(ref req) => {
                 let is_quit = matches!(req, Request::Quit);
                 send_message(&mut conn, stream_id, req)?;
-                conn.stream_send(stream_id, &[], true)?;
+                stream_send_all(&mut conn, stream_id, &[], true)?;
                 flush_egress(&mut conn, &socket)?;
                 let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
                 repl::display_response(&resp);
@@ -175,7 +180,7 @@ fn main() -> Result<()> {
                     path: remote.clone(),
                 };
                 send_message(&mut conn, stream_id, &req)?;
-                conn.stream_send(stream_id, &[], true)?;
+                stream_send_all(&mut conn, stream_id, &[], true)?;
                 flush_egress(&mut conn, &socket)?;
 
                 let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
@@ -222,7 +227,7 @@ fn main() -> Result<()> {
                     mode,
                 };
                 send_message(&mut conn, stream_id, &req)?;
-                conn.stream_send(stream_id, &file_data, true)?;
+                stream_send_all(&mut conn, stream_id, &file_data, true)?;
                 flush_egress(&mut conn, &socket)?;
                 println!("Uploading {} ({} bytes)...", remote_path, file_data.len());
                 let resp =

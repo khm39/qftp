@@ -12,6 +12,8 @@ use qftp_common::transport::*;
 mod handler;
 
 const SERVER: Token = Token(0);
+/// Maximum file size for Put operations (1 GB).
+const MAX_UPLOAD_SIZE: u64 = 1024 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "qftp-server", about = "QUIC File Transfer Protocol Server")]
@@ -40,11 +42,13 @@ fn main() -> Result<()> {
     let cert_pem = cert.cert.pem();
     let key_pem = cert.key_pair.serialize_pem();
 
-    // Write cert and key to temp files for quiche.
-    let cert_path = std::env::temp_dir().join("qftp-server-cert.pem");
-    let key_path = std::env::temp_dir().join("qftp-server-key.pem");
+    // Write cert and key to temp files for quiche with restrictive permissions.
+    let cert_path = std::env::temp_dir().join(format!("qftp-server-cert-{}.pem", std::process::id()));
+    let key_path = std::env::temp_dir().join(format!("qftp-server-key-{}.pem", std::process::id()));
     fs::write(&cert_path, &cert_pem).context("failed to write cert PEM")?;
     fs::write(&key_path, &key_pem).context("failed to write key PEM")?;
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+        .context("failed to set key file permissions")?;
 
     let mut config = create_server_config(
         cert_path.to_str().unwrap(),
@@ -128,6 +132,18 @@ fn main() -> Result<()> {
 
                 log::info!("New QUIC connection from {}", from);
                 conn = Some(new_conn);
+            } else {
+                // Check if this is an Initial packet from a different client.
+                // Currently only one connection is supported at a time.
+                if let Ok(hdr) = quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+                    if hdr.ty == quiche::Type::Initial {
+                        log::warn!(
+                            "Rejecting new connection from {} (server only supports one concurrent connection)",
+                            from
+                        );
+                        continue;
+                    }
+                }
             }
 
             // Feed the packet into the connection.
@@ -172,7 +188,7 @@ fn main() -> Result<()> {
                                                 Ok(data) => {
                                                     let size = data.len() as u64;
                                                     send_message(c, stream_id, &Response::FileReady { size })?;
-                                                    c.stream_send(stream_id, &data, true)
+                                                    stream_send_all(c, stream_id, &data, true)
                                                         .context("failed to send file data")?;
                                                 }
                                                 Err(e) => {
@@ -192,6 +208,18 @@ fn main() -> Result<()> {
                                 }
 
                                 Request::Put { ref path, size, mode } => {
+                                    if size > MAX_UPLOAD_SIZE {
+                                        send_message(
+                                            c,
+                                            stream_id,
+                                            &Response::Err(format!(
+                                                "Upload too large: {} bytes (max {} bytes)",
+                                                size, MAX_UPLOAD_SIZE
+                                            )),
+                                        )?;
+                                        *state = StreamState::Done;
+                                        continue;
+                                    }
                                     let file_path = match handler::resolve_parent(&cwd, &root, path) {
                                         Ok(p) => p,
                                         Err(e) => {
@@ -224,7 +252,9 @@ fn main() -> Result<()> {
                                             match fs::write(path, file_data) {
                                                 Ok(()) => {
                                                     let perms = fs::Permissions::from_mode(*mode);
-                                                    let _ = fs::set_permissions(path, perms);
+                                                    if let Err(e) = fs::set_permissions(path, perms) {
+                                                        log::warn!("Failed to set permissions on {}: {}", path.display(), e);
+                                                    }
                                                     send_message(c, stream_id, &Response::Ok)?;
                                                 }
                                                 Err(e) => {

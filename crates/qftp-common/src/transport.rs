@@ -3,6 +3,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const STREAM_BUF_SIZE: usize = 65536;
+/// Maximum allowed control message size (16 MB). Prevents a malicious peer from
+/// sending an enormous length prefix that causes unbounded memory allocation.
+pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Flush pending outgoing packets from the QUIC connection to the UDP socket.
 pub fn flush_egress(
@@ -64,14 +67,45 @@ pub fn send_message<T: Serialize>(
     msg: &T,
 ) -> Result<()> {
     let payload = bincode::serialize(msg).context("failed to serialize message")?;
+    anyhow::ensure!(
+        payload.len() <= MAX_MESSAGE_SIZE,
+        "message too large: {} bytes (max {})",
+        payload.len(),
+        MAX_MESSAGE_SIZE
+    );
     let len = payload.len() as u32;
     let mut data = Vec::with_capacity(4 + payload.len());
     data.extend_from_slice(&len.to_be_bytes());
     data.extend_from_slice(&payload);
 
-    conn.stream_send(stream_id, &data, false)
-        .context("stream_send failed")?;
+    stream_send_all(conn, stream_id, &data, false)?;
 
+    Ok(())
+}
+
+/// Send all bytes on a QUIC stream, handling partial writes by retrying.
+pub fn stream_send_all(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    data: &[u8],
+    fin: bool,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let is_last = offset + STREAM_BUF_SIZE >= data.len();
+        let written = conn
+            .stream_send(stream_id, &data[offset..], fin && is_last)
+            .context("stream_send failed")?;
+        offset += written;
+        if written == 0 {
+            anyhow::bail!("stream_send wrote 0 bytes, stream may be blocked");
+        }
+    }
+    // If data is empty and fin is requested, send a fin-only frame.
+    if data.is_empty() && fin {
+        conn.stream_send(stream_id, &[], true)
+            .context("stream_send fin failed")?;
+    }
     Ok(())
 }
 
@@ -103,6 +137,13 @@ pub fn recv_message<T: DeserializeOwned>(
 
     let msg_len =
         u32::from_be_bytes([stream_buf[0], stream_buf[1], stream_buf[2], stream_buf[3]]) as usize;
+
+    anyhow::ensure!(
+        msg_len <= MAX_MESSAGE_SIZE,
+        "peer sent oversized message: {} bytes (max {})",
+        msg_len,
+        MAX_MESSAGE_SIZE
+    );
 
     if stream_buf.len() < 4 + msg_len {
         return Ok(None);
@@ -152,8 +193,12 @@ pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Con
     Ok(config)
 }
 
-/// Create a QUIC client configuration (peer verification disabled).
-pub fn create_client_config() -> Result<quiche::Config> {
+/// Create a QUIC client configuration.
+///
+/// When `verify_peer` is false, certificate validation is skipped (useful for
+/// self-signed certs during development). Production deployments should set
+/// this to true.
+pub fn create_client_config(verify_peer: bool) -> Result<quiche::Config> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 
