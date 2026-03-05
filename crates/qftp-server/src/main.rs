@@ -12,6 +12,8 @@ use qftp_common::transport::*;
 mod handler;
 
 const SERVER: Token = Token(0);
+/// Maximum file size for Get/Put operations (1 GB).
+const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "qftp-server", about = "QUIC File Transfer Protocol Server")]
@@ -168,18 +170,39 @@ fn main() -> Result<()> {
                                 Request::Get { ref path } => {
                                     match handler::resolve(&cwd, &root, path) {
                                         Ok(file_path) => {
-                                            match fs::read(&file_path) {
-                                                Ok(data) => {
-                                                    let size = data.len() as u64;
-                                                    send_message(c, stream_id, &Response::FileReady { size })?;
-                                                    c.stream_send(stream_id, &data, true)
-                                                        .context("failed to send file data")?;
+                                            let meta = fs::metadata(&file_path);
+                                            match meta {
+                                                Ok(m) if m.len() > MAX_FILE_SIZE => {
+                                                    send_message(
+                                                        c,
+                                                        stream_id,
+                                                        &Response::Err(format!(
+                                                            "File too large: {} bytes (max {} bytes)",
+                                                            m.len(),
+                                                            MAX_FILE_SIZE
+                                                        )),
+                                                    )?;
                                                 }
+                                                Ok(_) => match fs::read(&file_path) {
+                                                    Ok(data) => {
+                                                        let size = data.len() as u64;
+                                                        send_message(c, stream_id, &Response::FileReady { size })?;
+                                                        c.stream_send(stream_id, &data, true)
+                                                            .context("failed to send file data")?;
+                                                    }
+                                                    Err(e) => {
+                                                        send_message(
+                                                            c,
+                                                            stream_id,
+                                                            &Response::Err(format!("Failed to read file: {e}")),
+                                                        )?;
+                                                    }
+                                                },
                                                 Err(e) => {
                                                     send_message(
                                                         c,
                                                         stream_id,
-                                                        &Response::Err(format!("Failed to read file: {e}")),
+                                                        &Response::Err(format!("Failed to stat file: {e}")),
                                                     )?;
                                                 }
                                             }
