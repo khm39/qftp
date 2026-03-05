@@ -162,7 +162,7 @@ fn main() -> Result<()> {
             repl::Command::Remote(ref req) => {
                 let is_quit = matches!(req, Request::Quit);
                 send_message(&mut conn, stream_id, req)?;
-                conn.stream_send(stream_id, &[], true)?;
+                stream_send_all(&mut conn, stream_id, &[], true)?;
                 flush_egress(&mut conn, &socket)?;
                 let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
                 repl::display_response(&resp);
@@ -175,7 +175,7 @@ fn main() -> Result<()> {
                     path: remote.clone(),
                 };
                 send_message(&mut conn, stream_id, &req)?;
-                conn.stream_send(stream_id, &[], true)?;
+                stream_send_all(&mut conn, stream_id, &[], true)?;
                 flush_egress(&mut conn, &socket)?;
 
                 let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
@@ -222,7 +222,7 @@ fn main() -> Result<()> {
                     mode,
                 };
                 send_message(&mut conn, stream_id, &req)?;
-                conn.stream_send(stream_id, &file_data, true)?;
+                stream_send_all(&mut conn, stream_id, &file_data, true)?;
                 flush_egress(&mut conn, &socket)?;
                 println!("Uploading {} ({} bytes)...", remote_path, file_data.len());
                 let resp =

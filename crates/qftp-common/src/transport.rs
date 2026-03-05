@@ -69,9 +69,34 @@ pub fn send_message<T: Serialize>(
     data.extend_from_slice(&len.to_be_bytes());
     data.extend_from_slice(&payload);
 
-    conn.stream_send(stream_id, &data, false)
-        .context("stream_send failed")?;
+    stream_send_all(conn, stream_id, &data, false)?;
 
+    Ok(())
+}
+
+/// Send all bytes on a QUIC stream, handling partial writes by retrying.
+pub fn stream_send_all(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    data: &[u8],
+    fin: bool,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let is_last = offset + STREAM_BUF_SIZE >= data.len();
+        let written = conn
+            .stream_send(stream_id, &data[offset..], fin && is_last)
+            .context("stream_send failed")?;
+        offset += written;
+        if written == 0 {
+            anyhow::bail!("stream_send wrote 0 bytes, stream may be blocked");
+        }
+    }
+    // If data is empty and fin is requested, send a fin-only frame.
+    if data.is_empty() && fin {
+        conn.stream_send(stream_id, &[], true)
+            .context("stream_send fin failed")?;
+    }
     Ok(())
 }
 

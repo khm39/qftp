@@ -172,7 +172,7 @@ fn main() -> Result<()> {
                                                 Ok(data) => {
                                                     let size = data.len() as u64;
                                                     send_message(c, stream_id, &Response::FileReady { size })?;
-                                                    c.stream_send(stream_id, &data, true)
+                                                    stream_send_all(c, stream_id, &data, true)
                                                         .context("failed to send file data")?;
                                                 }
                                                 Err(e) => {
