@@ -16,7 +16,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
     let cmd = parts[0].to_lowercase();
     match cmd.as_str() {
         "ls" | "dir" => {
-            let path = parts.get(1).unwrap_or(&".").to_string();
+            let path = parts.get(1).unwrap_or(&"").to_string();
             Some(Command::Remote(Request::Ls { path }))
         }
         "cd" => {
