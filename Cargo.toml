@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["crates/qftp-common", "crates/qftp-server", "crates/qftp-client"]
