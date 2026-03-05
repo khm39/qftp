@@ -145,12 +145,16 @@ pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Con
     Ok(config)
 }
 
-/// Create a QUIC client configuration (peer verification disabled).
-pub fn create_client_config() -> Result<quiche::Config> {
+/// Create a QUIC client configuration.
+///
+/// When `verify_peer` is false, certificate validation is skipped (useful for
+/// self-signed certs during development). Production deployments should set
+/// this to true.
+pub fn create_client_config(verify_peer: bool) -> Result<quiche::Config> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 
-    config.verify_peer(false);
+    config.verify_peer(verify_peer);
 
     config
         .set_application_protos(&[b"qftp"])
