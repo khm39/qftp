@@ -224,7 +224,9 @@ fn main() -> Result<()> {
                                             match fs::write(path, file_data) {
                                                 Ok(()) => {
                                                     let perms = fs::Permissions::from_mode(*mode);
-                                                    let _ = fs::set_permissions(path, perms);
+                                                    if let Err(e) = fs::set_permissions(path, perms) {
+                                                        log::warn!("Failed to set permissions on {}: {}", path.display(), e);
+                                                    }
                                                     send_message(c, stream_id, &Response::Ok)?;
                                                 }
                                                 Err(e) => {
