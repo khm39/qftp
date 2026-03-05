@@ -158,18 +158,8 @@ pub fn recv_message<T: DeserializeOwned>(
     Ok(Some(msg))
 }
 
-/// Create a QUIC server configuration with the given certificate and key PEM data.
-pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Config> {
-    let mut config =
-        quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
-
-    config
-        .load_cert_chain_from_pem_file(cert_pem)
-        .context("failed to load cert chain")?;
-    config
-        .load_priv_key_from_pem_file(key_pem)
-        .context("failed to load private key")?;
-
+/// Apply common QUIC transport parameters shared by client and server.
+fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config
         .set_application_protos(&[b"qftp"])
         .context("failed to set ALPN")?;
@@ -182,6 +172,23 @@ pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Con
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_disable_active_migration(true);
+
+    Ok(())
+}
+
+/// Create a QUIC server configuration with the given certificate and key PEM data.
+pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Config> {
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
+
+    config
+        .load_cert_chain_from_pem_file(cert_pem)
+        .context("failed to load cert chain")?;
+    config
+        .load_priv_key_from_pem_file(key_pem)
+        .context("failed to load private key")?;
+
+    apply_common_config(&mut config)?;
 
     Ok(config)
 }
@@ -195,20 +202,8 @@ pub fn create_client_config(verify_peer: bool) -> Result<quiche::Config> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 
-    config.verify_peer(verify_peer);
-
-    config
-        .set_application_protos(&[b"qftp"])
-        .context("failed to set ALPN")?;
-
-    config.set_max_idle_timeout(30_000);
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_disable_active_migration(true);
+    config.verify_peer(false);
+    apply_common_config(&mut config)?;
 
     Ok(config)
 }
