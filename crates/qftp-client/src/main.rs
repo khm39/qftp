@@ -137,6 +137,8 @@ fn main() -> Result<()> {
     println!("Connected to {}", args.host);
 
     let mut rl = rustyline::DefaultEditor::new()?;
+    // QUIC client-initiated bidirectional streams use IDs 0, 4, 8, ...
+    // (stream_id % 4 == 0). Each command uses a fresh stream.
     let mut next_stream_id: u64 = 0;
 
     loop {
