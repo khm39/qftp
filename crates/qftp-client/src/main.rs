@@ -19,6 +19,9 @@ const CLIENT: Token = Token(0);
 struct Args {
     #[arg(long, default_value = "127.0.0.1:4433")]
     host: String,
+    /// Verify the server's TLS certificate (disable for self-signed certs).
+    #[arg(long, default_value = "false")]
+    verify_peer: bool,
 }
 
 fn poll_response(
@@ -90,7 +93,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let mut config = create_client_config()?;
+    let mut config = create_client_config(args.verify_peer)?;
 
     let peer_addr = args.host.parse().context("failed to parse host address")?;
 
