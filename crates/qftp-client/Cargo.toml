@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 qftp-common = { path = "../qftp-common" }
-quiche = "0.22"
+quiche = "0.24"
 mio = { version = "1", features = ["net", "os-poll"] }
 anyhow = "1"
 log = "0.4"
