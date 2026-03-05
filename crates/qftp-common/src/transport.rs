@@ -3,6 +3,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const STREAM_BUF_SIZE: usize = 65536;
+/// Maximum allowed control message size (16 MB). Prevents a malicious peer from
+/// sending an enormous length prefix that causes unbounded memory allocation.
+pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Flush pending outgoing packets from the QUIC connection to the UDP socket.
 pub fn flush_egress(
@@ -64,6 +67,12 @@ pub fn send_message<T: Serialize>(
     msg: &T,
 ) -> Result<()> {
     let payload = bincode::serialize(msg).context("failed to serialize message")?;
+    anyhow::ensure!(
+        payload.len() <= MAX_MESSAGE_SIZE,
+        "message too large: {} bytes (max {})",
+        payload.len(),
+        MAX_MESSAGE_SIZE
+    );
     let len = payload.len() as u32;
     let mut data = Vec::with_capacity(4 + payload.len());
     data.extend_from_slice(&len.to_be_bytes());
@@ -128,6 +137,13 @@ pub fn recv_message<T: DeserializeOwned>(
 
     let msg_len =
         u32::from_be_bytes([stream_buf[0], stream_buf[1], stream_buf[2], stream_buf[3]]) as usize;
+
+    anyhow::ensure!(
+        msg_len <= MAX_MESSAGE_SIZE,
+        "peer sent oversized message: {} bytes (max {})",
+        msg_len,
+        MAX_MESSAGE_SIZE
+    );
 
     if stream_buf.len() < 4 + msg_len {
         return Ok(None);
