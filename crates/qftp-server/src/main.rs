@@ -368,12 +368,16 @@ fn main() -> Result<()> {
                             // Surface the failure to the client and mark the
                             // stream Done so it gets reaped by the retain()
                             // sweep at the end of the loop, instead of
-                            // lingering until the connection times out.
-                            send_message(
+                            // lingering until the connection times out. The
+                            // notification itself is best-effort: the stream
+                            // is already in a bad state, so the send is very
+                            // likely to fail too, and propagating that error
+                            // would tear down the whole server.
+                            let _ = send_message(
                                 c,
                                 stream_id,
                                 &Response::Err("Stream receive error".into()),
-                            )?;
+                            );
                             *state = StreamState::Done;
                             continue;
                         }

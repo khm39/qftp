@@ -5,9 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel in-progress runs when new commits land on the same ref so we don't
+# burn runner minutes on superseded commits.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   check:

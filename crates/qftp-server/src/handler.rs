@@ -226,18 +226,30 @@ mod tests {
     #[test]
     fn resolve_rejects_parent_escape() {
         let (_dir, root) = setup_root();
+        // `etc/passwd` does not exist under root.parent(), so canonicalize()
+        // returns ENOENT before the starts_with(root) check ever runs. That
+        // path is still safely rejected, just for a different reason --
+        // pin the test to it so a future refactor doesn't silently turn a
+        // path-traversal rejection into a "no such file" leak.
         let err = resolve(&root, &root, "../etc/passwd").unwrap_err();
-        // canonicalize fails first because the target doesn't exist below
-        // root; in either case the call must not succeed.
-        assert!(!err.is_empty());
+        assert!(
+            err.contains("No such file"),
+            "expected ENOENT-style error, got: {err}"
+        );
     }
 
     #[test]
     fn resolve_rejects_existing_path_outside_root() {
         let (_dir, root) = setup_root();
-        // /tmp definitely exists and is outside the test root.
+        // /tmp exists on every supported (unix) platform and tempfile puts
+        // our root underneath it, so the canonicalized result is reliably
+        // outside root and must hit the explicit "outside root" branch
+        // rather than ENOENT.
         let err = resolve(&root, &root, "/../../../../../../tmp").unwrap_err();
-        assert!(err.contains("outside root") || err.contains("No such file"));
+        assert!(
+            err.contains("outside root"),
+            "expected outside-root rejection, got: {err}"
+        );
     }
 
     #[test]
