@@ -8,10 +8,7 @@ pub const STREAM_BUF_SIZE: usize = 65536;
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Flush pending outgoing packets from the QUIC connection to the UDP socket.
-pub fn flush_egress(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-) -> Result<()> {
+pub fn flush_egress(conn: &mut quiche::Connection, socket: &mio::net::UdpSocket) -> Result<()> {
     let mut out = [0u8; MAX_DATAGRAM_SIZE];
 
     loop {
@@ -167,9 +164,14 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    // Flow control windows large enough to admit a full file transfer
+    // (see qftp-server MAX_FILE_SIZE) without requiring an
+    // egress-flush-and-retry send loop. Phase 1 will replace the buffered
+    // send path with proper streaming; for Phase 0 these bounds keep
+    // stream_send_all from bailing on partial writes for files up to ~1 GiB.
+    config.set_initial_max_data(2 * 1024 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_local(1024 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_remote(1024 * 1024 * 1024);
     config.set_initial_max_streams_bidi(100);
     config.set_disable_active_migration(true);
 
@@ -195,10 +197,12 @@ pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Con
 
 /// Create a QUIC client configuration.
 ///
-/// When `verify_peer` is false, certificate validation is skipped (useful for
-/// self-signed certs during development). Production deployments should set
-/// this to true.
+/// The `verify_peer` argument is currently ignored: certificate verification
+/// is hard-coded off because the server presents a freshly generated
+/// self-signed certificate on every start. Phase 1 (see issue #28) will wire
+/// the flag through and default verification on with a CA bundle option.
 pub fn create_client_config(verify_peer: bool) -> Result<quiche::Config> {
+    let _ = verify_peer;
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 

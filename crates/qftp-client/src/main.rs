@@ -103,8 +103,7 @@ fn main() -> Result<()> {
 
     let local_addr = std_socket.local_addr()?;
 
-    let mut socket =
-        mio::net::UdpSocket::from_std(std_socket);
+    let mut socket = mio::net::UdpSocket::from_std(std_socket);
 
     // Generate connection ID
     let rng = ring::rand::SystemRandom::new();
@@ -124,7 +123,10 @@ fn main() -> Result<()> {
     // Perform handshake
     flush_egress(&mut conn, &socket)?;
     loop {
-        poll.poll(&mut events, conn.timeout().or(Some(Duration::from_millis(100))))?;
+        poll.poll(
+            &mut events,
+            conn.timeout().or(Some(Duration::from_millis(100))),
+        )?;
         conn.on_timeout();
         handle_ingress(&mut conn, &socket, &mut [0u8; 65535])?;
         flush_egress(&mut conn, &socket)?;
@@ -147,7 +149,9 @@ fn main() -> Result<()> {
     loop {
         let line = match rl.readline("qftp> ") {
             Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof) => break,
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => break,
             Err(e) => {
                 println!("Error: {}", e);
                 break;
@@ -195,7 +199,12 @@ fn main() -> Result<()> {
                         });
                         println!("Downloading {} ({} bytes)...", local_path, size);
                         let data = poll_file_data(
-                            &mut conn, &socket, &mut poll, &mut events, stream_id, size,
+                            &mut conn,
+                            &socket,
+                            &mut poll,
+                            &mut events,
+                            stream_id,
+                            size,
                         )?;
                         fs::write(&local_path, &data)?;
                         println!("Downloaded {} bytes to {}", data.len(), local_path);
@@ -230,8 +239,7 @@ fn main() -> Result<()> {
                 stream_send_all(&mut conn, stream_id, &file_data, true)?;
                 flush_egress(&mut conn, &socket)?;
                 println!("Uploading {} ({} bytes)...", remote_path, file_data.len());
-                let resp =
-                    poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
+                let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
                 repl::display_response(&resp);
             }
         }

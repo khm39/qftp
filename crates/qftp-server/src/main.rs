@@ -26,8 +26,15 @@ struct Args {
 }
 
 enum StreamState {
-    ReadingRequest { buf: Vec<u8> },
-    ReadingFileData { path: PathBuf, remaining: u64, data: Vec<u8>, mode: u32 },
+    ReadingRequest {
+        buf: Vec<u8>,
+    },
+    ReadingFileData {
+        path: PathBuf,
+        remaining: u64,
+        data: Vec<u8>,
+        mode: u32,
+    },
     Done,
 }
 
@@ -44,22 +51,22 @@ fn main() -> Result<()> {
     let key_pem = cert.key_pair.serialize_pem();
 
     // Write cert and key to temp files for quiche with restrictive permissions.
-    let cert_path = std::env::temp_dir().join(format!("qftp-server-cert-{}.pem", std::process::id()));
+    let cert_path =
+        std::env::temp_dir().join(format!("qftp-server-cert-{}.pem", std::process::id()));
     let key_path = std::env::temp_dir().join(format!("qftp-server-key-{}.pem", std::process::id()));
     fs::write(&cert_path, &cert_pem).context("failed to write cert PEM")?;
     fs::write(&key_path, &key_pem).context("failed to write key PEM")?;
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
         .context("failed to set key file permissions")?;
 
-    let mut config = create_server_config(
-        cert_path.to_str().unwrap(),
-        key_path.to_str().unwrap(),
-    )?;
+    let mut config = create_server_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap())?;
 
     // Create UDP socket.
     let addr: std::net::SocketAddr = args.bind.parse().context("invalid bind address")?;
     let std_socket = std::net::UdpSocket::bind(addr).context("failed to bind UDP socket")?;
-    std_socket.set_nonblocking(true).context("failed to set nonblocking")?;
+    std_socket
+        .set_nonblocking(true)
+        .context("failed to set nonblocking")?;
     let mut socket = mio::net::UdpSocket::from_std(std_socket);
 
     log::info!("QFTP server listening on {}", addr);
@@ -110,7 +117,8 @@ fn main() -> Result<()> {
 
             if conn.is_none() {
                 // Parse QUIC header to check for Initial packet.
-                let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+                let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN)
+                {
                     Ok(hdr) => hdr,
                     Err(e) => {
                         log::warn!("Failed to parse QUIC header: {:?}", e);
@@ -136,7 +144,9 @@ fn main() -> Result<()> {
             } else {
                 // Check if this is an Initial packet from a different client.
                 // Currently only one connection is supported at a time.
-                if let Ok(hdr) = quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+                if let Ok(hdr) =
+                    quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN)
+                {
                     if hdr.ty == quiche::Type::Initial {
                         log::warn!(
                             "Rejecting new connection from {} (server only supports one concurrent connection)",
@@ -168,14 +178,14 @@ fn main() -> Result<()> {
 
             for stream_id in readable {
                 // Ensure there is a stream state entry.
-                if !streams.contains_key(&stream_id) {
-                    streams.insert(stream_id, StreamState::ReadingRequest { buf: Vec::new() });
-                }
-
-                let state = streams.get_mut(&stream_id).unwrap();
+                let state = streams
+                    .entry(stream_id)
+                    .or_insert_with(|| StreamState::ReadingRequest { buf: Vec::new() });
 
                 match state {
-                    StreamState::ReadingRequest { buf: ref mut stream_buf } => {
+                    StreamState::ReadingRequest {
+                        buf: ref mut stream_buf,
+                    } => {
                         let req: Option<Request> = recv_message(c, stream_id, stream_buf)?;
 
                         if let Some(req) = req {
@@ -201,15 +211,21 @@ fn main() -> Result<()> {
                                                 Ok(_) => match fs::read(&file_path) {
                                                     Ok(data) => {
                                                         let size = data.len() as u64;
-                                                        send_message(c, stream_id, &Response::FileReady { size })?;
-                                                        c.stream_send(stream_id, &data, true)
+                                                        send_message(
+                                                            c,
+                                                            stream_id,
+                                                            &Response::FileReady { size },
+                                                        )?;
+                                                        stream_send_all(c, stream_id, &data, true)
                                                             .context("failed to send file data")?;
                                                     }
                                                     Err(e) => {
                                                         send_message(
                                                             c,
                                                             stream_id,
-                                                            &Response::Err(format!("Failed to read file: {e}")),
+                                                            &Response::Err(format!(
+                                                                "Failed to read file: {e}"
+                                                            )),
                                                         )?;
                                                     }
                                                 },
@@ -217,7 +233,9 @@ fn main() -> Result<()> {
                                                     send_message(
                                                         c,
                                                         stream_id,
-                                                        &Response::Err(format!("Failed to stat file: {e}")),
+                                                        &Response::Err(format!(
+                                                            "Failed to stat file: {e}"
+                                                        )),
                                                     )?;
                                                 }
                                             }
@@ -229,20 +247,25 @@ fn main() -> Result<()> {
                                     *state = StreamState::Done;
                                 }
 
-                                Request::Put { ref path, size, mode } => {
-                                    if size > MAX_UPLOAD_SIZE {
+                                Request::Put {
+                                    ref path,
+                                    size,
+                                    mode,
+                                } => {
+                                    if size > MAX_FILE_SIZE {
                                         send_message(
                                             c,
                                             stream_id,
                                             &Response::Err(format!(
                                                 "Upload too large: {} bytes (max {} bytes)",
-                                                size, MAX_UPLOAD_SIZE
+                                                size, MAX_FILE_SIZE
                                             )),
                                         )?;
                                         *state = StreamState::Done;
                                         continue;
                                     }
-                                    let file_path = match handler::resolve_parent(&cwd, &root, path) {
+                                    let file_path = match handler::resolve_parent(&cwd, &root, path)
+                                    {
                                         Ok(p) => p,
                                         Err(e) => {
                                             send_message(c, stream_id, &Response::Err(e))?;
@@ -274,8 +297,13 @@ fn main() -> Result<()> {
                                             match fs::write(path, file_data) {
                                                 Ok(()) => {
                                                     let perms = fs::Permissions::from_mode(*mode);
-                                                    if let Err(e) = fs::set_permissions(path, perms) {
-                                                        log::warn!("Failed to set permissions on {}: {}", path.display(), e);
+                                                    if let Err(e) = fs::set_permissions(path, perms)
+                                                    {
+                                                        log::warn!(
+                                                            "Failed to set permissions on {}: {}",
+                                                            path.display(),
+                                                            e
+                                                        );
                                                     }
                                                     send_message(c, stream_id, &Response::Ok)?;
                                                 }
@@ -297,8 +325,7 @@ fn main() -> Result<()> {
                                 Request::Quit => {
                                     send_message(c, stream_id, &Response::Ok)?;
                                     flush_egress(c, &socket)?;
-                                    c.close(true, 0x00, b"bye")
-                                        .ok(); // may already be closing
+                                    c.close(true, 0x00, b"bye").ok(); // may already be closing
                                     *state = StreamState::Done;
                                 }
 
@@ -318,6 +345,7 @@ fn main() -> Result<()> {
                         mode,
                     } => {
                         let mut tmp = [0u8; STREAM_BUF_SIZE];
+                        let mut fatal_recv_error = false;
                         loop {
                             match c.stream_recv(stream_id, &mut tmp) {
                                 Ok((len, _fin)) => {
@@ -325,10 +353,29 @@ fn main() -> Result<()> {
                                 }
                                 Err(quiche::Error::Done) => break,
                                 Err(e) => {
-                                    log::warn!("stream_recv error on stream {}: {:?}", stream_id, e);
+                                    log::warn!(
+                                        "stream_recv error on stream {}: {:?}",
+                                        stream_id,
+                                        e
+                                    );
+                                    fatal_recv_error = true;
                                     break;
                                 }
                             }
+                        }
+
+                        if fatal_recv_error {
+                            // Surface the failure to the client and mark the
+                            // stream Done so it gets reaped by the retain()
+                            // sweep at the end of the loop, instead of
+                            // lingering until the connection times out.
+                            send_message(
+                                c,
+                                stream_id,
+                                &Response::Err("Stream receive error".into()),
+                            )?;
+                            *state = StreamState::Done;
+                            continue;
                         }
 
                         if data.len() as u64 >= *remaining {

@@ -3,8 +3,14 @@ use qftp_common::protocol::{Request, Response};
 #[derive(Debug)]
 pub enum Command {
     Remote(Request),
-    Get { remote: String, local: Option<String> },
-    Put { local: String, remote: Option<String> },
+    Get {
+        remote: String,
+        local: Option<String>,
+    },
+    Put {
+        local: String,
+        remote: Option<String>,
+    },
 }
 
 pub fn parse_command(line: &str) -> Option<Command> {
@@ -123,10 +129,7 @@ pub fn display_response(resp: &Response) {
         Response::Err(e) => println!("Error: {e}"),
         Response::Path(p) => println!("{p}"),
         Response::DirListing(entries) => {
-            println!(
-                "{:<12} {:>10}  {:<4}  {}",
-                "MODE", "SIZE", "TYPE", "NAME"
-            );
+            println!("{:<12} {:>10}  {:<4}  NAME", "MODE", "SIZE", "TYPE");
             println!("{}", "-".repeat(50));
             for entry in entries {
                 let type_str = if entry.is_dir { "DIR" } else { "file" };
