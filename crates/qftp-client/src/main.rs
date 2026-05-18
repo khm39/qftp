@@ -19,9 +19,25 @@ const CLIENT: Token = Token(0);
 struct Args {
     #[arg(long, default_value = "127.0.0.1:4433")]
     host: String,
-    /// Verify the server's TLS certificate (disable for self-signed certs).
-    #[arg(long, default_value = "false")]
-    verify_peer: bool,
+    /// SNI name expected on the server certificate. Defaults to "localhost"
+    /// to match the server's self-signed development cert.
+    #[arg(long, default_value = "localhost")]
+    server_name: String,
+    /// Path to a PEM CA bundle used to verify the server certificate.
+    /// When omitted the system trust store is used.
+    #[arg(long)]
+    ca: Option<String>,
+    /// Disable server certificate verification. Required when talking to
+    /// the dev server (self-signed cert). Refuse to run in production.
+    #[arg(long, default_value_t = false)]
+    insecure: bool,
+    /// Path to a PEM client certificate. Required by servers that enforce
+    /// mTLS (`qftp-server --client-ca <ca>`).
+    #[arg(long, requires = "client_key")]
+    client_cert: Option<String>,
+    /// Path to the PEM private key matching --client-cert.
+    #[arg(long, requires = "client_cert")]
+    client_key: Option<String>,
 }
 
 fn poll_response(
@@ -89,11 +105,28 @@ fn poll_file_data(
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
 
-    let mut config = create_client_config(args.verify_peer)?;
+    let client_cert = match (&args.client_cert, &args.client_key) {
+        (Some(c), Some(k)) => Some(qftp_common::transport::ClientCert {
+            cert_pem: c.clone(),
+            key_pem: k.clone(),
+        }),
+        _ => None,
+    };
+
+    let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
+        verify_peer: !args.insecure,
+        ca_path: args.ca.clone(),
+        client_cert,
+    })?;
 
     let peer_addr = args.host.parse().context("failed to parse host address")?;
 
@@ -112,7 +145,13 @@ fn main() -> Result<()> {
     rng.fill(&mut scid_bytes).unwrap();
     let scid = quiche::ConnectionId::from_vec(scid_bytes.to_vec());
 
-    let mut conn = quiche::connect(Some("localhost"), &scid, local_addr, peer_addr, &mut config)?;
+    let mut conn = quiche::connect(
+        Some(&args.server_name),
+        &scid,
+        local_addr,
+        peer_addr,
+        &mut config,
+    )?;
 
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);

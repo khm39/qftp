@@ -49,7 +49,7 @@ pub fn handle_ingress(
         match conn.recv(&mut buf[..len], recv_info) {
             Ok(_) => {}
             Err(e) => {
-                log::warn!("QUIC recv error: {:?}", e);
+                tracing::warn!(error = ?e, "QUIC recv error");
             }
         }
     }
@@ -182,17 +182,52 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     Ok(())
 }
 
-/// Create a QUIC server configuration with the given certificate and key PEM data.
-pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Config> {
+/// Server TLS configuration.
+pub struct ServerTlsConfig {
+    /// PEM-encoded server certificate chain.
+    pub cert_pem: String,
+    /// PEM-encoded server private key.
+    pub key_pem: String,
+    /// When set, the server requires clients to present a certificate
+    /// chained to this PEM CA bundle (mTLS).
+    pub client_ca_pem: Option<String>,
+}
+
+/// Client TLS configuration.
+pub struct ClientTlsConfig {
+    /// Verify the server's certificate. Should be true outside of dev.
+    pub verify_peer: bool,
+    /// Path to a PEM CA bundle to verify the server cert against. When
+    /// `None` the system trust store is used.
+    pub ca_path: Option<String>,
+    /// Client certificate to present (for mTLS-enabled servers).
+    pub client_cert: Option<ClientCert>,
+}
+
+/// Client certificate material for mTLS.
+pub struct ClientCert {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// Create a QUIC server configuration.
+pub fn create_server_config(tls: &ServerTlsConfig) -> Result<quiche::Config> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 
     config
-        .load_cert_chain_from_pem_file(cert_pem)
+        .load_cert_chain_from_pem_file(&tls.cert_pem)
         .context("failed to load cert chain")?;
     config
-        .load_priv_key_from_pem_file(key_pem)
+        .load_priv_key_from_pem_file(&tls.key_pem)
         .context("failed to load private key")?;
+
+    if let Some(ca_path) = &tls.client_ca_pem {
+        config
+            .load_verify_locations_from_file(ca_path)
+            .context("failed to load client CA bundle")?;
+        config.verify_peer(true);
+    }
 
     apply_common_config(&mut config)?;
 
@@ -200,17 +235,33 @@ pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Con
 }
 
 /// Create a QUIC client configuration.
-///
-/// The `verify_peer` argument is currently ignored: certificate verification
-/// is hard-coded off because the server presents a freshly generated
-/// self-signed certificate on every start. Phase 1 (see issue #28) will wire
-/// the flag through and default verification on with a CA bundle option.
-pub fn create_client_config(verify_peer: bool) -> Result<quiche::Config> {
-    let _ = verify_peer;
+pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 
-    config.verify_peer(false);
+    config.verify_peer(tls.verify_peer);
+
+    if let Some(ca_path) = &tls.ca_path {
+        config
+            .load_verify_locations_from_file(ca_path)
+            .context("failed to load CA bundle")?;
+    } else if tls.verify_peer {
+        // Fall back to the platform trust store. quiche delegates to
+        // BoringSSL; without an explicit bundle the OS roots are used.
+        config
+            .load_verify_locations_from_directory("/etc/ssl/certs")
+            .ok();
+    }
+
+    if let Some(cc) = &tls.client_cert {
+        config
+            .load_cert_chain_from_pem_file(&cc.cert_pem)
+            .context("failed to load client cert")?;
+        config
+            .load_priv_key_from_pem_file(&cc.key_pem)
+            .context("failed to load client key")?;
+    }
+
     apply_common_config(&mut config)?;
 
     Ok(config)
