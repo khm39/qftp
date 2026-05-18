@@ -1,7 +1,34 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+/// Read a file's mode where the OS exposes one (Unix), and synthesize a
+/// generous default elsewhere so listings still round-trip.
+#[cfg(unix)]
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    meta.permissions().mode()
+}
+#[cfg(not(unix))]
+fn mode_of(_meta: &fs::Metadata) -> u32 {
+    0o644
+}
+
+/// Apply a Unix mode where the OS supports it; otherwise refuse so callers
+/// don't silently lose ACLs they thought they were setting.
+#[cfg(unix)]
+fn set_mode(target: &Path, mode: u32) -> Response {
+    let perms = fs::Permissions::from_mode(mode);
+    match fs::set_permissions(target, perms) {
+        Ok(()) => Response::Ok,
+        Err(e) => Response::Err(format!("chmod failed: {e}")),
+    }
+}
+#[cfg(not(unix))]
+fn set_mode(_target: &Path, _mode: u32) -> Response {
+    Response::Err("chmod is not supported on this platform".into())
+}
 
 use qftp_common::protocol::{DirEntry, FileStat, Request, Response};
 
@@ -151,7 +178,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 is_dir: meta.is_dir(),
                                 size: meta.len(),
                                 modified,
-                                mode: meta.permissions().mode(),
+                                mode: mode_of(&meta),
                             });
                         }
                         listing.sort_by(|a, b| a.name.cmp(&b.name));
@@ -203,13 +230,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         }
 
         Request::Chmod { path, mode } => match resolve(cwd, root, path) {
-            Ok(target) => {
-                let perms = fs::Permissions::from_mode(*mode);
-                match fs::set_permissions(&target, perms) {
-                    Ok(()) => Response::Ok,
-                    Err(e) => Response::Err(format!("chmod failed: {e}")),
-                }
-            }
+            Ok(target) => set_mode(&target, *mode),
             Err(e) => Response::Err(e),
         },
 
@@ -226,7 +247,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                         size: meta.len(),
                         is_dir: meta.is_dir(),
                         modified,
-                        mode: meta.permissions().mode(),
+                        mode: mode_of(&meta),
                     })
                 }
                 Err(e) => Response::Err(format!("stat failed: {e}")),
@@ -240,7 +261,10 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
     }
 }
 
-#[cfg(test)]
+// The tests below exercise Unix symlink semantics and the unix-only
+// PermissionsExt path. Gating the whole module keeps `cargo test`
+// compiling on non-Unix targets (issue #35).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
@@ -332,11 +356,12 @@ mod tests {
         // Create symlink root/escape -> /tmp (outside root)
         std::os::unix::fs::symlink("/tmp", root.join("escape")).unwrap();
         let err = resolve(&root, &root, "escape").unwrap_err();
-        // The canonicalize() in resolve() follows the symlink and lands
-        // outside root, hitting the explicit outside-root check.
+        // walk_safe walks the user path component-wise and uses
+        // symlink_metadata, so it rejects the symlink itself before any
+        // dereference happens -- expect the explicit symlink message.
         assert!(
-            err.contains("outside root") || err.contains("symlink not allowed"),
-            "expected outside-root or symlink rejection, got: {err}"
+            err.contains("symlink not allowed"),
+            "expected symlink rejection, got: {err}"
         );
     }
 

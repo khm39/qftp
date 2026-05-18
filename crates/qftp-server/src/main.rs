@@ -173,6 +173,24 @@ fn install_signal_handler() -> Result<Arc<AtomicBool>> {
     Ok(shutdown)
 }
 
+/// Open the upload temp file in a way that refuses to follow a symlink
+/// already at `path`. The temp name is predictable
+/// (`.qftp.partial.<pid>.<stream_id>`), so a local attacker who can write
+/// in the destination directory could otherwise pre-create it as a
+/// symlink and redirect our writes elsewhere. `create_new(true)` rejects
+/// any existing entry, and on Unix `O_NOFOLLOW` makes opening through a
+/// symlink fail with ELOOP for good measure.
+fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
 /// Allocate a temp path next to the eventual destination so the final
 /// `rename` is atomic (same filesystem).
 fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
@@ -214,15 +232,20 @@ fn send_file_streaming(
             .read_exact(&mut chunk[..to_read])
             .context("failed to read file chunk")?;
 
-        let fin = sent + to_read as u64 == total_size;
+        // Final chunk of the file? Mirror the stream_send_all pattern: pass
+        // fin=true on every retry within this last chunk. quiche only emits
+        // the FIN frame when it actually queues the trailing byte, so a
+        // partial-write retry that again asserts fin is what eventually
+        // delivers EOF -- there's no risk of "closing early".
+        let chunk_is_last = sent + to_read as u64 == total_size;
 
         let mut chunk_off = 0;
         while chunk_off < to_read {
-            match conn.stream_send(stream_id, &chunk[chunk_off..to_read], fin) {
+            match conn.stream_send(stream_id, &chunk[chunk_off..to_read], chunk_is_last) {
                 Ok(0) => {
                     // Stream-level flow control is exhausted. Push out what
                     // we have, pull in any acks the peer has sent, and try
-                    // again on the next loop iteration.
+                    // again next iteration.
                     flush_egress(conn, socket)?;
                     handle_ingress(conn, socket, &mut net_buf)?;
                     std::thread::sleep(Duration::from_millis(1));
@@ -235,6 +258,13 @@ fn send_file_streaming(
             }
         }
 
+        flush_egress(conn, socket)?;
+    }
+
+    // Zero-length file: emit a fin-only frame so the peer's read returns EOF.
+    if total_size == 0 {
+        conn.stream_send(stream_id, &[], true)
+            .context("stream_send fin (empty file) failed")?;
         flush_egress(conn, socket)?;
     }
 
@@ -420,7 +450,7 @@ fn main() -> Result<()> {
                                             }
                                         };
                                     let temp_path = temp_path_for(&final_path, stream_id);
-                                    let writer = match File::create(&temp_path) {
+                                    let writer = match open_temp_no_follow(&temp_path) {
                                         Ok(f) => BufWriter::with_capacity(FILE_CHUNK_SIZE, f),
                                         Err(e) => {
                                             send_message(
@@ -562,7 +592,7 @@ fn drive_put(
             break;
         }
         match conn.stream_recv(stream_id, tmp) {
-            Ok((len, _fin)) => {
+            Ok((len, fin)) => {
                 let to_take = (len as u64).min(*remaining) as usize;
                 if let Err(e) = writer.write_all(&tmp[..to_take]) {
                     return Ok(Some(Response::Err(format!("Failed to write file: {e}"))));
@@ -571,6 +601,16 @@ fn drive_put(
                 if to_take < len {
                     // Peer sent more bytes than declared. Reject.
                     return Ok(Some(Response::Err("Upload exceeded declared size".into())));
+                }
+                if fin && *remaining > 0 {
+                    // Peer closed the stream before delivering the declared
+                    // number of bytes. Don't leave the client hanging until
+                    // the idle timeout -- surface the truncation now and
+                    // let Drop clean up the temp file.
+                    return Ok(Some(Response::Err(format!(
+                        "Upload truncated: {} bytes still expected",
+                        *remaining
+                    ))));
                 }
             }
             Err(quiche::Error::Done) => break,

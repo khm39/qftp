@@ -164,15 +164,16 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    // Flow control windows large enough to admit a full file transfer
-    // (see qftp-server MAX_FILE_SIZE) without requiring an
-    // egress-flush-and-retry send loop. Phase 1 (issue #30, #31) will
-    // replace the buffered send path with proper streaming, at which point
-    // these can come back down. To bound the resulting DoS surface in the
-    // meantime, initial_max_streams_bidi is held to a small number: the
-    // current client only opens one bidi stream at a time, so 4 is plenty
-    // of headroom and caps worst-case in-memory buffering at well under
-    // the 2 GiB connection limit.
+    // Phase 1 sends and receives files in chunks (qftp-server's
+    // send_file_streaming and drive_put), so peak memory no longer scales
+    // with the flow-control window. We still keep the windows generous to
+    // minimize how often send_file_streaming has to spin-wait for a peer
+    // ACK; the per-stream RAM upper bound is now the BufReader/BufWriter
+    // capacity (64 KiB) rather than the window itself. initial_max_streams_bidi
+    // stays low because the server is still single-connection (Phase 2,
+    // issue #36): the current client only opens one bidi stream at a time.
+    // Phase 2's multi-connection rewrite is the right place to revisit
+    // both dimensions in concert with a real egress-driven sender.
     config.set_initial_max_data(2 * 1024 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_local(1024 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_remote(1024 * 1024 * 1024);
