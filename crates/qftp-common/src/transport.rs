@@ -201,17 +201,26 @@ fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> R
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     // Phase 1 sends and receives files in chunks (qftp-server's
     // send_file_streaming and drive_put), so peak memory no longer scales
-    // with the flow-control window. We still keep the windows generous to
-    // minimize how often send_file_streaming has to spin-wait for a peer
-    // ACK; the per-stream RAM upper bound is now the BufReader/BufWriter
-    // capacity (64 KiB) rather than the window itself. initial_max_streams_bidi
-    // stays low because the server is still single-connection (Phase 2,
-    // issue #36): the current client only opens one bidi stream at a time.
-    // Phase 2's multi-connection rewrite is the right place to revisit
-    // both dimensions in concert with a real egress-driven sender.
-    config.set_initial_max_data(2 * 1024 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_local(1024 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_remote(1024 * 1024 * 1024);
+    // with the flow-control window: the per-stream RAM upper bound is
+    // BufReader/BufWriter capacity (64 KiB). The window only needs to be
+    // big enough that the sender doesn't spin-wait for ACKs at line rate.
+    //
+    // #139: shrink the advertised windows from 2 GiB / 1 GiB to bound
+    // the quiche internal bookkeeping and kernel UDP buffer footprint.
+    // 32 MiB per stream is ~500x the chunk size and comfortably exceeds
+    // bandwidth × delay on a 1 Gbps × 200 ms link (~25 MiB), so steady-
+    // state throughput is unaffected; the connection-wide cap of
+    // 32 MiB × max_streams_bidi (4) = 128 MiB holds total per-conn use
+    // bounded too. initial_max_streams_bidi stays low because the
+    // server is still single-connection (Phase 2, issue #36): the
+    // current client only opens one bidi stream at a time. Phase 2's
+    // multi-connection rewrite is the right place to revisit these in
+    // concert with a real egress-driven sender.
+    const STREAM_FLOW_WINDOW: u64 = 32 * 1024 * 1024;
+    const CONN_FLOW_WINDOW: u64 = 128 * 1024 * 1024;
+    config.set_initial_max_data(CONN_FLOW_WINDOW);
+    config.set_initial_max_stream_data_bidi_local(STREAM_FLOW_WINDOW);
+    config.set_initial_max_stream_data_bidi_remote(STREAM_FLOW_WINDOW);
     config.set_initial_max_streams_bidi(4);
     config.set_disable_active_migration(true);
 
