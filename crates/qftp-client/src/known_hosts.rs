@@ -142,6 +142,17 @@ impl KnownHosts {
     /// directory) if needed. Mode is set to 0600 on Unix so a
     /// fingerprint database isn't world-readable.
     pub fn append_to_file(path: &Path, host_port: &str, fingerprint_hex: &str) -> Result<()> {
+        // #114: refuse to write host strings that could inject extra
+        // (attacker-pinned) entries on adjacent lines. The host_port
+        // value originates from a CLI argument / config / URL and
+        // could carry embedded newlines or framing-sensitive
+        // whitespace.
+        if !is_valid_host_port(host_port) {
+            anyhow::bail!("refusing to pin host with disallowed characters: {host_port:?} (#114)");
+        }
+        if !is_valid_fingerprint_hex(fingerprint_hex) {
+            anyhow::bail!("refusing to pin malformed fingerprint: {fingerprint_hex:?} (#114)");
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -160,6 +171,21 @@ impl KnownHosts {
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Lexical validation for a `host:port` string before we trust it
+/// enough to write into `known_hosts`. Allows ASCII letters, digits,
+/// `.`, `_`, `-`, plus `:` `[` `]` for bracketed IPv6 forms. Rejects
+/// anything else (notably whitespace, including newlines).
+fn is_valid_host_port(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '[' | ']'))
+}
+
+/// 64 lowercase or uppercase hex chars.
+fn is_valid_fingerprint_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Compute the lowercase-hex SHA-256 of a DER-encoded leaf cert.
@@ -270,6 +296,46 @@ mod tests {
             fp,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn append_rejects_host_string_with_newline() {
+        // #114: a newline in host_port would inject an attacker-pinned
+        // entry on the next line. Refuse to write.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("known_hosts");
+        let fp = "0".repeat(64);
+        let err = KnownHosts::append_to_file(&path, "evil:4433\nvictim:4433 sha256:bad", &fp)
+            .expect_err("expected append to refuse newline-laced host");
+        assert!(err.to_string().contains("#114"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn append_rejects_whitespace_in_host() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("known_hosts");
+        let fp = "0".repeat(64);
+        let err = KnownHosts::append_to_file(&path, "host with space:4433", &fp)
+            .expect_err("expected append to refuse whitespace in host");
+        assert!(err.to_string().contains("#114"));
+    }
+
+    #[test]
+    fn append_rejects_malformed_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("known_hosts");
+        let err = KnownHosts::append_to_file(&path, "h:4433", "not-hex")
+            .expect_err("expected append to refuse non-hex fingerprint");
+        assert!(err.to_string().contains("#114"));
+    }
+
+    #[test]
+    fn append_accepts_bracketed_ipv6() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("known_hosts");
+        let fp = "0".repeat(64);
+        KnownHosts::append_to_file(&path, "[::1]:4433", &fp)
+            .expect("bracketed IPv6 host should be accepted");
     }
 
     #[test]

@@ -201,7 +201,34 @@ pub fn do_get(
     let mut file = opts
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;
+
+    // #116: when resuming, the server's BLAKE3 trailer is computed
+    // over the whole file (server side has no resume concept on its
+    // hashing path). Feed the existing on-disk prefix into the hasher
+    // before we start consuming network bytes so the trailer check
+    // covers prefix tampering as well as new-byte tampering. Without
+    // this, an attacker who modified the partial file would land a
+    // passing checksum on a corrupt result.
+    let mut hasher = blake3::Hasher::new();
     if resume_offset > 0 {
+        let mut prefix = File::open(local)
+            .with_context(|| format!("re-open {} to hash resume prefix", local.display()))?;
+        let mut buf = [0u8; CHUNK];
+        let mut left = resume_offset;
+        while left > 0 {
+            let want = (left as usize).min(buf.len());
+            let n = prefix
+                .read(&mut buf[..want])
+                .with_context(|| format!("read resume prefix from {}", local.display()))?;
+            if n == 0 {
+                bail!(
+                    "partial file shorter than advertised offset {resume_offset}; \
+                     remove it and retry (#116)"
+                );
+            }
+            hasher.update(&buf[..n]);
+            left -= n as u64;
+        }
         file.seek(SeekFrom::Start(resume_offset))
             .with_context(|| format!("seeking to {resume_offset}"))?;
     }
@@ -210,7 +237,6 @@ pub fn do_get(
     bar.set_position(resume_offset);
 
     let mut received: u64 = 0;
-    let mut hasher = blake3::Hasher::new();
     let mut trailer = Vec::<u8>::new();
     let mut tmp = [0u8; CHUNK];
 

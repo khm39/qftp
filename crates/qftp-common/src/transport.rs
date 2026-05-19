@@ -156,7 +156,7 @@ pub fn recv_message<T: DeserializeOwned>(
 }
 
 /// Apply common QUIC transport parameters shared by client and server.
-fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
+fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> Result<()> {
     config
         .set_application_protos(&[crate::protocol::ALPN])
         .context("failed to set ALPN")?;
@@ -180,13 +180,21 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config.set_initial_max_streams_bidi(4);
     config.set_disable_active_migration(true);
 
-    // 0-RTT resumption. Enabled unconditionally: it costs us nothing
-    // when no session ticket is offered (server falls back to a
-    // normal 1-RTT handshake), and the client gains the option of
-    // resuming if it has a saved ticket. Replay protection for 0-RTT
-    // data is enforced in the per-Request decode path on the server
-    // (write ops refused while `is_in_early_data()`).
-    config.enable_early_data();
+    // 0-RTT resumption. Server-side replay protection is enforced in
+    // the per-Request decode path (write ops refused while
+    // `is_in_early_data()`). The client side gates this on whether
+    // the TLS stack itself verifies the peer cert:
+    //   * verify_peer = true: a MitM cannot complete the resumed
+    //     handshake without the real server's private key, so 0-RTT
+    //     bytes stay confidential.
+    //   * verify_peer = false (--insecure or TOFU before pin-binding
+    //     lands): an attacker who terminates the connection could
+    //     receive the first Request bytes (#110). Skip enable_early_data
+    //     to force a 1-RTT handshake; the application-layer TOFU
+    //     check then runs before any request bytes leave the host.
+    if allow_early_data {
+        config.enable_early_data();
+    }
 
     Ok(())
 }
@@ -238,7 +246,7 @@ pub fn create_server_config(tls: &ServerTlsConfig) -> Result<quiche::Config> {
         config.verify_peer(true);
     }
 
-    apply_common_config(&mut config)?;
+    apply_common_config(&mut config, true)?;
 
     Ok(config)
 }
@@ -271,7 +279,9 @@ pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
             .context("failed to load client key")?;
     }
 
-    apply_common_config(&mut config)?;
+    // #110: gate 0-RTT on whether the TLS stack will actually
+    // authenticate the peer.
+    apply_common_config(&mut config, tls.verify_peer)?;
 
     Ok(config)
 }

@@ -186,6 +186,42 @@ fn init_tracing(format: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write a private-key PEM atomically with restrictive permissions.
+///
+/// #107: the previous code used `fs::write` (default mode, follows
+/// symlinks) and then `fs::set_permissions(0o600)`. The window between
+/// those two calls was an exploitable TOCTOU and the predictable
+/// per-PID temp filename also enabled symlink-prefill attacks on
+/// `/tmp`. This helper:
+///   * removes any pre-existing file at the destination so a stale
+///     entry from a crashed previous run doesn't block us;
+///   * opens with `O_CREAT | O_EXCL | O_NOFOLLOW` so a symlink planted
+///     at the predicted path is rejected, not followed;
+///   * applies mode 0600 at creation time (Unix `mode` honored only on
+///     create).
+fn write_private_key(path: &Path, contents: &str) -> Result<()> {
+    let _ = fs::remove_file(path);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(path).with_context(|| {
+        format!(
+            "failed to create {} with 0o600 + O_NOFOLLOW",
+            path.display()
+        )
+    })?;
+    use std::io::Write as _;
+    f.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    f.flush().ok();
+    Ok(())
+}
+
 fn load_or_make_tls(args: &Args) -> Result<ServerTlsConfig> {
     if args.self_signed && args.self_signed_persistent {
         return load_or_make_persistent_self_signed(args);
@@ -201,11 +237,13 @@ fn load_or_make_tls(args: &Args) -> Result<ServerTlsConfig> {
             std::env::temp_dir().join(format!("qftp-server-cert-{}.pem", std::process::id()));
         let key_path =
             std::env::temp_dir().join(format!("qftp-server-key-{}.pem", std::process::id()));
+        // Cert is public material; a normal write is fine.
         fs::write(&cert_path, &cert_pem).context("failed to write cert PEM")?;
-        fs::write(&key_path, &key_pem).context("failed to write key PEM")?;
-        #[cfg(unix)]
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-            .context("failed to set key file permissions")?;
+        // #107: the private key must never appear with default
+        // permissions in /tmp. Create with mode 0o600 atomically, and
+        // refuse to clobber a pre-existing path (defeats symlink
+        // prefill of the predictable per-PID name).
+        write_private_key(&key_path, &key_pem)?;
 
         log_fingerprint(&cert_pem, "ephemeral");
 
@@ -281,15 +319,12 @@ fn load_or_make_persistent_self_signed(args: &Args) -> Result<ServerTlsConfig> {
         let key_pem = cert.key_pair.serialize_pem();
         fs::write(&cert_path, &cert_pem)
             .with_context(|| format!("failed to write {}", cert_path.display()))?;
-        fs::write(&key_path, &key_pem)
-            .with_context(|| format!("failed to write {}", key_path.display()))?;
         #[cfg(unix)]
-        {
-            fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o644))
-                .with_context(|| format!("failed to chmod {}", cert_path.display()))?;
-            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("failed to chmod {}", key_path.display()))?;
-        }
+        fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("failed to chmod {}", cert_path.display()))?;
+        // #107: write the key atomically with 0o600 + O_NOFOLLOW
+        // rather than write+chmod (TOCTOU + symlink prefill).
+        write_private_key(&key_path, &key_pem)?;
         info!(dir = %dir.display(), "wrote new persistent self-signed cert");
     } else {
         info!(dir = %dir.display(), "loaded existing persistent self-signed cert");
