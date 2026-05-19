@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/qftp-common", "crates/qftp-server", "crates/qftp-client"]
+members = ["crates/qftp-common", "crates/qftp-server", "crates/qftp-client", "crates/qftp-admin"]
 # fuzz/ is a separate, nightly-only workspace driven by cargo-fuzz; keep
 # it out of the main workspace so `cargo build --workspace` on stable
 # doesn't try to compile libfuzzer-sys.

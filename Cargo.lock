@@ -962,6 +962,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qftp-admin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "serde",
+ "tempfile",
+ "toml",
+ "toml_edit",
+]
+
+[[package]]
 name = "qftp-client"
 version = "0.1.0"
 dependencies = [
