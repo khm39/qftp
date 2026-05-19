@@ -90,6 +90,13 @@ struct Args {
     /// `~/.qftp_history`.
     #[arg(long)]
     history: Option<PathBuf>,
+    /// Quiet mode: hide progress bars, print errors only.
+    #[arg(long, short = 'q', default_value_t = false)]
+    quiet: bool,
+    /// Increase log verbosity. `-v` info, `-vv` debug, `-vvv` trace.
+    /// Beats `RUST_LOG`.
+    #[arg(long, short = 'v', action = clap::ArgAction::Count)]
+    verbose: u8,
     /// Print a shell-completion script to stdout and exit.
     /// Pipe it into the right place for your shell, e.g.
     ///   `qftp-client --generate-completions bash | sudo tee \
@@ -150,14 +157,26 @@ enum OneShot {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
+
+    // Tracing init: `-v` family wins over RUST_LOG. `-q` falls to
+    // warn so the user only sees errors (progress bars are silenced
+    // separately by the transfer module).
+    let cli_level: Option<&str> = match (args.quiet, args.verbose) {
+        (true, _) => Some("warn"),
+        (false, 0) => None,
+        (false, 1) => Some("info"),
+        (false, 2) => Some("debug"),
+        (false, _) => Some("trace"),
+    };
+    let filter = match cli_level {
+        Some(l) => tracing_subscriber::EnvFilter::new(l),
+        None => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    transfer::set_quiet(args.quiet);
 
     if let Some(shell) = args.generate_completions {
         let mut cmd = Args::command();
