@@ -67,6 +67,16 @@ pub fn parse_url(input: &str) -> Result<UrlTarget> {
             "unsupported scheme: {scheme} (expected qftp or qftps)"
         ));
     }
+    // qftp authenticates with mTLS or (later) #77 pubkey/passphrase;
+    // there is no protocol-level password. Silently ignoring a `:pw`
+    // in the URL would let users believe they had auth set up. Reject
+    // it explicitly so secrets cannot leak into shell history.
+    if parsed.password().is_some() {
+        return Err(anyhow!(
+            "URL contains a password component; qftp does not support password-in-URL \
+             (use --client-cert / --client-key, or wait for #77 pubkey auth)"
+        ));
+    }
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("URL is missing a host component"))?
@@ -201,7 +211,8 @@ pub fn resolve(
             url_part = Some(parse_url(t)?);
         } else {
             let cfg = config.host.get(t).cloned().ok_or_else(|| {
-                let available: Vec<&String> = config.host.keys().collect();
+                let mut available: Vec<&str> = config.host.keys().map(|s| s.as_str()).collect();
+                available.sort_unstable();
                 if available.is_empty() {
                     anyhow!(
                         "no host alias '{t}' defined (the config file has no [host.*] sections)"
@@ -209,11 +220,7 @@ pub fn resolve(
                 } else {
                     anyhow!(
                         "no host alias '{t}'. Defined aliases: {}",
-                        available
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        available.join(", ")
                     )
                 }
             })?;
@@ -221,11 +228,19 @@ pub fn resolve(
         }
     }
 
-    if let Some(alias) = &alias_part {
-        if let Some(endpoint) = &alias.endpoint {
-            url_part = Some(parse_url(endpoint)?);
-        }
-    }
+    // Layering, lowest precedence first:
+    //   1. builtin defaults
+    //   2. alias.endpoint (a URL parsed into host/port/sni/user/path)
+    //   3. alias's explicit fields (host/port/server_name/...): these
+    //      override the endpoint so an operator can pin a different
+    //      SNI than the cert's hostname, etc.
+    //   4. URL given on the command line (it's the user's explicit
+    //      intent at invocation time)
+    //   5. CLI flag overrides (--host etc., the highest)
+    //
+    // The merge intentionally goes endpoint -> alias overrides ->
+    // command-line URL so users get the "alias is a defaults bundle"
+    // mental model.
 
     let mut host = "127.0.0.1".to_string();
     let mut port: u16 = DEFAULT_PORT;
@@ -237,6 +252,23 @@ pub fn resolve(
     let mut client_cert: Option<String> = None;
     let mut client_key: Option<String> = None;
 
+    // Step 2: alias.endpoint.
+    if let Some(alias) = &alias_part {
+        if let Some(endpoint) = &alias.endpoint {
+            let u = parse_url(endpoint)?;
+            host.clone_from(&u.host);
+            port = u.port;
+            server_name.clone_from(&u.host);
+            if let Some(uu) = &u.user {
+                user = Some(uu.clone());
+            }
+            if let Some(p) = &u.initial_path {
+                initial_path = Some(p.clone());
+            }
+        }
+    }
+
+    // Step 3: alias explicit fields override the endpoint.
     if let Some(alias) = &alias_part {
         if let Some(h) = &alias.host {
             host.clone_from(h);
@@ -253,20 +285,26 @@ pub fn resolve(
         if let Some(b) = alias.insecure {
             insecure = b;
         }
-        ca = alias.ca.as_deref().map(expand_tilde).or(ca);
-        client_cert = alias
-            .client_cert
-            .as_deref()
-            .map(expand_tilde)
-            .or(client_cert);
-        client_key = alias.client_key.as_deref().map(expand_tilde).or(client_key);
-        initial_path.clone_from(&alias.initial_path);
+        if let Some(p) = &alias.initial_path {
+            initial_path = Some(p.clone());
+        }
+        if let Some(s) = &alias.ca {
+            ca = Some(expand_tilde(s));
+        }
+        if let Some(s) = &alias.client_cert {
+            client_cert = Some(expand_tilde(s));
+        }
+        if let Some(s) = &alias.client_key {
+            client_key = Some(expand_tilde(s));
+        }
     }
 
+    // Step 4: URL given on the command line.
     if let Some(u) = &url_part {
         host.clone_from(&u.host);
         port = u.port;
-        // SNI follows the URL host unless overridden elsewhere.
+        // SNI follows the URL host unless explicitly overridden by a
+        // flag later.
         server_name.clone_from(&u.host);
         if let Some(uu) = &u.user {
             user = Some(uu.clone());
@@ -276,18 +314,12 @@ pub fn resolve(
         }
     }
 
+    // Step 5: CLI flags win.
     if let Some(h) = &overrides.host {
-        // Override format is `ip:port`; parse it so we keep the
-        // resolved host/port pair coherent.
-        if let Some((h_only, p_only)) = h.rsplit_once(':') {
-            if let Ok(p) = p_only.parse::<u16>() {
-                host = h_only.to_string();
-                port = p;
-            } else {
-                host = h.clone();
-            }
-        } else {
-            host = h.clone();
+        let (h_only, p_opt) = split_host_port(h);
+        host = h_only;
+        if let Some(p) = p_opt {
+            port = p;
         }
     }
     if let Some(s) = &overrides.server_name {
@@ -307,7 +339,7 @@ pub fn resolve(
     }
 
     Ok(ConnectionSpec {
-        host: format!("{host}:{port}"),
+        host: format_host_port(&host, port),
         server_name,
         user,
         initial_path,
@@ -316,6 +348,53 @@ pub fn resolve(
         client_cert,
         client_key,
     })
+}
+
+/// Format a host + port for the `SocketAddr` parser. IPv6 literals
+/// must be wrapped in brackets so `[::1]:4433` parses; IPv4 and
+/// hostnames pass through plain.
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Split a `--host` value into `(host, Some(port))`, accepting:
+///   - `127.0.0.1:4433`
+///   - `example.com:4433`
+///   - `[::1]:4433`            (bracketed IPv6 with port)
+///   - `[::1]`                 (bracketed IPv6, no port)
+///   - `2001:db8::1`           (bare IPv6, no port)
+///   - `127.0.0.1`             (no port)
+///
+/// Bare IPv6 literals are unambiguous when they contain more than one
+/// `:`, so we only treat the last colon as a port separator for hosts
+/// with at most one `:`.
+fn split_host_port(input: &str) -> (String, Option<u16>) {
+    if let Some(rest) = input.strip_prefix('[') {
+        // Bracketed IPv6.
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (host.to_string(), port);
+        }
+        return (input.to_string(), None);
+    }
+    let colon_count = input.bytes().filter(|b| *b == b':').count();
+    match colon_count {
+        0 => (input.to_string(), None),
+        1 => match input.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port) => (h.to_string(), Some(port)),
+                Err(_) => (input.to_string(), None),
+            },
+            None => (input.to_string(), None),
+        },
+        // 2+ colons: bare IPv6 address. There's no port unless the
+        // user used the bracket form, which we handled above.
+        _ => (input.to_string(), None),
+    }
 }
 
 #[cfg(test)]
@@ -435,16 +514,91 @@ mod tests {
                 [host.work]
                 endpoint = "qftps://files.work.example:9000"
                 server_name = "custom-sni.example"
+                port = 7000
             "#,
         )
         .unwrap();
         let spec = resolve(Some("work"), &cfg, &Overrides::default()).unwrap();
-        // URL wins over alias.server_name for host but not for SNI:
-        // endpoint sets SNI to its host, then no explicit field beats
-        // it -- but our precedence (alias < url) means alias.server_name
-        // is overwritten when endpoint is present. This test pins the
-        // behaviour so a future maintainer notices if it shifts.
-        assert_eq!(spec.server_name, "files.work.example");
+        // Endpoint primes the defaults, then the alias's explicit
+        // server_name / port override them. Host stays at the
+        // endpoint's value because no explicit `host =` was set.
+        assert_eq!(spec.server_name, "custom-sni.example");
+        assert_eq!(spec.host, "files.work.example:7000");
+    }
+
+    #[test]
+    fn parse_url_rejects_password() {
+        let err = parse_url("qftp://alice:secret@host:4433").unwrap_err();
+        assert!(err.to_string().contains("password"));
+    }
+
+    #[test]
+    fn resolve_unknown_alias_lists_aliases_sorted() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+                [host.zzz]
+                endpoint = "qftp://x:4433"
+                [host.aaa]
+                endpoint = "qftp://x:4433"
+                [host.mmm]
+                endpoint = "qftp://x:4433"
+            "#,
+        )
+        .unwrap();
+        let err = resolve(Some("nope"), &cfg, &Overrides::default()).unwrap_err();
+        let msg = err.to_string();
+        // Aliases must appear in sorted order.
+        let aaa_pos = msg.find("aaa").unwrap();
+        let mmm_pos = msg.find("mmm").unwrap();
+        let zzz_pos = msg.find("zzz").unwrap();
+        assert!(aaa_pos < mmm_pos);
+        assert!(mmm_pos < zzz_pos);
+    }
+
+    #[test]
+    fn split_host_port_handles_ipv4_hostname_and_ipv6() {
+        assert_eq!(
+            split_host_port("127.0.0.1:4433"),
+            ("127.0.0.1".to_string(), Some(4433))
+        );
+        assert_eq!(
+            split_host_port("example.com:4433"),
+            ("example.com".to_string(), Some(4433))
+        );
+        assert_eq!(
+            split_host_port("example.com"),
+            ("example.com".to_string(), None)
+        );
+        // Bare IPv6 (no port): not split.
+        assert_eq!(
+            split_host_port("2001:db8::1"),
+            ("2001:db8::1".to_string(), None)
+        );
+        // Bracketed IPv6 with port.
+        assert_eq!(
+            split_host_port("[::1]:4433"),
+            ("::1".to_string(), Some(4433))
+        );
+        assert_eq!(split_host_port("[::1]"), ("::1".to_string(), None));
+    }
+
+    #[test]
+    fn format_host_port_brackets_ipv6() {
+        assert_eq!(format_host_port("127.0.0.1", 4433), "127.0.0.1:4433");
+        assert_eq!(format_host_port("example.com", 4433), "example.com:4433");
+        assert_eq!(format_host_port("::1", 4433), "[::1]:4433");
+        assert_eq!(format_host_port("2001:db8::1", 9000), "[2001:db8::1]:9000");
+        // Already bracketed -> left alone.
+        assert_eq!(format_host_port("[::1]", 4433), "[::1]:4433");
+    }
+
+    #[test]
+    fn resolve_ipv6_url_brackets_socket_string() {
+        let cfg = ConfigFile::default();
+        let spec = resolve(Some("qftp://[::1]:4433"), &cfg, &Overrides::default()).unwrap();
+        assert_eq!(spec.host, "[::1]:4433");
+        // SocketAddr should be parseable.
+        let _: std::net::SocketAddr = spec.host.parse().unwrap();
     }
 
     #[test]
@@ -473,6 +627,18 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("nope"));
         assert!(msg.contains("work"));
+    }
+
+    #[test]
+    fn resolve_flag_host_accepts_bracketed_ipv6() {
+        let cfg = ConfigFile::default();
+        let overrides = Overrides {
+            host: Some("[2001:db8::1]:5555".to_string()),
+            ..Overrides::default()
+        };
+        let spec = resolve(None, &cfg, &overrides).unwrap();
+        assert_eq!(spec.host, "[2001:db8::1]:5555");
+        let _: std::net::SocketAddr = spec.host.parse().unwrap();
     }
 
     #[test]

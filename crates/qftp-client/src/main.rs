@@ -72,7 +72,11 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let config_path = args.config.clone().or_else(config::default_config_path);
+    let config_path = args
+        .config
+        .as_ref()
+        .map(|p| PathBuf::from(config::expand_tilde(&p.to_string_lossy())))
+        .or_else(config::default_config_path);
     let cfg_file = match &config_path {
         Some(p) => config::ConfigFile::load(p)?,
         None => config::ConfigFile::default(),
