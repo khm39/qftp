@@ -515,6 +515,26 @@ fn process_readable_streams(
                     }
                 };
                 if let Some(req) = req {
+                    // #140: enforce per-field length caps on top of
+                    // the 16 MiB frame cap. A peer that packed a
+                    // multi-MiB path string into a single field
+                    // would otherwise allocate that much during
+                    // decode; bincode's with_limit bounds the total
+                    // frame, not individual fields.
+                    if let Err(e) = qftp_common::protocol::validate_request(&req) {
+                        warn!(
+                            peer = %ctx.peer_addr,
+                            stream_id,
+                            error = %e,
+                            "request failed per-field validation; closing stream"
+                        );
+                        actions.push(PendingAction::AclReject {
+                            stream_id,
+                            resp: err(ErrorCode::Malformed, e.to_string()),
+                        });
+                        *state = StreamState::Done;
+                        continue;
+                    }
                     metrics.requests_total.fetch_add(1, Ordering::Relaxed);
                     debug!(
                         peer = %ctx.peer_addr,

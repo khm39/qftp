@@ -447,6 +447,11 @@ fn poll_response(
 
         match recv_message::<Response>(conn, stream_id, &mut buf)? {
             Some(resp) => {
+                // #140: per-field cap defense in depth against a
+                // malicious server packing a multi-MiB string / huge
+                // listing into a single field.
+                qftp_common::protocol::validate_response(&resp)
+                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
                 flush_egress(conn, socket)?;
                 return Ok(resp);
             }
