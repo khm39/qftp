@@ -90,8 +90,51 @@ jobs:
             qftp-*.tar.gz
             qftp-*.tar.gz.sha256
 
+  # Build .deb packages for the Linux matrix. cargo-deb consumes
+  # the `[package.metadata.deb]` section in each binary crate's
+  # Cargo.toml.
+  deb:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deb
+        run: cargo install --locked cargo-deb
+      - name: Install cross compiler (aarch64 only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+      - name: Build .deb packages
+        run: |
+          set -euo pipefail
+          for pkg in qftp-server qftp-client qftp-admin; do
+            cargo deb --target ${{ matrix.target }} -p "$pkg" --no-strip
+          done
+          mkdir -p dist-deb
+          find target/${{ matrix.target }}/debian -name '*.deb' -exec cp {} dist-deb/ \;
+          ls -la dist-deb/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: dist-deb/*.deb
+
   publish:
-    needs: build
+    needs: [build, deb]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -104,4 +147,4 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
           gh release create "$tag" --generate-notes \
-            $(find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' \))
+            $(find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.deb' \))
