@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use mio::{Events, Interest, Poll, Token};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
@@ -89,6 +90,12 @@ struct Args {
     /// `~/.qftp_history`.
     #[arg(long)]
     history: Option<PathBuf>,
+    /// Print a shell-completion script to stdout and exit.
+    /// Pipe it into the right place for your shell, e.g.
+    ///   `qftp-client --generate-completions bash | sudo tee \
+    ///   /etc/bash_completion.d/qftp-client`.
+    #[arg(long, value_name = "SHELL")]
+    generate_completions: Option<Shell>,
 }
 
 /// One-shot subcommands modelled on scp / sftp's single-shot UX.
@@ -151,6 +158,13 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if let Some(shell) = args.generate_completions {
+        let mut cmd = Args::command();
+        let bin = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
+        return Ok(());
+    }
 
     let config_path = args
         .config
