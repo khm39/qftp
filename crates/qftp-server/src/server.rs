@@ -48,6 +48,13 @@ use crate::user::{self, UserDirectory};
 /// mutate persistent state. Anything that writes or renames is
 /// refused so a captured 0-RTT flight cannot be replayed to put the
 /// server into a different state.
+/// 0-RTT replay safety cap on `Get`: a captured 0-RTT Get is bandwidth
+/// amplification when source-spoofed (#138). Allow small ranged reads
+/// in 0-RTT (existence probes, header sniffs) but demote anything
+/// without a length or larger than this cap to 1-RTT so QUIC address
+/// validation gates the response.
+const REPLAY_SAFE_GET_MAX_LEN: u64 = 64 * 1024;
+
 fn request_is_replay_safe(req: &Request) -> bool {
     // #127: Quota is intentionally NOT in this set. Even though
     // #111 caches the usage so the reply is cheap, treating it as
@@ -56,15 +63,18 @@ fn request_is_replay_safe(req: &Request) -> bool {
     // useful primarily as an amplification primitive. The latency
     // cost of forcing 1-RTT for Quota is negligible since it runs
     // once per session.
-    matches!(
-        req,
+    match req {
         Request::Ls { .. }
-            | Request::Cd { .. }
-            | Request::Pwd
-            | Request::Stat { .. }
-            | Request::Get { .. }
-            | Request::Quit,
-    )
+        | Request::Cd { .. }
+        | Request::Pwd
+        | Request::Stat { .. }
+        | Request::Quit => true,
+        // #138: only short ranged Gets are replay-safe. An unbounded
+        // Get against a large file replayed with a spoofed source
+        // becomes a reflection amplifier.
+        Request::Get { length, .. } => matches!(length, Some(n) if *n <= REPLAY_SAFE_GET_MAX_LEN),
+        _ => false,
+    }
 }
 
 const SERVER_TOKEN: Token = Token(0);
@@ -1380,9 +1390,25 @@ mod tests {
         assert!(request_is_replay_safe(&Request::Get {
             path: "x".into(),
             offset: 0,
-            length: None,
+            length: Some(REPLAY_SAFE_GET_MAX_LEN),
         }));
         assert!(request_is_replay_safe(&Request::Quit));
+    }
+
+    /// #138: Get without a length cap, or with too large a length, is
+    /// a 0-RTT reflection amplifier and must be demoted to 1-RTT.
+    #[test]
+    fn replay_safe_rejects_unbounded_get() {
+        assert!(!request_is_replay_safe(&Request::Get {
+            path: "x".into(),
+            offset: 0,
+            length: None,
+        }));
+        assert!(!request_is_replay_safe(&Request::Get {
+            path: "x".into(),
+            offset: 0,
+            length: Some(REPLAY_SAFE_GET_MAX_LEN + 1),
+        }));
     }
 
     #[test]
