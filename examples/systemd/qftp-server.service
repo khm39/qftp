@@ -1,0 +1,52 @@
+[Unit]
+Description=QFTP file transfer server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Dedicated unprivileged user, created and torn down with the unit.
+DynamicUser=yes
+RuntimeDirectory=qftp
+StateDirectory=qftp
+
+# Binary lives wherever cargo install / dpkg / the release tarball put it.
+ExecStart=/usr/local/bin/qftp-server \
+    --bind 0.0.0.0:4433 \
+    --root %S/qftp \
+    --cert /etc/qftp/server.crt --key /etc/qftp/server.key \
+    --client-ca /etc/qftp/ca.crt \
+    --users /etc/qftp/users.toml \
+    --require-retry \
+    --max-connections 256 \
+    --max-connections-per-ip 16 \
+    --metrics-bind 127.0.0.1:9090 \
+    --log-format json
+
+# Send SIGTERM, give the server time to drain its connections, then SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart on crash but not on clean shutdown.
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ReadWritePaths=%S/qftp
+
+[Install]
+WantedBy=multi-user.target
