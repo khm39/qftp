@@ -19,3 +19,15 @@ toml_edit = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+
+[package.metadata.deb]
+maintainer = "qftp contributors"
+copyright = "MIT OR Apache-2.0"
+extended-description = """\
+Ops-side CLI for editing qftp-server's users.toml."""
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/qftp-admin", "/usr/bin/", "755"],
+]
+depends = "qftp-server"
