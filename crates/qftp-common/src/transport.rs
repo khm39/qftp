@@ -67,12 +67,15 @@ pub fn tune_udp_buffers(socket: &std::net::UdpSocket) {
 pub fn tune_udp_buffers(_socket: &std::net::UdpSocket) {}
 
 /// Maximum number of QUIC datagrams to coalesce into a single
-/// `sendmsg(UDP_SEGMENT)` burst (#151). Sized so one burst is ~86 KiB
-/// at our MTU — large enough to cut the per-packet syscall rate by
-/// ~64× without holding the egress path so long that pacing turns
-/// into jitter. Linux UDP_SEGMENT itself caps at 64 segments per
-/// skbuff, so going higher would just be wasted buffer.
-const GSO_BURST_PACKETS: usize = 64;
+/// `sendmsg(UDP_SEGMENT)` burst (#151). The underlying GSO skb must
+/// fit within Linux's per-device `gso_max_size`, which is 65 536
+/// bytes on every NIC we've seen (including loopback). At our
+/// `MAX_DATAGRAM_SIZE = 1350` that gives a hard ceiling of 48
+/// segments before the kernel returns `EMSGSIZE` and our fallback
+/// path kicks in; 32 leaves comfortable headroom for slightly
+/// larger MTUs (DPLPMTUD pushing us toward 1500) without flipping
+/// the GSO-disabled flag.
+const GSO_BURST_PACKETS: usize = 32;
 
 /// Tracks whether UDP_SEGMENT (GSO) is usable on this socket. Starts
 /// in "try" state, flips to "off" the first time the kernel rejects a
