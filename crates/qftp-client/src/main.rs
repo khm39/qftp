@@ -10,6 +10,7 @@ use mio::{Events, Interest, Poll, Token};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
+mod completer;
 mod config;
 mod connect;
 mod fanout;
@@ -17,6 +18,7 @@ mod known_hosts;
 mod oneshot;
 mod repl;
 mod session_store;
+mod stats;
 mod sync;
 mod transfer;
 mod watch;
@@ -149,6 +151,21 @@ enum OneShot {
         /// Recurse into directories.
         #[arg(short = 'r', long)]
         recursive: bool,
+        /// Skip uploads whose destination already exists. Server-side
+        /// enforced (returns AlreadyExists for races).
+        #[arg(short = 'n', long, conflicts_with_all = ["force", "interactive"])]
+        no_clobber: bool,
+        /// Overwrite existing destinations without asking. Default on
+        /// non-TTY stdin; on a TTY, the default is `--interactive`.
+        #[arg(short = 'f', long, conflicts_with = "interactive")]
+        force: bool,
+        /// On a TTY, prompt before overwriting an existing destination.
+        /// Defaults on when stdin is a TTY.
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Print the upload plan without transferring anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Download a remote path to a local file.
     Get {
@@ -160,6 +177,20 @@ enum OneShot {
         /// Recurse into directories.
         #[arg(short = 'r', long)]
         recursive: bool,
+        /// Skip the download if the local destination already exists.
+        #[arg(short = 'n', long, conflicts_with_all = ["force", "interactive"])]
+        no_clobber: bool,
+        /// Overwrite a pre-existing local file (delete + re-download).
+        /// On a non-TTY stdin this is the default.
+        #[arg(short = 'f', long, conflicts_with = "interactive")]
+        force: bool,
+        /// On a TTY, prompt before overwriting an existing local file.
+        /// Defaults on when stdin is a TTY.
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Print the download plan without transferring anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List a remote directory.
     Ls {
@@ -222,6 +253,7 @@ enum OneShot {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    stats::init();
 
     // Tracing init: `-v` family wins over RUST_LOG. `-q` falls to
     // warn so the user only sees errors (progress bars are silenced
@@ -528,7 +560,12 @@ fn run_interactive(
     next_stream_id: &mut u64,
     local_cwd: &mut PathBuf,
 ) -> Result<()> {
-    let mut rl = rustyline::DefaultEditor::new()?;
+    // Tab completion wired through `ReplHelper` (#64). Without an
+    // explicit helper rustyline emits a beep on TAB; with it we get
+    // first-word command completion + local-path completion for the
+    // `put`/`lcd`/`lls`/`lmkdir`/`!` family.
+    let mut rl: rustyline::Editor<completer::ReplHelper, _> = rustyline::Editor::new()?;
+    rl.set_helper(Some(completer::ReplHelper::new()));
     let hist_path = history_path(args);
     if let Some(p) = &hist_path {
         let _ = rl.load_history(p);
@@ -651,6 +688,10 @@ fn run_one_line(
             }
             return Ok(());
         }
+        repl::Command::Stats => {
+            stats::print(&stats::snapshot());
+            return Ok(());
+        }
         repl::Command::Shell(rest) => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             let mut cmd_proc = std::process::Command::new(&shell);
@@ -753,9 +794,9 @@ fn run_one_line(
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "uploaded".to_string())
                     });
-                    if let Err(e) =
-                        transfer::do_put(conn, socket, poll, events, stream_id, &path, &target, 0)
-                    {
+                    if let Err(e) = transfer::do_put(
+                        conn, socket, poll, events, stream_id, &path, &target, 0, false,
+                    ) {
                         println!("put {} failed: {e}", path.display());
                     }
                 }
@@ -916,7 +957,17 @@ fn do_recursive_put(
     if !local.is_dir() {
         // -r on a file degrades to a normal put.
         let stream_id = take_stream(next_stream_id);
-        return transfer::do_put(conn, socket, poll, events, stream_id, local, remote_root, 0);
+        return transfer::do_put(
+            conn,
+            socket,
+            poll,
+            events,
+            stream_id,
+            local,
+            remote_root,
+            0,
+            false,
+        );
     }
     // Ensure top-level mkdir.
     let stream_id = take_stream(next_stream_id);
@@ -974,6 +1025,7 @@ fn do_recursive_put(
                     &path,
                     &remote_child,
                     0,
+                    false,
                 ) {
                     println!("put {} failed: {e}", path.display());
                 }

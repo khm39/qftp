@@ -18,7 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rustyline = "15"
+rustyline = { version = "15", features = ["derive"] }
 ring = "0.17"
 blake3 = "1"
 indicatif = "0.18"

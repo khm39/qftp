@@ -190,6 +190,38 @@ fn report_response_for_status(resp: &Response) -> i32 {
     }
 }
 
+/// How an existing destination is handled by a Put / Get. Captures
+/// the `--no-clobber` / `--force` / `--interactive` flag interaction
+/// in one place so the policy lives next to the dispatch (rather than
+/// being re-derived inside each transfer helper). `interactive` is the
+/// rsync default on a TTY; non-TTY defaults to `force` (silent
+/// overwrite) so scripted batches keep their previous behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClobberPolicy {
+    /// `-f` / `--force`: overwrite the destination silently.
+    Force,
+    /// `-n` / `--no-clobber`: refuse to overwrite. Wire-enforced via
+    /// `Request::Put { no_clobber: true }`; local Gets compare the
+    /// destination path before opening the network stream.
+    NoClobber,
+    /// `-i` / `--interactive`: prompt y/N before overwriting.
+    Interactive,
+}
+
+fn resolve_clobber(no_clobber: bool, force: bool, interactive: bool) -> ClobberPolicy {
+    if no_clobber {
+        ClobberPolicy::NoClobber
+    } else if force {
+        ClobberPolicy::Force
+    } else if interactive || std::io::stdin().is_terminal() {
+        // Explicit `-i` and TTY default both land in the same arm:
+        // ask before overwriting. rsync uses the same heuristic.
+        ClobberPolicy::Interactive
+    } else {
+        ClobberPolicy::Force
+    }
+}
+
 /// Dispatch entry point called from `main`. Returns the process
 /// exit code; `main` calls `std::process::exit` with it.
 pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
@@ -198,12 +230,34 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
             local,
             remote,
             recursive,
-        } => run_put(&local, &remote, recursive, &overrides),
+            no_clobber,
+            force,
+            interactive,
+            dry_run,
+        } => run_put(
+            &local,
+            &remote,
+            recursive,
+            resolve_clobber(no_clobber, force, interactive),
+            dry_run,
+            &overrides,
+        ),
         OneShot::Get {
             remote,
             local,
             recursive,
-        } => run_get(&remote, local.as_deref(), recursive, &overrides),
+            no_clobber,
+            force,
+            interactive,
+            dry_run,
+        } => run_get(
+            &remote,
+            local.as_deref(),
+            recursive,
+            resolve_clobber(no_clobber, force, interactive),
+            dry_run,
+            &overrides,
+        ),
         OneShot::Ls { remote } => run_remote_oneshot(&remote, &overrides, |path| Request::Ls {
             path: path.into(),
         }),
@@ -318,6 +372,8 @@ fn run_get(
     remote_url: &str,
     local: Option<&str>,
     recursive: bool,
+    clobber: ClobberPolicy,
+    dry_run: bool,
     overrides: &Overrides,
 ) -> Result<i32> {
     if recursive {
@@ -343,6 +399,58 @@ fn run_get(
             PathBuf::from(name)
         }
     };
+    // #70: --dry-run / --no-clobber / --interactive policy on Get
+    // operates purely on the *local* side. transfer::do_get itself
+    // already resumes a pre-existing partial download by appending
+    // to it; the override here turns that into "skip" or "redownload
+    // from scratch" depending on the flag.
+    let local_exists = local_path.exists();
+    if dry_run {
+        if local_exists {
+            match clobber {
+                ClobberPolicy::NoClobber => {
+                    println!(
+                        "would skip (exists, --no-clobber): {}",
+                        local_path.display()
+                    );
+                }
+                ClobberPolicy::Force => {
+                    println!(
+                        "would overwrite (exists, --force): {}",
+                        local_path.display()
+                    );
+                }
+                ClobberPolicy::Interactive => {
+                    println!("would prompt (exists): {}", local_path.display());
+                }
+            }
+        } else {
+            println!("would download: {} -> {}", r.path, local_path.display());
+        }
+        return Ok(exit::OK);
+    }
+    if local_exists {
+        match clobber {
+            ClobberPolicy::NoClobber => {
+                eprintln!("skipping (exists, --no-clobber): {}", local_path.display());
+                return Ok(exit::OK);
+            }
+            ClobberPolicy::Interactive => {
+                if !prompt_overwrite(&local_path.display().to_string())? {
+                    eprintln!("skipped: {}", local_path.display());
+                    return Ok(exit::OK);
+                }
+                // User said yes -- treat as force (start over).
+                let _ = std::fs::remove_file(&local_path);
+            }
+            ClobberPolicy::Force => {
+                // do_get's default behaviour is to *resume* from any
+                // existing local file. --force means the user wants
+                // a fresh download instead.
+                let _ = std::fs::remove_file(&local_path);
+            }
+        }
+    }
     with_connection(&spec, |conn, socket, poll, events, next| {
         let stream_id = take_stream(next);
         match transfer::do_get(conn, socket, poll, events, stream_id, &r.path, &local_path) {
@@ -359,6 +467,8 @@ fn run_put(
     locals: &[String],
     remote_url: &str,
     recursive: bool,
+    clobber: ClobberPolicy,
+    dry_run: bool,
     overrides: &Overrides,
 ) -> Result<i32> {
     if locals.is_empty() {
@@ -381,6 +491,9 @@ fn run_put(
     let multiple = locals.len() > 1;
     let target_is_dir = r.path.ends_with('/') || multiple;
 
+    // For dry-run we still open the connection so the user sees auth
+    // failures and remote-existence checks; the actual transfer is
+    // gated on `!dry_run`.
     with_connection(&spec, |conn, socket, poll, events, next| {
         let mut worst = exit::OK;
         for local in locals {
@@ -400,8 +513,60 @@ fn run_put(
             } else {
                 r.path.clone()
             };
+
+            // Pre-check existence on remote when the policy needs to
+            // know (so we can skip the body upload for --no-clobber
+            // and prompt for --interactive). --force skips the probe
+            // and pays no extra round-trip.
+            let mut effective_no_clobber = false;
+            if !matches!(clobber, ClobberPolicy::Force) {
+                let exists =
+                    remote_exists(conn, socket, poll, events, next, &dest)?.unwrap_or(false);
+                match clobber {
+                    ClobberPolicy::Force => {}
+                    ClobberPolicy::NoClobber => {
+                        if exists {
+                            if dry_run {
+                                println!("would skip (exists, --no-clobber): {local} -> {dest}");
+                            } else {
+                                eprintln!("skipping (exists, --no-clobber): {local} -> {dest}");
+                            }
+                            continue;
+                        }
+                        // Wire it on regardless so a race between the
+                        // probe and the upload still gets refused.
+                        effective_no_clobber = true;
+                    }
+                    ClobberPolicy::Interactive => {
+                        if exists {
+                            if dry_run {
+                                println!("would prompt (exists): {local} -> {dest}");
+                                continue;
+                            }
+                            if !prompt_overwrite(&dest)? {
+                                eprintln!("skipped: {dest}");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if dry_run {
+                println!("would upload: {local} -> {dest}");
+                continue;
+            }
             let stream_id = take_stream(next);
-            match transfer::do_put(conn, socket, poll, events, stream_id, &local_path, &dest, 0) {
+            match transfer::do_put(
+                conn,
+                socket,
+                poll,
+                events,
+                stream_id,
+                &local_path,
+                &dest,
+                0,
+                effective_no_clobber,
+            ) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("put {local} -> {dest} failed: {e}");
@@ -413,6 +578,56 @@ fn run_put(
     })
 }
 
+/// Probe whether `path` exists on the remote via `Stat`. Returns
+/// `Some(bool)` for a definitive yes/no, `None` if the server
+/// answered with an error we couldn't interpret (treated as "unknown
+/// — don't skip the upload"). Used by `run_put` to short-circuit
+/// `--no-clobber` and `--interactive` without sending body bytes.
+fn remote_exists(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next: &mut u64,
+    path: &str,
+) -> Result<Option<bool>> {
+    let resp = one_request(
+        conn,
+        socket,
+        poll,
+        events,
+        next,
+        &Request::Stat {
+            path: path.to_string(),
+        },
+    )?;
+    Ok(match resp {
+        Response::FileStat(_) => Some(true),
+        Response::Err(e) if matches!(e.code, ErrorCode::NotFound) => Some(false),
+        _ => None,
+    })
+}
+
+/// Read a y/N answer from stdin. Returns `true` only for an explicit
+/// 'y'/'yes' (case-insensitive). EOF / read error / anything else
+/// counts as no.
+fn prompt_overwrite(target: &str) -> Result<bool> {
+    use std::io::BufRead;
+    eprint!("Overwrite '{target}'? [y/N] ");
+    flush_stdout();
+    let _ = std::io::stderr().flush();
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut line = String::new();
+    match handle.read_line(&mut line) {
+        Ok(0) | Err(_) => Ok(false),
+        Ok(_) => {
+            let t = line.trim().to_ascii_lowercase();
+            Ok(t == "y" || t == "yes")
+        }
+    }
+}
+
 // Suppress dead-code warning until additional UX features (#73,
 // #80) use this; keeps the helper public to other modules without
 // triggering clippy on this PR alone.
@@ -421,7 +636,6 @@ fn is_tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
-#[allow(dead_code)]
 fn flush_stdout() {
     let _ = std::io::stdout().flush();
 }

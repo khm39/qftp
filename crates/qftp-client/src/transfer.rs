@@ -160,6 +160,26 @@ pub fn do_get(
     remote: &str,
     local: &Path,
 ) -> Result<()> {
+    // #80: parent span for the whole download so structured logs
+    // group the FileReady / chunk / verify events under a single
+    // (op=get, stream_id=N, path=...) header.
+    let _span = tracing::info_span!("transfer", op = "get", stream_id, path = %remote).entered();
+    let result = do_get_inner(conn, socket, poll, events, stream_id, remote, local);
+    if result.is_err() {
+        crate::stats::record_failure();
+    }
+    result
+}
+
+fn do_get_inner(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    stream_id: u64,
+    remote: &str,
+    local: &Path,
+) -> Result<()> {
     let resume_offset = match std::fs::metadata(local) {
         Ok(m) if m.is_file() => m.len(),
         _ => 0,
@@ -369,12 +389,15 @@ pub fn do_get(
         local.display(),
         if checksum_follows { "" } else { "un" }
     );
+    crate::stats::record_download(size);
     Ok(())
 }
 
 /// Upload `local` to `remote`. Sends a BLAKE3 checksum the server can
 /// verify against the received bytes. Resume from an existing
 /// server-side temp at `offset` is supported by passing it through.
+/// `no_clobber` (#70) asks the server to refuse the Put with
+/// `AlreadyExists` rather than overwrite a pre-existing destination.
 #[allow(clippy::too_many_arguments)]
 pub fn do_put(
     conn: &mut quiche::Connection,
@@ -385,6 +408,30 @@ pub fn do_put(
     local: &Path,
     remote: &str,
     offset: u64,
+    no_clobber: bool,
+) -> Result<()> {
+    // #80: parent span for the whole upload.
+    let _span = tracing::info_span!("transfer", op = "put", stream_id, path = %remote).entered();
+    let result = do_put_inner(
+        conn, socket, poll, events, stream_id, local, remote, offset, no_clobber,
+    );
+    if result.is_err() {
+        crate::stats::record_failure();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_put_inner(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    stream_id: u64,
+    local: &Path,
+    remote: &str,
+    offset: u64,
+    no_clobber: bool,
 ) -> Result<()> {
     let meta =
         std::fs::metadata(local).with_context(|| format!("stat {} for upload", local.display()))?;
@@ -418,6 +465,7 @@ pub fn do_put(
         mode,
         offset,
         checksum: Some(checksum),
+        no_clobber,
     };
     send_message(conn, stream_id, &req)?;
     flush_egress(conn, socket)?;
@@ -487,6 +535,7 @@ pub fn do_put(
     match resp {
         Response::Ok => {
             println!("Uploaded {bytes_to_send} bytes to {remote} (verified)");
+            crate::stats::record_upload(bytes_to_send);
             Ok(())
         }
         Response::Err(e) => bail!("server refused Put: {} ({:?})", e.message, e.code),
