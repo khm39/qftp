@@ -19,10 +19,24 @@ mod transfer;
 
 const CLIENT: Token = Token(0);
 
+/// Long-form `--version` body. Built from the package version plus
+/// the build-time facts injected by `build.rs`.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n  build:  ",
+    env!("QFTP_BUILD_DATE"),
+    "\n  commit: ",
+    env!("QFTP_GIT_REV"),
+    "\n  target: ",
+    env!("TARGET_TRIPLE"),
+);
+
 #[derive(Parser)]
 #[command(
     name = "qftp-client",
     about = "QUIC File Transfer Protocol Client",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = LONG_VERSION,
     long_about = "Connect to a qftp server. The positional TARGET is either a \
         qftp:// URL (e.g. qftp://user@host:4433/path) or the name of a host \
         alias defined in ~/.qftp/config.toml. Flag overrides have the highest \

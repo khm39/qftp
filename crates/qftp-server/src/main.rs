@@ -20,8 +20,23 @@ mod retry;
 mod server;
 mod user;
 
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n  build:  ",
+    env!("QFTP_BUILD_DATE"),
+    "\n  commit: ",
+    env!("QFTP_GIT_REV"),
+    "\n  target: ",
+    env!("TARGET_TRIPLE"),
+);
+
 #[derive(Parser)]
-#[command(name = "qftp-server", about = "QUIC File Transfer Protocol Server")]
+#[command(
+    name = "qftp-server",
+    about = "QUIC File Transfer Protocol Server",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = LONG_VERSION,
+)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:4433")]
     bind: String,
