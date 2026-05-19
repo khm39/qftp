@@ -397,7 +397,21 @@ fn log_fingerprint(cert_pem: &str, source: &str) {
 
 #[cfg(unix)]
 fn check_key_permissions(path: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path).context("failed to stat key file")?;
+    // #144: catch the misconfig where the key happens to be 0o600 but
+    // owned by a different user. The process can still read it, but
+    // it almost certainly indicates a deploy mistake worth surfacing
+    // before the server starts.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        anyhow::bail!(
+            "key file {} is owned by uid {}, expected {} (current effective uid)",
+            path,
+            meta.uid(),
+            euid
+        );
+    }
     let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
         anyhow::bail!(
