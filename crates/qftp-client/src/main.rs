@@ -16,6 +16,7 @@ mod oneshot;
 mod repl;
 mod session_store;
 mod transfer;
+mod watch;
 
 const CLIENT: Token = Token(0);
 
@@ -173,6 +174,19 @@ enum OneShot {
     Rename { from: String, to: String },
     /// Show metadata for a remote path.
     Stat { remote: String },
+    /// Watch a local directory and mirror create / modify / delete
+    /// events to a remote prefix. Runs until Ctrl-C.
+    Watch {
+        /// Local directory to watch.
+        local: String,
+        /// Remote URL prefix; events under <local> map to paths
+        /// under this prefix.
+        remote: String,
+        /// Debounce window in milliseconds. Bursty editors save in
+        /// flurries; collapsing nearby events avoids spurious Puts.
+        #[arg(long, default_value_t = 200)]
+        debounce_ms: u64,
+    },
 }
 
 fn main() -> Result<()> {
