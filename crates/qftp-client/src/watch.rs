@@ -214,8 +214,50 @@ fn run_session(
             continue;
         }
 
+        // #115: notify follows symlinks under the watched tree on
+        // Linux. A symlink planted inside `local_root` could point at
+        // `/home/user/.ssh/` and be silently uploaded. Resolve each
+        // event path through `canonicalize` and confirm the *real*
+        // path is still under the canonical root before acting.
+        let canonical_root = local_root
+            .canonicalize()
+            .with_context(|| format!("canonicalize watch root {}", local_root.display()))?;
         for (path, action) in pending.drain() {
-            let rel = match path.strip_prefix(local_root) {
+            let canonical = match path.canonicalize() {
+                Ok(p) => p,
+                Err(e) if matches!(action, Action::Delete) => {
+                    // Removed paths can't be canonicalized — but their
+                    // location can be, by taking the parent. If even
+                    // the parent disappeared, just trust the strip
+                    // prefix check; we're only sending an Rm.
+                    path.parent()
+                        .and_then(|p| p.canonicalize().ok())
+                        .filter(|p| p.starts_with(&canonical_root))
+                        .map(|_| path.clone())
+                        .unwrap_or_else(|| {
+                            tracing::warn!(error=%e, path=%path.display(),
+                                "watch: cannot canonicalize delete target; skipping");
+                            PathBuf::new()
+                        })
+                }
+                Err(e) => {
+                    tracing::warn!(error=%e, path=%path.display(),
+                        "watch: cannot canonicalize event path; skipping");
+                    continue;
+                }
+            };
+            if canonical.as_os_str().is_empty() {
+                continue;
+            }
+            if !canonical.starts_with(&canonical_root) {
+                tracing::warn!(
+                    path = %path.display(),
+                    resolved = %canonical.display(),
+                    "watch: ignoring event whose real path escapes the watched root (#115)"
+                );
+                continue;
+            }
+            let rel = match canonical.strip_prefix(&canonical_root) {
                 Ok(r) => r,
                 Err(_) => continue,
             };

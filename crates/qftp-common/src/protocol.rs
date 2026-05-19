@@ -22,6 +22,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Reject `name` as a directory-entry component if it can be used to
+/// escape its parent on either side of the protocol. The check is
+/// purely lexical and runs on values arriving from the network — i.e.
+/// every `DirEntry.name` the client receives from a server, and every
+/// path fragment the server hands back in a listing. Rules:
+///
+///   - empty string
+///   - "." or ".."
+///   - any '/' (POSIX separator)
+///   - any '\\' (Windows separator; rejected unconditionally so the
+///     same listing is safe on both platforms)
+///   - any NUL byte
+///   - leading whitespace or control characters are not blocked here;
+///     `Path::join` handles those harmlessly. Path-traversal is the
+///     concern (#108 / SECURITY.md).
+pub fn safe_entry_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    !name.contains(['/', '\\', '\0'])
+}
+
 /// ALPN value advertised over QUIC. The trailing major version lets us
 /// retire wire-incompatible revisions cleanly.
 pub const ALPN: &[u8] = b"qftp/1";
@@ -294,6 +316,21 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn safe_entry_name_rejects_traversal() {
+        assert!(!safe_entry_name(""));
+        assert!(!safe_entry_name("."));
+        assert!(!safe_entry_name(".."));
+        assert!(!safe_entry_name("a/b"));
+        assert!(!safe_entry_name("..\\foo"));
+        assert!(!safe_entry_name("foo\0bar"));
+        assert!(!safe_entry_name("/etc/passwd"));
+        assert!(safe_entry_name("normal.txt"));
+        assert!(safe_entry_name("file with spaces"));
+        assert!(safe_entry_name("ünicode-ok"));
+        assert!(safe_entry_name("..hidden"));
     }
 
     #[test]

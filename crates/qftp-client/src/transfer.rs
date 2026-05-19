@@ -187,10 +187,18 @@ pub fn do_get(
         other => bail!("unexpected response to Get: {other:?}"),
     };
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(resume_offset == 0)
+    // #109: refuse to open through a pre-existing symlink. Combined
+    // with #108's name filter this stops a malicious server from
+    // pointing a recursive download at, say, ~/.ssh/authorized_keys
+    // via a planted symlink in the destination directory.
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(resume_offset == 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;
     if resume_offset > 0 {

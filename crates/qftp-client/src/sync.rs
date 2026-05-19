@@ -292,6 +292,19 @@ fn walk_remote(
             _ => continue,
         };
         for e in entries {
+            // #108: a malicious server could synthesize entry names with
+            // `..` or absolute paths. With `--delete`, those names would
+            // be echoed back as `Rm` requests, asking the server to
+            // delete arbitrary paths. Reject lexically before we even
+            // remember the name.
+            if !qftp_common::protocol::safe_entry_name(&e.name) {
+                tracing::warn!(
+                    name = %e.name,
+                    parent = %abs,
+                    "sync: ignoring unsafe entry name from server"
+                );
+                continue;
+            }
             let child_abs = if abs.ends_with('/') {
                 format!("{abs}{}", e.name)
             } else {
