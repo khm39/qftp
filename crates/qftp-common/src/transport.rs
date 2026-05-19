@@ -511,6 +511,16 @@ fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> R
     config.set_initial_max_streams_bidi(4);
     config.set_disable_active_migration(true);
 
+    // Pacing is on by default in quiche, which makes `conn.send` return
+    // `Done` after one BBR-calculated burst even when many packets are
+    // queued. That defeats our `sendmsg(UDP_SEGMENT)` coalescing in
+    // `flush_egress` (#151) -- we'd land 1-3 packets per batch instead
+    // of the 64-packet GSO cap. The protocol does its own back-pressure
+    // via QUIC's flow-control window, and the existing congestion
+    // controller still gates total in-flight bytes, so disabling the
+    // explicit pacer just lets us drain queued packets in one syscall.
+    config.enable_pacing(false);
+
     // 0-RTT resumption. Server-side replay protection is enforced in
     // the per-Request decode path (write ops refused while
     // `is_in_early_data()`). The client side gates this on whether
