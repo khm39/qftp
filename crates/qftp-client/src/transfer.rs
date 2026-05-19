@@ -20,6 +20,16 @@ use qftp_common::transport::*;
 
 const CHUNK: usize = 64 * 1024;
 
+/// Outer-loop buffer for the upload body. Sized much larger than the
+/// generic `CHUNK` so a 64 MiB put runs the outer event-loop step ~64
+/// times instead of ~1024: each extra trip costs a `read_exact`,
+/// stream_send call, ingress drain, and flush_egress, and at small
+/// chunk sizes the fixed overhead — not flow-control — was capping
+/// loopback put at ~65 MiB/s (#150). quiche handles partial accepts
+/// via the inner stream_send loop, so a larger buffer is purely a
+/// win when cwnd is open and degrades gracefully when it isn't.
+const UPLOAD_CHUNK: usize = 1024 * 1024;
+
 /// Process-wide flag set from `--quiet`. When true, `make_bar`
 /// returns a hidden ProgressBar so callers don't have to thread the
 /// flag through every transfer entry point.
@@ -441,20 +451,10 @@ fn do_put_inner(
         bail!("resume offset {offset} is past local file size {size}; refusing");
     }
 
-    // Hash whole local file first so we have a checksum to commit to.
+    // Streaming BLAKE3 (#152): hash incrementally as we read+send,
+    // then ship the 32-byte digest as an in-band trailer after the
+    // body. Saves the upfront full-file read+hash pass.
     let mut hasher = blake3::Hasher::new();
-    {
-        let mut f = File::open(local).context("opening local for hashing")?;
-        let mut buf = [0u8; CHUNK];
-        loop {
-            let n = f.read(&mut buf).context("reading local for hashing")?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-    }
-    let checksum = *hasher.finalize().as_bytes();
 
     let bytes_to_send = size - offset;
     let mode = unix_mode(&meta);
@@ -464,22 +464,39 @@ fn do_put_inner(
         size: bytes_to_send,
         mode,
         offset,
-        checksum: Some(checksum),
+        // checksum_trailer below carries the verification path; leave
+        // the legacy header field empty so the server ignores it.
+        checksum: None,
         no_clobber,
+        checksum_trailer: true,
     };
     send_message(conn, stream_id, &req)?;
     flush_egress(conn, socket)?;
 
     let mut f = File::open(local).context("opening local for send")?;
+    // For resume (offset > 0), the server reconstructed BLAKE3 over the
+    // existing prefix already; the client has to hash the prefix too so
+    // the trailer covers the same byte range. Read once for hashing
+    // only, then seek to `offset` for the actual send.
     if offset > 0 {
-        f.seek(SeekFrom::Start(offset))?;
+        let mut prefix_buf = [0u8; CHUNK];
+        let mut left = offset;
+        while left > 0 {
+            let want = (left as usize).min(prefix_buf.len());
+            f.read_exact(&mut prefix_buf[..want])
+                .context("reading local resume prefix for hash")?;
+            hasher.update(&prefix_buf[..want]);
+            left -= want as u64;
+        }
+        // f is now positioned at offset, which is where the send loop
+        // wants to start.
     }
 
     let bar = make_bar(size, "upload");
     bar.set_position(offset);
 
     let mut sent: u64 = 0;
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; UPLOAD_CHUNK];
     let mut pacer = Pacer::new();
     let mut recv_buf = [0u8; 65535];
     while sent < bytes_to_send {
@@ -487,12 +504,14 @@ fn do_put_inner(
         let want = want.min(buf.len());
         f.read_exact(&mut buf[..want])
             .context("reading local chunk")?;
-        let is_last = sent + want as u64 == bytes_to_send;
+        // Hash before send -- the buffer is already in cache from
+        // read_exact, so this pass is essentially free.
+        hasher.update(&buf[..want]);
 
         // Bandwidth throttle (`--bwlimit`). No-op when unlimited.
         pacer.consume(want);
 
-        // Drive a single CHUNK to the wire. quiche's stream_send will
+        // Drive a single chunk to the wire. quiche's stream_send will
         // truncate or refuse the write when the connection's send
         // capacity (flow-control + congestion window) is exhausted —
         // in both cases we have to flush egress and pull ACKs in
@@ -500,11 +519,13 @@ fn do_put_inner(
         // version of this loop propagated `Error::Done` immediately,
         // which made any upload that didn't fit in the initial cwnd
         // (~14 KiB) fail outright.
+        //
+        // The trailer (#152) carries the FIN; never set chunk_fin on
+        // body bytes.
         let mut sub = 0usize;
         while sub < want {
             let remaining = &buf[sub..want];
-            let chunk_fin = is_last && (sub + remaining.len() == want);
-            match conn.stream_send(stream_id, remaining, chunk_fin) {
+            match conn.stream_send(stream_id, remaining, false) {
                 Ok(0) | Err(quiche::Error::Done) => {
                     flush_egress(conn, socket)?;
                     poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
@@ -523,12 +544,37 @@ fn do_put_inner(
         sent += want as u64;
         bar.set_position(offset + sent);
 
-        // Pump any incoming acks so flow-control opens up.
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
-        conn.on_timeout();
+        // Non-blocking ingress drain so ACKs keep cwnd opening, but
+        // do NOT block in poll.poll here: back-pressure is already
+        // handled by the inner `Done -> poll.poll` path, and a
+        // mandatory per-chunk poll capped loopback put at ~65 MiB/s
+        // (#150) by sleeping on `conn.timeout()` between chunks even
+        // when send capacity was fine.
         handle_ingress(conn, socket, &mut recv_buf)?;
         flush_egress(conn, socket)?;
     }
+
+    // Body fully queued. Push the 32-byte BLAKE3 trailer with FIN.
+    let trailer = *hasher.finalize().as_bytes();
+    let mut sub = 0usize;
+    while sub < trailer.len() {
+        let chunk_fin = sub == 0 || sub + (trailer.len() - sub) == trailer.len();
+        match conn.stream_send(stream_id, &trailer[sub..], chunk_fin) {
+            Ok(0) | Err(quiche::Error::Done) => {
+                flush_egress(conn, socket)?;
+                poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
+                conn.on_timeout();
+                handle_ingress(conn, socket, &mut recv_buf)?;
+                if conn.is_closed() {
+                    bail!("connection closed during trailer send");
+                }
+            }
+            Ok(n) => sub += n,
+            Err(e) => bail!("stream_send (trailer) failed: {e}"),
+        }
+    }
+    flush_egress(conn, socket)?;
+
     bar.finish_and_clear();
 
     let resp = poll_response(conn, socket, poll, events, stream_id)?;

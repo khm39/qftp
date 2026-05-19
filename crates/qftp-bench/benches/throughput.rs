@@ -20,9 +20,10 @@ use criterion::{BenchmarkId, Criterion, Throughput};
 
 use qftp_bench::{write_random_file, ServerFixture};
 
-/// Default size sweep, kept modest so a full bench run finishes in
-/// minutes rather than hours. Override with `QFTP_BENCH_SIZES`.
-const DEFAULT_SIZES: &[usize] = &[1 << 20, 16 << 20, 64 << 20];
+/// Default size sweep. Default goes up to 1 GiB so the steady-state
+/// throughput dominates handshake cost; override with `QFTP_BENCH_SIZES`
+/// for a faster smoke run.
+const DEFAULT_SIZES: &[usize] = &[1 << 20, 16 << 20, 64 << 20, 256 << 20, 1024 << 20];
 
 fn parse_sizes() -> Vec<usize> {
     let Ok(raw) = std::env::var("QFTP_BENCH_SIZES") else {
@@ -60,8 +61,11 @@ fn human_size(n: usize) -> String {
 fn bench_put(c: &mut Criterion, fixture: &ServerFixture, sizes: &[usize]) {
     let mut group = c.benchmark_group("put");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(20));
-    group.warm_up_time(Duration::from_secs(3));
+    // Big files need longer measurement / warmup windows so criterion
+    // doesn't print "Unable to complete N samples" or skew warmup to
+    // a fraction of one transfer.
+    group.measurement_time(Duration::from_secs(60));
+    group.warm_up_time(Duration::from_secs(5));
 
     let counter = AtomicU64::new(0);
 
@@ -81,9 +85,11 @@ fn bench_put(c: &mut Criterion, fixture: &ServerFixture, sizes: &[usize]) {
 
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
+                    let server_anon = fixture.root.path().join("anonymous");
                     for _ in 0..iters {
                         let n = counter.fetch_add(1, Ordering::Relaxed);
-                        let remote = format!("/put-{n}.bin");
+                        let remote_name = format!("put-{n}.bin");
+                        let remote = format!("/{remote_name}");
                         let script = format!("put {local_str} {remote}");
                         let start = Instant::now();
                         if let Err(e) = fixture.run_repl(&script) {
@@ -95,6 +101,9 @@ fn bench_put(c: &mut Criterion, fixture: &ServerFixture, sizes: &[usize]) {
                             eprintln!("warning: put iter {n}: {e}");
                         }
                         total += start.elapsed();
+                        // Reclaim the just-uploaded file so a multi-GiB
+                        // sweep doesn't exhaust the server's tempdir.
+                        let _ = std::fs::remove_file(server_anon.join(&remote_name));
                     }
                     total
                 });
@@ -108,8 +117,8 @@ fn bench_put(c: &mut Criterion, fixture: &ServerFixture, sizes: &[usize]) {
 fn bench_get(c: &mut Criterion, fixture: &ServerFixture, sizes: &[usize]) {
     let mut group = c.benchmark_group("get");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(20));
-    group.warm_up_time(Duration::from_secs(3));
+    group.measurement_time(Duration::from_secs(60));
+    group.warm_up_time(Duration::from_secs(5));
 
     for &size in sizes {
         group.throughput(Throughput::Bytes(size as u64));

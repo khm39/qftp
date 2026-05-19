@@ -476,6 +476,7 @@ enum PendingAction {
         offset: u64,
         expected_checksum: Option<[u8; 32]>,
         no_clobber: bool,
+        checksum_trailer: bool,
         leftover: Vec<u8>,
     },
     HandleSimple {
@@ -635,6 +636,7 @@ fn process_readable_streams(
                             offset,
                             checksum,
                             no_clobber,
+                            checksum_trailer,
                         } => {
                             let leftover = std::mem::take(stream_buf);
                             actions.push(PendingAction::StartPut {
@@ -645,6 +647,7 @@ fn process_readable_streams(
                                 offset,
                                 expected_checksum: checksum,
                                 no_clobber,
+                                checksum_trailer,
                                 leftover,
                             });
                             *state = StreamState::Done;
@@ -706,6 +709,7 @@ fn process_readable_streams(
                 offset,
                 expected_checksum,
                 no_clobber,
+                checksum_trailer,
                 leftover,
             } => {
                 start_put(
@@ -717,6 +721,7 @@ fn process_readable_streams(
                     offset,
                     expected_checksum,
                     no_clobber,
+                    checksum_trailer,
                     leftover,
                     metrics,
                 )?;
@@ -1070,6 +1075,7 @@ fn start_put(
     offset: u64,
     expected_checksum: Option<[u8; 32]>,
     no_clobber: bool,
+    checksum_trailer: bool,
     leftover: Vec<u8>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
@@ -1243,6 +1249,11 @@ fn start_put(
         completed: false,
         hasher,
         expected_checksum,
+        trailer_buf: if checksum_trailer {
+            Some(crate::connection::TrailerBuf::new())
+        } else {
+            None
+        },
         reserved_bytes: new_bytes,
         owner: Arc::clone(&ctx.user),
     };
@@ -1307,6 +1318,7 @@ fn drive_put(
         completed,
         hasher,
         expected_checksum,
+        trailer_buf,
         reserved_bytes,
         owner,
     } = state
@@ -1314,6 +1326,9 @@ fn drive_put(
         return Ok(None);
     };
 
+    // Phase A: drain body bytes until `remaining == 0`. Anything past
+    // the body in the same recv goes into the trailer buffer when
+    // streaming-checksum mode is active (#152).
     loop {
         if *remaining == 0 {
             break;
@@ -1330,11 +1345,24 @@ fn drive_put(
                 hasher.update(&tmp[..to_take]);
                 *remaining -= to_take as u64;
                 metrics.add_bytes_received(to_take as u64);
-                if to_take < len {
-                    return Ok(Some(err(
-                        ErrorCode::UploadOverflow,
-                        "Upload exceeded declared size",
-                    )));
+                let after_body = len - to_take;
+                if after_body > 0 {
+                    // Bytes past the body. Legitimate only when the
+                    // client opted into the streaming trailer.
+                    if let Some(buf) = trailer_buf {
+                        let consumed = buf.extend(&tmp[to_take..len]);
+                        if consumed < after_body {
+                            return Ok(Some(err(
+                                ErrorCode::UploadOverflow,
+                                "Upload exceeded declared size + trailer",
+                            )));
+                        }
+                    } else {
+                        return Ok(Some(err(
+                            ErrorCode::UploadOverflow,
+                            "Upload exceeded declared size",
+                        )));
+                    }
                 }
                 if fin && *remaining > 0 {
                     return Ok(Some(err(
@@ -1351,7 +1379,45 @@ fn drive_put(
         }
     }
 
+    // Phase B: body fully received. If streaming-checksum mode is
+    // active, keep draining until the 32-byte trailer is complete
+    // before verifying.
     if *remaining == 0 {
+        if let Some(buf) = trailer_buf.as_mut() {
+            while !buf.is_full() {
+                match conn.stream_recv(stream_id, tmp) {
+                    Ok((len, fin)) => {
+                        let consumed = buf.extend(&tmp[..len]);
+                        if consumed < len {
+                            return Ok(Some(err(
+                                ErrorCode::UploadOverflow,
+                                "Trailer bytes exceeded 32",
+                            )));
+                        }
+                        if fin && !buf.is_full() {
+                            return Ok(Some(err(
+                                ErrorCode::UploadTruncated,
+                                "Stream closed before BLAKE3 trailer was complete",
+                            )));
+                        }
+                    }
+                    Err(quiche::Error::Done) => return Ok(None),
+                    Err(quiche::Error::InvalidStreamState(_)) => {
+                        // FIN already consumed; stream is gone but
+                        // we never finished the trailer.
+                        return Ok(Some(err(
+                            ErrorCode::UploadTruncated,
+                            "Stream closed before BLAKE3 trailer was complete",
+                        )));
+                    }
+                    Err(e) => {
+                        warn!(stream_id, error = ?e, "stream_recv error during trailer");
+                        return Ok(Some(err(ErrorCode::Internal, "Stream receive error")));
+                    }
+                }
+            }
+        }
+
         if let Err(e) = writer.flush() {
             return Ok(Some(err(
                 ErrorCode::Internal,
@@ -1361,9 +1427,16 @@ fn drive_put(
         // Verify checksum before rename. If it mismatches we leave the
         // temp in place for the Drop impl to clean up and refuse the
         // upload -- never reveal a corrupted body at `final_path`.
-        if let Some(expected) = expected_checksum {
+        // Trailer takes precedence over the legacy header checksum
+        // when both are present (defensive; client shouldn't set both).
+        let expected: Option<[u8; 32]> = trailer_buf
+            .as_ref()
+            .filter(|b| b.is_full())
+            .map(|b| b.bytes)
+            .or(*expected_checksum);
+        if let Some(expected) = expected {
             let got = *hasher.finalize().as_bytes();
-            if got != *expected {
+            if got != expected {
                 return Ok(Some(err(
                     ErrorCode::ChecksumMismatch,
                     "Upload checksum verification failed",
@@ -1506,6 +1579,7 @@ mod tests {
             offset: 0,
             checksum: Some([0u8; 32]),
             no_clobber: false,
+            checksum_trailer: false,
         }));
         assert!(!request_is_replay_safe(&Request::Rm { path: "x".into() }));
         assert!(!request_is_replay_safe(&Request::Mkdir {

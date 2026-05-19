@@ -234,8 +234,9 @@ impl ServerFixture {
     /// command line.
     ///
     /// If the client doesn't return within
-    /// `QFTP_BENCH_CLIENT_TIMEOUT_SECS` (default 15s), it is killed
-    /// and the call returns an error. This stops a single stalled
+    /// `QFTP_BENCH_CLIENT_TIMEOUT_SECS` (default 60s — enough for a
+    /// 1 GiB transfer at low loopback throughput), it is killed and
+    /// the call returns an error. This stops a single stalled
     /// connection from wedging the entire bench harness on the 30s
     /// QUIC idle timeout.
     pub fn run_repl(&self, script: &str) -> Result<()> {
@@ -262,7 +263,7 @@ impl ServerFixture {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(15));
+            .unwrap_or_else(|| Duration::from_secs(60));
         let deadline = Instant::now() + timeout;
         let out = loop {
             match child.try_wait().context("wait qftp-client")? {
