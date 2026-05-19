@@ -166,6 +166,30 @@ pub fn recv_message<T: DeserializeOwned>(
     Ok(Some(msg))
 }
 
+/// Decode a single length-prefixed message from a flat byte slice using
+/// the same bincode options as `recv_message`. Exposed so `fuzz/`
+/// targets can exercise the production decode path (4-byte BE length
+/// prefix + bincode with_limit), not a stripped-down `bincode::
+/// deserialize`. See #141.
+pub fn decode_framed_for_fuzz<T: DeserializeOwned>(buf: &[u8]) -> Result<T> {
+    anyhow::ensure!(buf.len() >= 4, "frame too short for length prefix");
+    let msg_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    anyhow::ensure!(
+        msg_len <= MAX_MESSAGE_SIZE,
+        "frame length {} exceeds MAX_MESSAGE_SIZE {}",
+        msg_len,
+        MAX_MESSAGE_SIZE
+    );
+    anyhow::ensure!(buf.len() >= 4 + msg_len, "frame truncated");
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_MESSAGE_SIZE as u64);
+    use bincode::Options as _;
+    opts.deserialize(&buf[4..4 + msg_len])
+        .context("failed to deserialize framed message")
+}
+
 /// Apply common QUIC transport parameters shared by client and server.
 fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> Result<()> {
     config
