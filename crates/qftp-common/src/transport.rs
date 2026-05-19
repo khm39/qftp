@@ -49,7 +49,7 @@ pub fn handle_ingress(
         match conn.recv(&mut buf[..len], recv_info) {
             Ok(_) => {}
             Err(e) => {
-                log::warn!("QUIC recv error: {:?}", e);
+                tracing::warn!(error = ?e, "QUIC recv error");
             }
         }
     }
@@ -164,15 +164,16 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    // Flow control windows large enough to admit a full file transfer
-    // (see qftp-server MAX_FILE_SIZE) without requiring an
-    // egress-flush-and-retry send loop. Phase 1 (issue #30, #31) will
-    // replace the buffered send path with proper streaming, at which point
-    // these can come back down. To bound the resulting DoS surface in the
-    // meantime, initial_max_streams_bidi is held to a small number: the
-    // current client only opens one bidi stream at a time, so 4 is plenty
-    // of headroom and caps worst-case in-memory buffering at well under
-    // the 2 GiB connection limit.
+    // Phase 1 sends and receives files in chunks (qftp-server's
+    // send_file_streaming and drive_put), so peak memory no longer scales
+    // with the flow-control window. We still keep the windows generous to
+    // minimize how often send_file_streaming has to spin-wait for a peer
+    // ACK; the per-stream RAM upper bound is now the BufReader/BufWriter
+    // capacity (64 KiB) rather than the window itself. initial_max_streams_bidi
+    // stays low because the server is still single-connection (Phase 2,
+    // issue #36): the current client only opens one bidi stream at a time.
+    // Phase 2's multi-connection rewrite is the right place to revisit
+    // both dimensions in concert with a real egress-driven sender.
     config.set_initial_max_data(2 * 1024 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_local(1024 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_remote(1024 * 1024 * 1024);
@@ -182,17 +183,52 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     Ok(())
 }
 
-/// Create a QUIC server configuration with the given certificate and key PEM data.
-pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Config> {
+/// Server TLS configuration.
+pub struct ServerTlsConfig {
+    /// PEM-encoded server certificate chain.
+    pub cert_pem: String,
+    /// PEM-encoded server private key.
+    pub key_pem: String,
+    /// When set, the server requires clients to present a certificate
+    /// chained to this PEM CA bundle (mTLS).
+    pub client_ca_pem: Option<String>,
+}
+
+/// Client TLS configuration.
+pub struct ClientTlsConfig {
+    /// Verify the server's certificate. Should be true outside of dev.
+    pub verify_peer: bool,
+    /// Path to a PEM CA bundle to verify the server cert against. When
+    /// `None` the system trust store is used.
+    pub ca_path: Option<String>,
+    /// Client certificate to present (for mTLS-enabled servers).
+    pub client_cert: Option<ClientCert>,
+}
+
+/// Client certificate material for mTLS.
+pub struct ClientCert {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// Create a QUIC server configuration.
+pub fn create_server_config(tls: &ServerTlsConfig) -> Result<quiche::Config> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 
     config
-        .load_cert_chain_from_pem_file(cert_pem)
+        .load_cert_chain_from_pem_file(&tls.cert_pem)
         .context("failed to load cert chain")?;
     config
-        .load_priv_key_from_pem_file(key_pem)
+        .load_priv_key_from_pem_file(&tls.key_pem)
         .context("failed to load private key")?;
+
+    if let Some(ca_path) = &tls.client_ca_pem {
+        config
+            .load_verify_locations_from_file(ca_path)
+            .context("failed to load client CA bundle")?;
+        config.verify_peer(true);
+    }
 
     apply_common_config(&mut config)?;
 
@@ -200,17 +236,33 @@ pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Con
 }
 
 /// Create a QUIC client configuration.
-///
-/// The `verify_peer` argument is currently ignored: certificate verification
-/// is hard-coded off because the server presents a freshly generated
-/// self-signed certificate on every start. Phase 1 (see issue #28) will wire
-/// the flag through and default verification on with a CA bundle option.
-pub fn create_client_config(verify_peer: bool) -> Result<quiche::Config> {
-    let _ = verify_peer;
+pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 
-    config.verify_peer(false);
+    config.verify_peer(tls.verify_peer);
+
+    if let Some(ca_path) = &tls.ca_path {
+        config
+            .load_verify_locations_from_file(ca_path)
+            .context("failed to load CA bundle")?;
+    } else if tls.verify_peer {
+        // Fall back to the platform trust store. quiche delegates to
+        // BoringSSL; without an explicit bundle the OS roots are used.
+        config
+            .load_verify_locations_from_directory("/etc/ssl/certs")
+            .ok();
+    }
+
+    if let Some(cc) = &tls.client_cert {
+        config
+            .load_cert_chain_from_pem_file(&cc.cert_pem)
+            .context("failed to load client cert")?;
+        config
+            .load_priv_key_from_pem_file(&cc.key_pem)
+            .context("failed to load client key")?;
+    }
+
     apply_common_config(&mut config)?;
 
     Ok(config)

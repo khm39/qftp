@@ -8,8 +8,8 @@ qftp-common = { path = "../qftp-common" }
 quiche = "0.22"
 mio = { version = "1", features = ["net", "os-poll"] }
 anyhow = "1"
-log = "0.4"
-env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 rustyline = "15"
 ring = "0.17"
