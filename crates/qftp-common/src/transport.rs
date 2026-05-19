@@ -158,7 +158,7 @@ pub fn recv_message<T: DeserializeOwned>(
 /// Apply common QUIC transport parameters shared by client and server.
 fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config
-        .set_application_protos(&[b"qftp"])
+        .set_application_protos(&[crate::protocol::ALPN])
         .context("failed to set ALPN")?;
 
     config.set_max_idle_timeout(30_000);

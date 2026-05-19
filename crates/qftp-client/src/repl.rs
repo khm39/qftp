@@ -1,4 +1,4 @@
-use qftp_common::protocol::{Request, Response};
+use qftp_common::protocol::{ErrorResponse, Request, Response};
 
 #[derive(Debug)]
 pub enum Command {
@@ -6,11 +6,28 @@ pub enum Command {
     Get {
         remote: String,
         local: Option<String>,
+        recursive: bool,
     },
     Put {
         local: String,
         remote: Option<String>,
+        recursive: bool,
     },
+}
+
+/// Pull `-r` / `--recursive` out of a token slice. Returns the flag and
+/// the remaining positional arguments.
+fn take_recursive_flag<'a>(parts: &'a [&'a str]) -> (bool, Vec<&'a str>) {
+    let mut recursive = false;
+    let mut rest = Vec::with_capacity(parts.len());
+    for p in parts {
+        if *p == "-r" || *p == "--recursive" {
+            recursive = true;
+        } else {
+            rest.push(*p);
+        }
+    }
+    (recursive, rest)
 }
 
 pub fn parse_command(line: &str) -> Option<Command> {
@@ -20,95 +37,102 @@ pub fn parse_command(line: &str) -> Option<Command> {
     }
 
     let cmd = parts[0].to_lowercase();
+    let args = &parts[1..];
     match cmd.as_str() {
         "ls" | "dir" => {
-            let path = parts.get(1).unwrap_or(&"").to_string();
+            let path = args.first().unwrap_or(&"").to_string();
             Some(Command::Remote(Request::Ls { path }))
         }
         "cd" => {
-            let path = parts.get(1).unwrap_or(&"/").to_string();
+            let path = args.first().unwrap_or(&"/").to_string();
             Some(Command::Remote(Request::Cd { path }))
         }
         "pwd" => Some(Command::Remote(Request::Pwd)),
         "get" => {
-            if parts.len() < 2 {
-                println!("Usage: get <remote> [local]");
+            let (recursive, args) = take_recursive_flag(args);
+            if args.is_empty() {
+                println!("Usage: get [-r] <remote> [local]");
                 return None;
             }
-            let remote = parts[1].to_string();
-            let local = parts.get(2).map(|s| s.to_string());
-            Some(Command::Get { remote, local })
+            Some(Command::Get {
+                remote: args[0].to_string(),
+                local: args.get(1).map(|s| s.to_string()),
+                recursive,
+            })
         }
         "put" => {
-            if parts.len() < 2 {
-                println!("Usage: put <local> [remote]");
+            let (recursive, args) = take_recursive_flag(args);
+            if args.is_empty() {
+                println!("Usage: put [-r] <local> [remote]");
                 return None;
             }
-            let local = parts[1].to_string();
-            let remote = parts.get(2).map(|s| s.to_string());
-            Some(Command::Put { local, remote })
+            Some(Command::Put {
+                local: args[0].to_string(),
+                remote: args.get(1).map(|s| s.to_string()),
+                recursive,
+            })
         }
         "mkdir" => {
-            if parts.len() < 2 {
+            if args.is_empty() {
                 println!("Usage: mkdir <path>");
                 return None;
             }
             Some(Command::Remote(Request::Mkdir {
-                path: parts[1].to_string(),
+                path: args[0].to_string(),
             }))
         }
         "rmdir" => {
-            if parts.len() < 2 {
+            if args.is_empty() {
                 println!("Usage: rmdir <path>");
                 return None;
             }
             Some(Command::Remote(Request::Rmdir {
-                path: parts[1].to_string(),
+                path: args[0].to_string(),
             }))
         }
         "rm" | "delete" => {
-            if parts.len() < 2 {
+            if args.is_empty() {
                 println!("Usage: rm <path>");
                 return None;
             }
             Some(Command::Remote(Request::Rm {
-                path: parts[1].to_string(),
+                path: args[0].to_string(),
             }))
         }
         "rename" | "mv" => {
-            if parts.len() < 3 {
+            if args.len() < 2 {
                 println!("Usage: rename <from> <to>");
                 return None;
             }
             Some(Command::Remote(Request::Rename {
-                from: parts[1].to_string(),
-                to: parts[2].to_string(),
+                from: args[0].to_string(),
+                to: args[1].to_string(),
             }))
         }
         "chmod" => {
-            if parts.len() < 3 {
+            if args.len() < 2 {
                 println!("Usage: chmod <mode_octal> <path>");
                 return None;
             }
-            let mode = match u32::from_str_radix(parts[1], 8) {
+            let mode = match u32::from_str_radix(args[0], 8) {
                 Ok(m) => m,
                 Err(_) => {
-                    println!("Invalid octal mode: {}", parts[1]);
+                    println!("Invalid octal mode: {}", args[0]);
                     return None;
                 }
             };
             Some(Command::Remote(Request::Chmod {
-                path: parts[2].to_string(),
+                path: args[1].to_string(),
                 mode,
             }))
         }
         "stat" => {
-            if parts.len() < 2 {
+            if args.is_empty() {
                 println!("Usage: stat <path>");
                 return None;
             }
             Some(Command::Remote(Request::Stat {
-                path: parts[1].to_string(),
+                path: args[0].to_string(),
             }))
         }
         "quit" | "exit" => Some(Command::Remote(Request::Quit)),
@@ -126,7 +150,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
 pub fn display_response(resp: &Response) {
     match resp {
         Response::Ok => println!("OK"),
-        Response::Err(e) => println!("Error: {e}"),
+        Response::Err(e) => display_error(e),
         Response::Path(p) => println!("{p}"),
         Response::DirListing(entries) => {
             println!("{:<12} {:>10}  {:<4}  NAME", "MODE", "SIZE", "TYPE");
@@ -149,10 +173,26 @@ pub fn display_response(resp: &Response) {
             println!("  Mode: {:o}", s.mode & 0o777);
             println!("  Modified: {}", s.modified);
         }
-        Response::FileReady { size } => {
-            println!("File ready: {size} bytes");
+        Response::FileReady {
+            size,
+            total_size,
+            checksum_follows,
+        } => {
+            println!(
+                "File ready: {size} bytes (total {total_size}{})",
+                if *checksum_follows {
+                    ", checksum follows"
+                } else {
+                    ""
+                }
+            );
         }
+        _ => println!("Response: {resp:?}"),
     }
+}
+
+pub fn display_error(e: &ErrorResponse) {
+    println!("Error [{:?}]: {}", e.code, e.message);
 }
 
 fn format_size(bytes: u64) -> String {
@@ -193,21 +233,21 @@ fn format_mode(mode: u32) -> String {
 
 fn print_help() {
     println!("Available commands:");
-    println!("  ls [path]              List directory contents");
-    println!("  dir [path]             Alias for ls");
-    println!("  cd [path]              Change remote directory");
-    println!("  pwd                    Print remote working directory");
-    println!("  get <remote> [local]   Download a file");
-    println!("  put <local> [remote]   Upload a file");
-    println!("  mkdir <path>           Create a directory");
-    println!("  rmdir <path>           Remove a directory");
-    println!("  rm <path>              Delete a file");
-    println!("  delete <path>          Alias for rm");
-    println!("  rename <from> <to>     Rename/move a file");
-    println!("  mv <from> <to>         Alias for rename");
-    println!("  chmod <mode> <path>    Change file permissions (octal mode)");
-    println!("  stat <path>            Show file information");
-    println!("  help                   Show this help message");
-    println!("  quit                   Disconnect and exit");
-    println!("  exit                   Alias for quit");
+    println!("  ls [path]                    List directory contents");
+    println!("  cd [path]                    Change remote directory");
+    println!("  pwd                          Print remote working directory");
+    println!("  get [-r] <remote> [local]    Download (auto-resumes if local exists)");
+    println!("  put [-r] <local> [remote]    Upload (BLAKE3 checksum verified)");
+    println!("  mkdir <path>                 Create a directory");
+    println!("  rmdir <path>                 Remove a directory");
+    println!("  rm <path>                    Delete a file");
+    println!("  rename <from> <to>           Rename/move a file");
+    println!("  chmod <mode> <path>          Change file permissions (octal)");
+    println!("  stat <path>                  Show file information");
+    println!("  help                         Show this help message");
+    println!("  quit                         Disconnect and exit");
+    println!();
+    println!("Tips:");
+    println!("  - Local glob: `put *.log` expands on the client side.");
+    println!("  - Use `-r` to walk directories on get/put.");
 }

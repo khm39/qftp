@@ -36,7 +36,7 @@ use qftp_common::transport::*;
 use tracing::{debug, info, warn};
 
 use crate::connection::{ConnectionContext, StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE};
-use crate::handler;
+use crate::handler::{self, err, io_code};
 use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
 use crate::retry::RetryKey;
@@ -402,12 +402,16 @@ enum PendingAction {
     StartGet {
         stream_id: u64,
         path: String,
+        offset: u64,
+        length: Option<u64>,
     },
     StartPut {
         stream_id: u64,
         path: String,
         size: u64,
         mode: u32,
+        offset: u64,
+        expected_checksum: Option<[u8; 32]>,
         leftover: Vec<u8>,
     },
     HandleSimple {
@@ -465,7 +469,7 @@ fn process_readable_streams(
                         );
                         actions.push(PendingAction::AclReject {
                             stream_id,
-                            resp: Response::Err("Malformed request".into()),
+                            resp: err(ErrorCode::Malformed, "Malformed request"),
                         });
                         *state = StreamState::Done;
                         continue;
@@ -491,7 +495,7 @@ fn process_readable_streams(
                             .fetch_add(1, Ordering::Relaxed);
                         actions.push(PendingAction::AclReject {
                             stream_id,
-                            resp: Response::Err("Rate limit exceeded".into()),
+                            resp: err(ErrorCode::RateLimited, "Rate limit exceeded"),
                         });
                         *state = StreamState::Done;
                         continue;
@@ -504,17 +508,34 @@ fn process_readable_streams(
                     }
 
                     match req {
-                        Request::Get { path } => {
-                            actions.push(PendingAction::StartGet { stream_id, path });
+                        Request::Get {
+                            path,
+                            offset,
+                            length,
+                        } => {
+                            actions.push(PendingAction::StartGet {
+                                stream_id,
+                                path,
+                                offset,
+                                length,
+                            });
                             *state = StreamState::Done;
                         }
-                        Request::Put { path, size, mode } => {
+                        Request::Put {
+                            path,
+                            size,
+                            mode,
+                            offset,
+                            checksum,
+                        } => {
                             let leftover = std::mem::take(stream_buf);
                             actions.push(PendingAction::StartPut {
                                 stream_id,
                                 path,
                                 size,
                                 mode,
+                                offset,
+                                expected_checksum: checksum,
                                 leftover,
                             });
                             *state = StreamState::Done;
@@ -556,17 +577,34 @@ fn process_readable_streams(
                 send_message(&mut ctx.conn, stream_id, &resp)?;
                 metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
             }
-            PendingAction::StartGet { stream_id, path } => {
-                start_get(ctx, stream_id, &path, metrics)?;
+            PendingAction::StartGet {
+                stream_id,
+                path,
+                offset,
+                length,
+            } => {
+                start_get(ctx, stream_id, &path, offset, length, metrics)?;
             }
             PendingAction::StartPut {
                 stream_id,
                 path,
                 size,
                 mode,
+                offset,
+                expected_checksum,
                 leftover,
             } => {
-                start_put(ctx, stream_id, &path, size, mode, leftover, metrics)?;
+                start_put(
+                    ctx,
+                    stream_id,
+                    &path,
+                    size,
+                    mode,
+                    offset,
+                    expected_checksum,
+                    leftover,
+                    metrics,
+                )?;
             }
             PendingAction::Quit { stream_id } => {
                 send_message(&mut ctx.conn, stream_id, &Response::Ok)?;
@@ -585,12 +623,22 @@ fn process_readable_streams(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_get(
     ctx: &mut ConnectionContext,
     stream_id: u64,
     path: &str,
+    offset: u64,
+    length: Option<u64>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
+    let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
+        send_message(&mut ctx.conn, stream_id, &err(code, msg))?;
+        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+        ctx.streams.insert(stream_id, StreamState::Done);
+        Ok(())
+    };
+
     let file_path = match handler::resolve(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
         Err(e) => {
@@ -603,56 +651,63 @@ fn start_get(
     let meta = match fs::metadata(&file_path) {
         Ok(m) => m,
         Err(e) => {
-            send_message(
-                &mut ctx.conn,
-                stream_id,
-                &Response::Err(format!("Failed to stat file: {e}")),
-            )?;
-            metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-            ctx.streams.insert(stream_id, StreamState::Done);
-            return Ok(());
+            return send_err(ctx, io_code(&e), format!("Failed to stat file: {e}"));
         }
     };
     if !meta.is_file() {
-        // Reject directories (and anything else not a regular file)
-        // before sending FileReady. On Unix open() on a directory
-        // succeeds, so without this check the client would be told to
-        // expect file bytes only to see the later read fail mid-stream.
-        send_message(
-            &mut ctx.conn,
-            stream_id,
-            &Response::Err("Not a regular file".into()),
-        )?;
-        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-        ctx.streams.insert(stream_id, StreamState::Done);
-        return Ok(());
+        return send_err(
+            ctx,
+            ErrorCode::IsADirectory,
+            "Not a regular file".to_string(),
+        );
     }
     if meta.len() > MAX_FILE_SIZE {
-        send_message(
-            &mut ctx.conn,
-            stream_id,
-            &Response::Err(format!(
+        return send_err(
+            ctx,
+            ErrorCode::FileTooLarge,
+            format!(
                 "File too large: {} bytes (max {} bytes)",
                 meta.len(),
                 MAX_FILE_SIZE
-            )),
-        )?;
-        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-        ctx.streams.insert(stream_id, StreamState::Done);
-        return Ok(());
+            ),
+        );
     }
-    let file = File::open(&file_path).context("open file for streaming send")?;
+    if offset > meta.len() {
+        return send_err(
+            ctx,
+            ErrorCode::InvalidRange,
+            format!("offset {} past end of file (size {})", offset, meta.len()),
+        );
+    }
+    let remaining = meta.len() - offset;
+    let bytes_to_send = match length {
+        Some(n) => n.min(remaining),
+        None => remaining,
+    };
+    let mut file = File::open(&file_path).context("open file for streaming send")?;
+    if offset > 0 {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .with_context(|| format!("seek to offset {offset}"))?;
+    }
     send_message(
         &mut ctx.conn,
         stream_id,
-        &Response::FileReady { size: meta.len() },
+        &Response::FileReady {
+            size: bytes_to_send,
+            total_size: meta.len(),
+            checksum_follows: true,
+        },
     )?;
     ctx.streams.insert(
         stream_id,
         StreamState::SendingFileData {
             reader: std::io::BufReader::with_capacity(FILE_CHUNK_SIZE, file),
-            total_size: meta.len(),
+            total_size: bytes_to_send,
             sent: 0,
+            hasher: blake3::Hasher::new(),
+            trailer: None,
+            trailer_offset: 0,
             finished: false,
         },
     );
@@ -673,100 +728,124 @@ fn drive_sending_streams(
 
     let mut chunk = [0u8; FILE_CHUNK_SIZE];
     for stream_id in stream_ids {
-        let Some(state) = ctx.streams.get_mut(&stream_id) else {
-            continue;
-        };
-        let StreamState::SendingFileData {
-            reader,
-            total_size,
-            sent,
-            finished,
-        } = state
-        else {
-            continue;
-        };
-        if *finished {
-            continue;
-        }
-        // Push as many chunks as the per-stream flow-control window will
-        // accept this iteration. When stream_send returns 0 (or Done)
-        // the stream is blocked; we rewind the BufReader by the bytes
-        // we read but couldn't push and try again next iteration after
-        // the peer's ACKs have reopened capacity.
-        //
-        // Zero-length files need an explicit fin-only frame: the loop
-        // body never runs (sent == total_size from the start) and the
-        // peer needs EOF to surface from its read.
-        if *total_size == 0 {
-            let _ = ctx.conn.stream_send(stream_id, &[], true);
-            *finished = true;
-            metrics.downloads_completed.fetch_add(1, Ordering::Relaxed);
-            *state = StreamState::Done;
-            continue;
-        }
-        loop {
-            if *sent == *total_size {
-                *finished = true;
-                metrics.downloads_completed.fetch_add(1, Ordering::Relaxed);
+        // After this call we either mark the stream Done, or we leave a
+        // SendingFileData with updated counters for the next iteration.
+        let outcome = drive_one_sender(ctx, stream_id, &mut chunk, metrics);
+        if outcome == SendOutcome::Finished {
+            if let Some(state) = ctx.streams.get_mut(&stream_id) {
                 *state = StreamState::Done;
-                break;
-            }
-            let want = ((*total_size - *sent) as usize).min(chunk.len());
-            if let Err(e) = reader.read_exact(&mut chunk[..want]) {
-                warn!(stream_id, error = %e, "file read failed mid-stream");
-                let _ = ctx.conn.stream_send(stream_id, &[], true);
-                *state = StreamState::Done;
-                break;
-            }
-            let chunk_is_last = *sent + want as u64 == *total_size;
-            match ctx
-                .conn
-                .stream_send(stream_id, &chunk[..want], chunk_is_last)
-            {
-                Ok(0) => {
-                    // Blocked: the bytes we read into chunk[..want] are
-                    // about to be dropped on the floor. Rewind so the
-                    // next call re-reads them.
-                    if let Err(e) = reader.seek_relative(-(want as i64)) {
-                        warn!(stream_id, error = %e, "seek failed when stream blocked");
-                        *state = StreamState::Done;
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    *sent += n as u64;
-                    metrics.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                    if n < want {
-                        // partial: rewind by the bytes quiche didn't accept
-                        // so the next iteration re-reads them. seek_relative
-                        // is the BufReader-native rewind and avoids
-                        // invalidating the in-memory buffer the way Seek
-                        // would.
-                        if let Err(e) = reader.seek_relative(-((want - n) as i64)) {
-                            warn!(stream_id, error = %e, "seek failed during partial send");
-                            *state = StreamState::Done;
-                            break;
-                        }
-                        break;
-                    }
-                }
-                Err(quiche::Error::Done) => {
-                    // Same as Ok(0): blocked. Rewind before bailing.
-                    if let Err(e) = reader.seek_relative(-(want as i64)) {
-                        warn!(stream_id, error = %e, "seek failed on Done");
-                        *state = StreamState::Done;
-                    }
-                    break;
-                }
-                Err(e) => {
-                    warn!(stream_id, error = ?e, "stream_send failed during Get");
-                    *state = StreamState::Done;
-                    break;
-                }
             }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Blocked,
+    Finished,
+    Failed,
+}
+
+fn drive_one_sender(
+    ctx: &mut ConnectionContext,
+    stream_id: u64,
+    chunk: &mut [u8],
+    metrics: &Arc<Metrics>,
+) -> SendOutcome {
+    let Some(state) = ctx.streams.get_mut(&stream_id) else {
+        return SendOutcome::Finished;
+    };
+    let StreamState::SendingFileData {
+        reader,
+        total_size,
+        sent,
+        hasher,
+        trailer,
+        trailer_offset,
+        finished,
+    } = state
+    else {
+        return SendOutcome::Finished;
+    };
+    if *finished {
+        return SendOutcome::Finished;
+    }
+
+    // Phase A: stream the body. After every chunk that quiche accepts we
+    // also feed it into the BLAKE3 hasher so the trailer matches exactly
+    // what the peer received.
+    while *sent < *total_size && trailer.is_none() {
+        let want = ((*total_size - *sent) as usize).min(chunk.len());
+        if let Err(e) = reader.read_exact(&mut chunk[..want]) {
+            warn!(stream_id, error = %e, "file read failed mid-stream");
+            let _ = ctx.conn.stream_send(stream_id, &[], true);
+            return SendOutcome::Failed;
+        }
+        match ctx.conn.stream_send(stream_id, &chunk[..want], false) {
+            Ok(0) => {
+                if let Err(e) = reader.seek_relative(-(want as i64)) {
+                    warn!(stream_id, error = %e, "seek failed when stream blocked");
+                    return SendOutcome::Failed;
+                }
+                return SendOutcome::Blocked;
+            }
+            Ok(n) => {
+                hasher.update(&chunk[..n]);
+                *sent += n as u64;
+                metrics.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                if n < want {
+                    if let Err(e) = reader.seek_relative(-((want - n) as i64)) {
+                        warn!(stream_id, error = %e, "seek failed during partial send");
+                        return SendOutcome::Failed;
+                    }
+                    return SendOutcome::Blocked;
+                }
+            }
+            Err(quiche::Error::Done) => {
+                if let Err(e) = reader.seek_relative(-(want as i64)) {
+                    warn!(stream_id, error = %e, "seek failed on Done");
+                    return SendOutcome::Failed;
+                }
+                return SendOutcome::Blocked;
+            }
+            Err(e) => {
+                warn!(stream_id, error = ?e, "stream_send failed during Get");
+                return SendOutcome::Failed;
+            }
+        }
+    }
+
+    // Phase B: body fully sent. Finalize hash once, then push the 32
+    // bytes as a trailer with FIN. trailer_offset survives across
+    // iterations so a partial-write here resumes cleanly.
+    if trailer.is_none() {
+        let h = hasher.finalize();
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(h.as_bytes());
+        *trailer = Some(buf);
+        *trailer_offset = 0;
+    }
+    let bytes = trailer.unwrap();
+    while *trailer_offset < bytes.len() {
+        let remaining = &bytes[*trailer_offset..];
+        match ctx.conn.stream_send(stream_id, remaining, true) {
+            Ok(0) => return SendOutcome::Blocked,
+            Ok(n) => {
+                *trailer_offset += n;
+                metrics.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Err(quiche::Error::Done) => return SendOutcome::Blocked,
+            Err(e) => {
+                warn!(stream_id, error = ?e, "stream_send for trailer failed");
+                return SendOutcome::Failed;
+            }
+        }
+    }
+
+    *finished = true;
+    metrics.downloads_completed.fetch_add(1, Ordering::Relaxed);
+    SendOutcome::Finished
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -776,21 +855,27 @@ fn start_put(
     path: &str,
     size: u64,
     mode: u32,
+    offset: u64,
+    expected_checksum: Option<[u8; 32]>,
     leftover: Vec<u8>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
-    if size > MAX_FILE_SIZE {
-        send_message(
-            &mut ctx.conn,
-            stream_id,
-            &Response::Err(format!(
-                "Upload too large: {} bytes (max {} bytes)",
-                size, MAX_FILE_SIZE
-            )),
-        )?;
+    let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
+        send_message(&mut ctx.conn, stream_id, &err(code, msg))?;
         metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
         ctx.streams.insert(stream_id, StreamState::Done);
-        return Ok(());
+        Ok(())
+    };
+
+    if size > MAX_FILE_SIZE {
+        return send_err(
+            ctx,
+            ErrorCode::FileTooLarge,
+            format!(
+                "Upload too large: {} bytes (max {} bytes)",
+                size, MAX_FILE_SIZE
+            ),
+        );
     }
     let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
@@ -802,20 +887,90 @@ fn start_put(
         }
     };
     let temp_path = temp_path_for(&final_path, stream_id);
-    let writer = match open_temp_no_follow(&temp_path) {
-        Ok(f) => BufWriter::with_capacity(FILE_CHUNK_SIZE, f),
-        Err(e) => {
-            send_message(
-                &mut ctx.conn,
-                stream_id,
-                &Response::Err(format!("Failed to create upload temp file: {e}")),
-            )?;
-            metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-            ctx.streams.insert(stream_id, StreamState::Done);
-            return Ok(());
+
+    // Resume: if offset > 0 the client is claiming the server already
+    // has the first `offset` bytes of this upload in the temp file. We
+    // open it for append (not create_new) and validate the existing
+    // length matches the offset. Otherwise it's a fresh upload.
+    let (writer, mut hasher) = if offset == 0 {
+        let f = match open_temp_no_follow(&temp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to create upload temp file: {e}"),
+                );
+            }
+        };
+        (
+            BufWriter::with_capacity(FILE_CHUNK_SIZE, f),
+            blake3::Hasher::new(),
+        )
+    } else {
+        // Resume path: open existing temp, validate length, hash its
+        // contents so the final checksum still covers the full body.
+        let meta = match fs::metadata(&temp_path) {
+            Ok(m) => m,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    ErrorCode::InvalidRange,
+                    format!("Resume requested at offset {offset} but no temp file exists ({e})"),
+                );
+            }
+        };
+        if meta.len() != offset {
+            return send_err(
+                ctx,
+                ErrorCode::InvalidRange,
+                format!(
+                    "Resume offset {offset} doesn't match server temp length {}",
+                    meta.len()
+                ),
+            );
         }
+        let mut hasher = blake3::Hasher::new();
+        let mut existing = match File::open(&temp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to open temp for resume: {e}"),
+                );
+            }
+        };
+        let mut copy_buf = [0u8; FILE_CHUNK_SIZE];
+        loop {
+            match std::io::Read::read(&mut existing, &mut copy_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    hasher.update(&copy_buf[..n]);
+                }
+                Err(e) => {
+                    return send_err(
+                        ctx,
+                        ErrorCode::Internal,
+                        format!("Failed to rehash temp for resume: {e}"),
+                    );
+                }
+            }
+        }
+        let f = match std::fs::OpenOptions::new().append(true).open(&temp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to reopen temp for append: {e}"),
+                );
+            }
+        };
+        (BufWriter::with_capacity(FILE_CHUNK_SIZE, f), hasher)
     };
 
+    let _ = &mut hasher; // borrow as mutable below
     let mut new_state = StreamState::ReadingFileData {
         final_path,
         temp_path,
@@ -823,17 +978,22 @@ fn start_put(
         remaining: size,
         mode,
         completed: false,
+        hasher,
+        expected_checksum,
     };
     if !leftover.is_empty() {
         if let StreamState::ReadingFileData {
-            writer, remaining, ..
+            writer,
+            remaining,
+            hasher,
+            ..
         } = &mut new_state
         {
             if leftover.len() as u64 > *remaining {
                 send_message(
                     &mut ctx.conn,
                     stream_id,
-                    &Response::Err("Upload exceeded declared size".into()),
+                    &err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
                 )?;
                 metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
                 ctx.streams.insert(stream_id, StreamState::Done);
@@ -843,12 +1003,13 @@ fn start_put(
                 send_message(
                     &mut ctx.conn,
                     stream_id,
-                    &Response::Err(format!("Failed to write file: {e}")),
+                    &err(ErrorCode::Internal, format!("Failed to write file: {e}")),
                 )?;
                 metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
                 ctx.streams.insert(stream_id, StreamState::Done);
                 return Ok(());
             }
+            hasher.update(&leftover);
             *remaining -= leftover.len() as u64;
             metrics
                 .bytes_received
@@ -885,6 +1046,8 @@ fn drive_put(
         remaining,
         mode,
         completed,
+        hasher,
+        expected_checksum,
     } = state
     else {
         return Ok(None);
@@ -898,36 +1061,61 @@ fn drive_put(
             Ok((len, fin)) => {
                 let to_take = (len as u64).min(*remaining) as usize;
                 if let Err(e) = writer.write_all(&tmp[..to_take]) {
-                    return Ok(Some(Response::Err(format!("Failed to write file: {e}"))));
+                    return Ok(Some(err(
+                        ErrorCode::Internal,
+                        format!("Failed to write file: {e}"),
+                    )));
                 }
+                hasher.update(&tmp[..to_take]);
                 *remaining -= to_take as u64;
                 metrics
                     .bytes_received
                     .fetch_add(to_take as u64, Ordering::Relaxed);
                 if to_take < len {
-                    return Ok(Some(Response::Err("Upload exceeded declared size".into())));
+                    return Ok(Some(err(
+                        ErrorCode::UploadOverflow,
+                        "Upload exceeded declared size",
+                    )));
                 }
                 if fin && *remaining > 0 {
-                    return Ok(Some(Response::Err(format!(
-                        "Upload truncated: {} bytes still expected",
-                        *remaining
-                    ))));
+                    return Ok(Some(err(
+                        ErrorCode::UploadTruncated,
+                        format!("Upload truncated: {} bytes still expected", *remaining),
+                    )));
                 }
             }
             Err(quiche::Error::Done) => break,
             Err(e) => {
                 warn!(stream_id, error = ?e, "stream_recv error during Put");
-                return Ok(Some(Response::Err("Stream receive error".into())));
+                return Ok(Some(err(ErrorCode::Internal, "Stream receive error")));
             }
         }
     }
 
     if *remaining == 0 {
         if let Err(e) = writer.flush() {
-            return Ok(Some(Response::Err(format!("Failed to flush file: {e}"))));
+            return Ok(Some(err(
+                ErrorCode::Internal,
+                format!("Failed to flush file: {e}"),
+            )));
+        }
+        // Verify checksum before rename. If it mismatches we leave the
+        // temp in place for the Drop impl to clean up and refuse the
+        // upload -- never reveal a corrupted body at `final_path`.
+        if let Some(expected) = expected_checksum {
+            let got = *hasher.finalize().as_bytes();
+            if got != *expected {
+                return Ok(Some(err(
+                    ErrorCode::ChecksumMismatch,
+                    "Upload checksum verification failed",
+                )));
+            }
         }
         if let Err(e) = fs::rename(temp_path, &final_path) {
-            return Ok(Some(Response::Err(format!("Failed to finalize file: {e}"))));
+            return Ok(Some(err(
+                ErrorCode::Internal,
+                format!("Failed to finalize file: {e}"),
+            )));
         }
         apply_mode(final_path, *mode);
         *completed = true;
