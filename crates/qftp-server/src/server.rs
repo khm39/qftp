@@ -701,21 +701,34 @@ fn process_readable_streams(
                 let response = if let Request::Rm { path } = &req {
                     match handler::resolve(&ctx.cwd, &ctx.user.home, path) {
                         Ok(target) => {
-                            let pre_size = std::fs::symlink_metadata(&target)
-                                .ok()
-                                .filter(|m| m.is_file())
-                                .map(|m| m.len())
-                                .unwrap_or(0);
-                            match std::fs::remove_file(&target) {
-                                Ok(()) => {
-                                    if pre_size > 0 {
-                                        let prev = ctx.user.used_bytes.load(Ordering::Relaxed);
-                                        let next = prev.saturating_sub(pre_size);
-                                        ctx.user.used_bytes.store(next, Ordering::Relaxed);
+                            // #137: parent-dir symlink TOCTOU re-check
+                            // mirrors handler::handle_request's
+                            // Mkdir/Rmdir/Rm/Rename guard. This Rm path
+                            // is here (rather than in the generic
+                            // handler) only because it also has to
+                            // decrement the per-user used-bytes cache.
+                            if let Err(e) =
+                                handler::recheck_ancestors_no_symlinks(&target, &ctx.user.home)
+                            {
+                                Response::Err(e)
+                            } else {
+                                let pre_size = std::fs::symlink_metadata(&target)
+                                    .ok()
+                                    .filter(|m| m.is_file())
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                match std::fs::remove_file(&target) {
+                                    Ok(()) => {
+                                        if pre_size > 0 {
+                                            let prev =
+                                                ctx.user.used_bytes.load(Ordering::Relaxed);
+                                            let next = prev.saturating_sub(pre_size);
+                                            ctx.user.used_bytes.store(next, Ordering::Relaxed);
+                                        }
+                                        Response::Ok
                                     }
-                                    Response::Ok
+                                    Err(e) => err(io_code(&e), format!("rm failed: {e}")),
                                 }
-                                Err(e) => err(io_code(&e), format!("rm failed: {e}")),
                             }
                         }
                         Err(e) => Response::Err(e),
@@ -758,6 +771,13 @@ fn start_get(
             return Ok(());
         }
     };
+    // #137: parent-dir symlink TOCTOU re-check. O_NOFOLLOW below
+    // protects the leaf only; an intermediate parent that was swapped
+    // to a symlink between resolve and open would still be traversed
+    // by the kernel and let us serve a file outside the user's home.
+    if let Err(e) = handler::recheck_ancestors_no_symlinks(&file_path, &ctx.user.home) {
+        return send_err(ctx, e.code, e.message);
+    }
     // #106: open with O_NOFOLLOW first, then derive metadata from the
     // resulting fd. This binds the metadata + the bytes we stream to
     // the same inode the path resolved to, eliminating the TOCTOU
@@ -1053,6 +1073,23 @@ fn start_put(
             return Ok(());
         }
     };
+    // #137: parent-dir symlink TOCTOU re-check. The temp file is
+    // opened with O_NOFOLLOW, which protects the *leaf* but not the
+    // intermediate components -- a parent that was swapped to a
+    // symlink between resolve_parent and open would still be
+    // traversed by the kernel and land the temp under the symlink
+    // target.
+    if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, &ctx.user.home) {
+        // Drop the in-flight reservation since we never opened the
+        // temp file.
+        ctx.user
+            .in_flight_bytes
+            .fetch_sub(new_bytes, Ordering::Relaxed);
+        send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
+        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+        ctx.streams.insert(stream_id, StreamState::Done);
+        return Ok(());
+    }
     let temp_path = temp_path_for(&final_path, stream_id);
 
     // Resume: if offset > 0 the client is claiming the server already
