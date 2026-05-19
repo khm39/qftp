@@ -78,6 +78,13 @@ struct Args {
     max_connections: usize,
     #[arg(long, default_value_t = 8)]
     max_connections_per_ip: usize,
+    /// Steady-state request rate per source IP (tokens per second).
+    /// The token bucket also covers Initial packet rate. Default 50/s.
+    #[arg(long, default_value_t = 50.0)]
+    rate_limit_rps: f64,
+    /// Maximum request burst per source IP. Default 100.
+    #[arg(long, default_value_t = 100.0)]
+    rate_limit_burst: f64,
     /// Require stateless retry (anti-amplification address validation)
     /// before any connection state is allocated. Recommended for any
     /// internet-facing deployment.
@@ -157,6 +164,8 @@ fn main() -> Result<()> {
             max_per_ip_connections: args.max_connections_per_ip,
         },
         require_retry: args.require_retry,
+        rate_limit_rps: args.rate_limit_rps,
+        rate_limit_burst: args.rate_limit_burst,
     };
 
     server::run(

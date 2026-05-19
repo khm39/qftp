@@ -123,6 +123,12 @@ pub fn recv_message<T: DeserializeOwned>(
                 stream_buf.extend_from_slice(&tmp[..len]);
             }
             Err(quiche::Error::Done) => break,
+            // Quiche removes a stream from its tracker the instant
+            // the peer's FIN byte is delivered; subsequent reads on
+            // the same id return InvalidStreamState instead of Done.
+            // Both mean "no more bytes will arrive", so handle them
+            // the same way here.
+            Err(quiche::Error::InvalidStreamState(_)) => break,
             Err(e) => return Err(e).context("stream_recv failed"),
         }
     }
