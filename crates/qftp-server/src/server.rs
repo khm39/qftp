@@ -1310,6 +1310,14 @@ fn apply_mode(_path: &Path, _mode: u32) {}
 fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
+    // #136: force 0o600 at create time so the in-flight partial isn't
+    // world-readable under a typical daemon umask (0o022). The final
+    // mode is applied by apply_mode() after rename to final_path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
     qftp_common::fs_safe::apply_no_follow(&mut opts).open(path)
 }
 
@@ -1401,5 +1409,17 @@ mod tests {
             path: "x".into(),
             mode: 0o644,
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial");
+        let f = open_temp_no_follow(&path).unwrap();
+        let meta = f.metadata().unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "in-flight temp must be 0o600, got {mode:o}");
     }
 }
