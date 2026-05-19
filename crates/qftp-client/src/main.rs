@@ -321,6 +321,7 @@ fn main() -> Result<()> {
     // pipeline > interactive TTY.
     let mut next_stream_id: u64 = 0;
     let mut quit_requested = false;
+    let mut local_cwd: PathBuf = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if let Some(path) = &spec.initial_path {
         let stream_id = take_stream(&mut next_stream_id);
@@ -351,6 +352,7 @@ fn main() -> Result<()> {
                 &mut events,
                 &mut next_stream_id,
                 &mut quit_requested,
+                &mut local_cwd,
             )?;
         }
     } else if args.batch || !std::io::stdin().is_terminal() {
@@ -369,6 +371,7 @@ fn main() -> Result<()> {
                 &mut events,
                 &mut next_stream_id,
                 &mut quit_requested,
+                &mut local_cwd,
             )?;
         }
     } else {
@@ -379,6 +382,7 @@ fn main() -> Result<()> {
             &mut poll,
             &mut events,
             &mut next_stream_id,
+            &mut local_cwd,
         )?;
     }
 
@@ -413,6 +417,7 @@ fn run_interactive(
     poll: &mut Poll,
     events: &mut Events,
     next_stream_id: &mut u64,
+    local_cwd: &mut PathBuf,
 ) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new()?;
     let hist_path = history_path(args);
@@ -435,7 +440,16 @@ fn run_interactive(
             }
         };
         let _ = rl.add_history_entry(&line);
-        run_one_line(&line, conn, socket, poll, events, next_stream_id, &mut quit)?;
+        run_one_line(
+            &line,
+            conn,
+            socket,
+            poll,
+            events,
+            next_stream_id,
+            &mut quit,
+            local_cwd,
+        )?;
     }
     if let Some(p) = hist_path {
         let _ = rl.save_history(&p);
@@ -451,6 +465,7 @@ fn history_path(args: &Args) -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".qftp_history"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_one_line(
     line: &str,
     conn: &mut quiche::Connection,
@@ -459,6 +474,7 @@ fn run_one_line(
     events: &mut Events,
     next_stream_id: &mut u64,
     quit_out: &mut bool,
+    local_cwd: &mut PathBuf,
 ) -> Result<()> {
     let cmd = match repl::parse_command(line) {
         Some(c) => c,
@@ -466,6 +482,79 @@ fn run_one_line(
     };
 
     match cmd {
+        repl::Command::Lcd(target) => {
+            let dest = match target.as_deref() {
+                Some(p) => {
+                    let p = config::expand_tilde(p);
+                    let pb = PathBuf::from(p);
+                    if pb.is_absolute() {
+                        pb
+                    } else {
+                        local_cwd.join(pb)
+                    }
+                }
+                None => std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/")),
+            };
+            match std::fs::canonicalize(&dest) {
+                Ok(c) if c.is_dir() => {
+                    *local_cwd = c;
+                    println!("local cwd: {}", local_cwd.display());
+                }
+                Ok(_) => println!("lcd: not a directory: {}", dest.display()),
+                Err(e) => println!("lcd: {}: {e}", dest.display()),
+            }
+            return Ok(());
+        }
+        repl::Command::Lpwd => {
+            println!("{}", local_cwd.display());
+            return Ok(());
+        }
+        repl::Command::Lls(path) => {
+            let target = match path {
+                Some(p) => resolve_local(local_cwd, &p),
+                None => local_cwd.clone(),
+            };
+            match std::fs::read_dir(&target) {
+                Ok(entries) => {
+                    let mut names: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| {
+                            let p = e.path();
+                            let suffix = if p.is_dir() { "/" } else { "" };
+                            format!("{}{suffix}", e.file_name().to_string_lossy())
+                        })
+                        .collect();
+                    names.sort_unstable();
+                    for n in names {
+                        println!("{n}");
+                    }
+                }
+                Err(e) => println!("lls {}: {e}", target.display()),
+            }
+            return Ok(());
+        }
+        repl::Command::Lmkdir(path) => {
+            let target = resolve_local(local_cwd, &path);
+            if let Err(e) = std::fs::create_dir_all(&target) {
+                println!("lmkdir {}: {e}", target.display());
+            }
+            return Ok(());
+        }
+        repl::Command::Shell(rest) => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let mut cmd_proc = std::process::Command::new(&shell);
+            cmd_proc.current_dir(local_cwd.clone());
+            if rest.is_empty() {
+                // Interactive shell.
+                let _ = cmd_proc.status();
+            } else {
+                cmd_proc.arg("-c").arg(&rest);
+                let _ = cmd_proc.status();
+            }
+            return Ok(());
+        }
         repl::Command::Remote(req) => {
             let is_quit = matches!(req, Request::Quit);
             let stream_id = take_stream(next_stream_id);
@@ -484,15 +573,28 @@ fn run_one_line(
             recursive,
         } => {
             if recursive {
-                do_recursive_get(conn, socket, poll, events, next_stream_id, &remote, local)?;
+                let local_root = local.map(|s| resolve_local(local_cwd, &s));
+                do_recursive_get(
+                    conn,
+                    socket,
+                    poll,
+                    events,
+                    next_stream_id,
+                    &remote,
+                    local_root.map(|p| p.to_string_lossy().into_owned()),
+                )?;
             } else {
                 let stream_id = take_stream(next_stream_id);
-                let local_path = local.map(PathBuf::from).unwrap_or_else(|| {
-                    Path::new(&remote)
-                        .file_name()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from(remote.clone()))
-                });
+                let local_path = match local {
+                    Some(s) => resolve_local(local_cwd, &s),
+                    None => {
+                        let name = Path::new(&remote)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| remote.clone());
+                        local_cwd.join(name)
+                    }
+                };
                 if let Err(e) =
                     transfer::do_get(conn, socket, poll, events, stream_id, &remote, &local_path)
                 {
@@ -505,8 +607,12 @@ fn run_one_line(
             remote,
             recursive,
         } => {
-            // Expand local glob first (recursive or not).
-            let locals = expand_glob(&local);
+            // Expand glob, resolving relative entries against the
+            // REPL's local cwd.
+            let pattern = resolve_local(local_cwd, &local)
+                .to_string_lossy()
+                .into_owned();
+            let locals = expand_glob(&pattern);
             if locals.is_empty() {
                 println!("no local files match {local}");
                 return Ok(());
@@ -554,6 +660,19 @@ fn take_stream(next: &mut u64) -> u64 {
     let cur = *next;
     *next += 4;
     cur
+}
+
+/// Resolve a user-supplied local path against the REPL's local cwd.
+/// Absolute paths and paths starting with `~/` pass through; relative
+/// paths are joined onto `local_cwd`.
+fn resolve_local(local_cwd: &Path, p: &str) -> PathBuf {
+    let expanded = config::expand_tilde(p);
+    let pb = PathBuf::from(expanded);
+    if pb.is_absolute() {
+        pb
+    } else {
+        local_cwd.join(pb)
+    }
 }
 
 fn expand_glob(pattern: &str) -> Vec<PathBuf> {

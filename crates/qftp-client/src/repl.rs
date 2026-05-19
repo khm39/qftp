@@ -13,6 +13,20 @@ pub enum Command {
         remote: Option<String>,
         recursive: bool,
     },
+    /// `lcd <path>` — change the REPL's local working directory used
+    /// when a `put` or `get` argument is a relative path. Does not
+    /// chdir() the process, so background helpers stay where they
+    /// were.
+    Lcd(Option<String>),
+    /// `lpwd` — show the REPL local cwd.
+    Lpwd,
+    /// `lls [path]` — list a local directory.
+    Lls(Option<String>),
+    /// `lmkdir <path>` — make a local directory (and parents).
+    Lmkdir(String),
+    /// `!cmd …` — pass the rest of the line to `$SHELL -c`. The
+    /// empty `!` form spawns an interactive `$SHELL`.
+    Shell(String),
 }
 
 /// Pull `-r` / `--recursive` out of a token slice. Returns the flag and
@@ -31,6 +45,12 @@ fn take_recursive_flag<'a>(parts: &'a [&'a str]) -> (bool, Vec<&'a str>) {
 }
 
 pub fn parse_command(line: &str) -> Option<Command> {
+    // `!` is parsed before whitespace-split so the user can pass
+    // pipes, quotes, redirection unmodified.
+    if let Some(rest) = line.strip_prefix('!') {
+        return Some(Command::Shell(rest.trim().to_string()));
+    }
+
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return None;
@@ -134,6 +154,16 @@ pub fn parse_command(line: &str) -> Option<Command> {
             Some(Command::Remote(Request::Stat {
                 path: args[0].to_string(),
             }))
+        }
+        "lcd" => Some(Command::Lcd(args.first().map(|s| s.to_string()))),
+        "lpwd" => Some(Command::Lpwd),
+        "lls" => Some(Command::Lls(args.first().map(|s| s.to_string()))),
+        "lmkdir" => {
+            if args.is_empty() {
+                println!("Usage: lmkdir <path>");
+                return None;
+            }
+            Some(Command::Lmkdir(args[0].to_string()))
         }
         "quit" | "exit" => Some(Command::Remote(Request::Quit)),
         "help" | "?" => {
@@ -244,10 +274,17 @@ fn print_help() {
     println!("  rename <from> <to>           Rename/move a file");
     println!("  chmod <mode> <path>          Change file permissions (octal)");
     println!("  stat <path>                  Show file information");
+    println!("  lcd [path]                   Change the REPL's local cwd (no $HOME → /)");
+    println!("  lpwd                         Print the REPL's local cwd");
+    println!("  lls [path]                   List a local directory");
+    println!("  lmkdir <path>                Create a local directory");
+    println!("  !cmd ...                     Run `cmd` via $SHELL -c");
+    println!("  !                            Spawn an interactive $SHELL");
     println!("  help                         Show this help message");
     println!("  quit                         Disconnect and exit");
     println!();
     println!("Tips:");
     println!("  - Local glob: `put *.log` expands on the client side.");
     println!("  - Use `-r` to walk directories on get/put.");
+    println!("  - `lcd` is REPL-scoped; the client process never chdir()'s.");
 }
