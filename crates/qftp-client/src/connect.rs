@@ -60,6 +60,7 @@ pub fn establish(
         UdpSocket::bind("0.0.0.0:0").with_context(|| format!("{context_label}: UDP bind"))?;
     std_socket.set_nonblocking(true)?;
     std_socket.connect(peer_addr)?;
+    qftp_common::transport::tune_udp_buffers(&std_socket);
     let local_addr = std_socket.local_addr()?;
     let mut socket = mio::net::UdpSocket::from_std(std_socket);
 

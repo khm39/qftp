@@ -174,7 +174,13 @@ pub fn do_get(
     stream_send_all(conn, stream_id, &[], true)?;
     flush_egress(conn, socket)?;
 
-    let resp = poll_response(conn, socket, poll, events, stream_id)?;
+    // The FileReady response and the first chunk of body bytes can be
+    // pulled off the stream together; capture whatever recv_message
+    // drained past the response frame so the body-read loop below can
+    // consume it before going back to stream_recv. For tiny files the
+    // entire body + trailer + FIN often arrives in the same ingress.
+    let mut carryover: Vec<u8> = Vec::new();
+    let resp = poll_response_with_buf(conn, socket, poll, events, stream_id, &mut carryover)?;
     let (size, total_size, checksum_follows) = match resp {
         Response::FileReady {
             size,
@@ -239,14 +245,42 @@ pub fn do_get(
     let want_trailer = if checksum_follows { 32 } else { 0 };
     let mut stream_finished = false;
 
-    while received < size || trailer.len() < want_trailer {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
+    // Drain whatever recv_message already read past the FileReady
+    // response frame. For small files the entire body + trailer is
+    // sitting in `carryover` before we ever hit stream_recv.
+    if !carryover.is_empty() {
+        let body_room = (size - received) as usize;
+        let body_take = body_room.min(carryover.len());
+        if body_take > 0 {
+            file.write_all(&carryover[..body_take])
+                .context("writing body chunk from carryover")?;
+            hasher.update(&carryover[..body_take]);
+            received += body_take as u64;
+            bar.set_position(resume_offset + received);
+        }
+        if body_take < carryover.len() {
+            trailer.extend_from_slice(&carryover[body_take..]);
+        }
+        carryover.clear();
+    }
 
+    while received < size || trailer.len() < want_trailer {
+        // Three-step pump: always drain the socket and stream first,
+        // and only block in poll.poll when both came up empty. The
+        // previous "poll first" arrangement would sleep on the QUIC
+        // idle timer when the last few packets had already been
+        // delivered to quiche by an earlier ingress call (e.g. the
+        // one in `poll_response_with_buf`); the response was sitting
+        // on the stream and the kernel UDP buffer was empty, so
+        // epoll had no edge event to fire.
+        let mut recv_buf = [0u8; 65535];
+        handle_ingress(conn, socket, &mut recv_buf)?;
+
+        let mut drained_any = false;
         loop {
             match conn.stream_recv(stream_id, &mut tmp) {
                 Ok((len, fin)) => {
+                    drained_any = true;
                     if received < size {
                         let body_room = (size - received) as usize;
                         let body_take = body_room.min(len);
@@ -267,6 +301,18 @@ pub fn do_get(
                     }
                 }
                 Err(quiche::Error::Done) => break,
+                // Quiche evicts a stream from its tracker as soon as it
+                // marks the stream complete -- which happens the moment
+                // we read the FIN byte. Any subsequent stream_recv
+                // returns InvalidStreamState instead of Done. Treat
+                // that as a graceful end-of-stream: if we have all the
+                // expected body + trailer bytes the outer loop will
+                // exit normally; if we don't, the post-loop check
+                // surfaces "server closed stream early".
+                Err(quiche::Error::InvalidStreamState(_)) => {
+                    stream_finished = true;
+                    break;
+                }
                 Err(e) => bail!("stream_recv: {e}"),
             }
         }
@@ -288,6 +334,13 @@ pub fn do_get(
 
         if conn.is_closed() && (received < size || trailer.len() < want_trailer) {
             bail!("connection closed during download");
+        }
+
+        // If neither the socket nor the stream had anything ready,
+        // sleep until the next event or the quiche timer fires.
+        if !drained_any {
+            poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
+            conn.on_timeout();
         }
     }
 
@@ -380,6 +433,7 @@ pub fn do_put(
     let mut sent: u64 = 0;
     let mut buf = vec![0u8; CHUNK];
     let mut pacer = Pacer::new();
+    let mut recv_buf = [0u8; 65535];
     while sent < bytes_to_send {
         let want = (bytes_to_send - sent) as usize;
         let want = want.min(buf.len());
@@ -390,10 +444,32 @@ pub fn do_put(
         // Bandwidth throttle (`--bwlimit`). No-op when unlimited.
         pacer.consume(want);
 
-        // The whole batch is one stream_send_all call, but we still want
-        // to flush egress periodically so the server actually sees the
-        // bytes. Send in CHUNK-sized pieces with intermediate flushes.
-        stream_send_all(conn, stream_id, &buf[..want], is_last)?;
+        // Drive a single CHUNK to the wire. quiche's stream_send will
+        // truncate or refuse the write when the connection's send
+        // capacity (flow-control + congestion window) is exhausted —
+        // in both cases we have to flush egress and pull ACKs in
+        // before the rest of the chunk can be queued. The previous
+        // version of this loop propagated `Error::Done` immediately,
+        // which made any upload that didn't fit in the initial cwnd
+        // (~14 KiB) fail outright.
+        let mut sub = 0usize;
+        while sub < want {
+            let remaining = &buf[sub..want];
+            let chunk_fin = is_last && (sub + remaining.len() == want);
+            match conn.stream_send(stream_id, remaining, chunk_fin) {
+                Ok(0) | Err(quiche::Error::Done) => {
+                    flush_egress(conn, socket)?;
+                    poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
+                    conn.on_timeout();
+                    handle_ingress(conn, socket, &mut recv_buf)?;
+                    if conn.is_closed() {
+                        bail!("connection closed during upload");
+                    }
+                }
+                Ok(n) => sub += n,
+                Err(e) => bail!("stream_send failed: {e}"),
+            }
+        }
         flush_egress(conn, socket)?;
 
         sent += want as u64;
@@ -402,7 +478,7 @@ pub fn do_put(
         // Pump any incoming acks so flow-control opens up.
         poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
         conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
+        handle_ingress(conn, socket, &mut recv_buf)?;
         flush_egress(conn, socket)?;
     }
     bar.finish_and_clear();
@@ -436,12 +512,43 @@ fn poll_response(
     stream_id: u64,
 ) -> Result<Response> {
     let mut buf = Vec::new();
+    poll_response_with_buf(conn, socket, poll, events, stream_id, &mut buf)
+}
+
+/// Same as [`poll_response`] but lets the caller observe whatever
+/// trailing bytes recv_message pulled off the stream beyond the
+/// response frame. For `Get`, the FileReady response and the first
+/// chunk of body bytes can arrive together; without this the body
+/// bytes that were already drained from quiche would be lost when the
+/// caller's body-read loop took over.
+fn poll_response_with_buf(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    stream_id: u64,
+    buf: &mut Vec<u8>,
+) -> Result<Response> {
     loop {
+        // Try to deserialize a response from anything quiche already
+        // has buffered on this stream BEFORE blocking in poll.poll.
+        // The body-send loop in `do_put` runs a final ingress pump
+        // after the last chunk goes out, and the server's response
+        // packet often arrives during that pump -- so by the time we
+        // get here the response bytes are already sitting in the
+        // stream's recv buffer. Without this pre-poll drain we would
+        // call poll.poll(timeout=30s) and sleep on the QUIC idle
+        // timeout even though the message has been delivered.
+        if let Some(resp) = recv_message::<Response>(conn, stream_id, buf)? {
+            flush_egress(conn, socket)?;
+            return Ok(resp);
+        }
+
         poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
         conn.on_timeout();
         handle_ingress(conn, socket, &mut [0u8; 65535])?;
 
-        match recv_message::<Response>(conn, stream_id, &mut buf)? {
+        match recv_message::<Response>(conn, stream_id, buf)? {
             Some(resp) => {
                 // #140: per-field cap defense in depth against a
                 // malicious server packing a multi-MiB string / huge

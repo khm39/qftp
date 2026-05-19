@@ -84,6 +84,10 @@ const SERVER_TOKEN: Token = Token(0);
 pub struct ServerConfig {
     pub caps: Caps,
     pub require_retry: bool,
+    /// Per-IP request token bucket refill rate (requests per second).
+    pub rate_limit_rps: f64,
+    /// Per-IP request token bucket burst capacity.
+    pub rate_limit_burst: f64,
 }
 
 pub fn run(
@@ -102,7 +106,8 @@ pub fn run(
     let mut events = Events::with_capacity(1024);
 
     let rng = ring::rand::SystemRandom::new();
-    let mut rate_limiter = RateLimiter::new(50.0, 100.0);
+    let mut rate_limiter =
+        RateLimiter::new(server_config.rate_limit_rps, server_config.rate_limit_burst);
     let mut counter = ConnectionCounter::default();
     let retry_key = RetryKey::new();
 

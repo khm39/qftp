@@ -22,6 +22,50 @@ pub const INITIAL_MAX_STREAM_DATA: u64 = 16 * 1024 * 1024;
 /// for the BDP this protocol actually sees.
 pub const INITIAL_MAX_CONNECTION_DATA: u64 = 4 * INITIAL_MAX_STREAM_DATA;
 
+/// Target size for SO_RCVBUF / SO_SNDBUF on the QUIC sockets, in bytes.
+/// Linux's default UDP recv buffer (`net.core.rmem_default`, usually
+/// 208 KiB) overflows almost immediately when one side bursts a full
+/// file's worth of packets faster than the other side can drain its
+/// kernel queue: the result is silent UDP drops, runaway QUIC PTO
+/// backoff, and 30s+ stalls in the middle of a transfer. 4 MiB is
+/// the standard `net.core.rmem_max` cap on most distros — request
+/// it explicitly, accept whatever the kernel grants (the syscall
+/// returns success even when the value is clamped), and rely on
+/// QUIC's own flow control to keep memory bounded.
+const SOCKET_BUF_HINT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bump the kernel send/receive buffers on a UDP socket. Failures are
+/// logged at debug level and otherwise ignored: the OS may cap the
+/// value below what we asked for, and on unsupported platforms (e.g.
+/// Windows) the helper is a no-op.
+#[cfg(unix)]
+pub fn tune_udp_buffers(socket: &std::net::UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let want = SOCKET_BUF_HINT_BYTES as libc::c_int;
+    for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &want as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&want) as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            tracing::debug!(
+                opt,
+                error = ?std::io::Error::last_os_error(),
+                "setsockopt failed (will use kernel default)"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn tune_udp_buffers(_socket: &std::net::UdpSocket) {}
+
 /// Flush pending outgoing packets from the QUIC connection to the UDP socket.
 pub fn flush_egress(conn: &mut quiche::Connection, socket: &mio::net::UdpSocket) -> Result<()> {
     let mut out = [0u8; MAX_DATAGRAM_SIZE];
@@ -138,6 +182,12 @@ pub fn recv_message<T: DeserializeOwned>(
                 stream_buf.extend_from_slice(&tmp[..len]);
             }
             Err(quiche::Error::Done) => break,
+            // Quiche removes a stream from its tracker the instant
+            // the peer's FIN byte is delivered; subsequent reads on
+            // the same id return InvalidStreamState instead of Done.
+            // Both mean "no more bytes will arrive", so handle them
+            // the same way here.
+            Err(quiche::Error::InvalidStreamState(_)) => break,
             Err(e) => return Err(e).context("stream_recv failed"),
         }
     }
