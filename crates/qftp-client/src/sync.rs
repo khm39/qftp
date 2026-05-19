@@ -19,20 +19,17 @@
 //!     event-driven server side (Phase 2) already supports it.
 
 use std::collections::{HashMap, HashSet};
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, ConnectionSpec, Overrides};
 use crate::session_store;
 use crate::transfer;
-
-const CLIENT: Token = Token(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Opts {
@@ -50,7 +47,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
 
     let url = config::parse_url(remote_url)
         .with_context(|| format!("sync: invalid remote URL {remote_url}"))?;
-    let host_port = format_host_port(&url.host, url.port);
+    let host_port = config::format_host_port(&url.host, url.port);
     let target = format!(
         "qftp://{host_port}{}",
         url.initial_path.as_deref().unwrap_or("/")
@@ -345,14 +342,6 @@ fn join_remote(prefix: &str, rel: &Path) -> String {
     }
 }
 
-fn format_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
 fn take_stream(next: &mut u64) -> u64 {
     let cur = *next;
     *next += 4;
@@ -405,66 +394,7 @@ fn poll_response(
 fn connect(
     spec: &ConnectionSpec,
 ) -> Result<(quiche::Connection, mio::net::UdpSocket, Poll, Events)> {
-    let client_cert = match (&spec.client_cert, &spec.client_key) {
-        (Some(c), Some(k)) => Some(qftp_common::transport::ClientCert {
-            cert_pem: c.clone(),
-            key_pem: k.clone(),
-        }),
-        _ => None,
-    };
-    let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
-        verify_peer: !spec.insecure,
-        ca_path: spec.ca.clone(),
-        client_cert,
-    })?;
-    let peer_addr = spec.host.parse().with_context(|| "sync: bad host")?;
-    let std_socket = UdpSocket::bind("0.0.0.0:0")?;
-    std_socket.set_nonblocking(true)?;
-    std_socket.connect(peer_addr)?;
-    let local_addr = std_socket.local_addr()?;
-    let mut socket = mio::net::UdpSocket::from_std(std_socket);
-
-    let rng = ring::rand::SystemRandom::new();
-    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-    use ring::rand::SecureRandom;
-    rng.fill(&mut scid_bytes).unwrap();
-    let scid = quiche::ConnectionId::from_vec(scid_bytes.to_vec());
-    let mut conn = quiche::connect(
-        Some(&spec.server_name),
-        &scid,
-        local_addr,
-        peer_addr,
-        &mut config,
-    )?;
-
-    if let Some(dir) = session_store::default_dir() {
-        if let Some(ticket) = session_store::load(&dir, &spec.host, None) {
-            let _ = conn.set_session(&ticket);
-        }
-    }
-
-    let mut poll = Poll::new()?;
-    let mut events_local = Events::with_capacity(1024);
-    poll.registry()
-        .register(&mut socket, CLIENT, Interest::READABLE)?;
-    flush_egress(&mut conn, &socket)?;
-    let mut buf = [0u8; 65535];
-    loop {
-        poll.poll(
-            &mut events_local,
-            conn.timeout().or(Some(Duration::from_millis(100))),
-        )?;
-        conn.on_timeout();
-        handle_ingress(&mut conn, &socket, &mut buf)?;
-        flush_egress(&mut conn, &socket)?;
-        if conn.is_established() {
-            break;
-        }
-        if conn.is_closed() {
-            return Err(anyhow!("sync: handshake closed"));
-        }
-    }
-    Ok((conn, socket, poll, Events::with_capacity(1024)))
+    crate::connect::establish(spec, "sync")
 }
 
 // SystemTime helper is reserved for the future remote->local path;

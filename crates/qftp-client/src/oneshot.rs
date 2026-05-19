@@ -8,12 +8,11 @@
 //! respect to TLS, config-file aliases, and CLI overrides.
 
 use std::io::{IsTerminal, Write};
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
@@ -21,8 +20,6 @@ use crate::config::{self, ConnectionSpec, Overrides};
 use crate::session_store;
 use crate::transfer;
 use crate::OneShot;
-
-const CLIENT: Token = Token(0);
 
 /// sysexits.h-style exit codes. We return them via
 /// `std::process::exit` so a script driver can branch on them.
@@ -52,19 +49,11 @@ fn parse_remote(input: &str) -> Result<RemoteRef> {
     let url = config::parse_url(input).with_context(|| format!("invalid remote URL: {input}"))?;
     let path = url.initial_path.unwrap_or_else(|| "/".to_string());
     Ok(RemoteRef {
-        host_port: format_host_port(&url.host, url.port),
+        host_port: config::format_host_port(&url.host, url.port),
         server_name: url.host.clone(),
         user: url.user,
         path,
     })
-}
-
-fn format_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
 }
 
 /// Resolve a `ConnectionSpec` from a one-shot URL + overrides. The
@@ -93,86 +82,8 @@ where
         &mut u64,
     ) -> Result<i32>,
 {
-    let client_cert = match (&spec.client_cert, &spec.client_key) {
-        (Some(c), Some(k)) => Some(qftp_common::transport::ClientCert {
-            cert_pem: c.clone(),
-            key_pem: k.clone(),
-        }),
-        _ => None,
-    };
-
-    let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
-        verify_peer: !spec.insecure,
-        ca_path: spec.ca.clone(),
-        client_cert,
-    })?;
-
-    let peer_addr = spec
-        .host
-        .parse()
-        .with_context(|| format!("failed to parse host address: {}", spec.host))?;
-    let std_socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
-    std_socket.set_nonblocking(true)?;
-    std_socket.connect(peer_addr)?;
-    let local_addr = std_socket.local_addr()?;
-    let mut socket = mio::net::UdpSocket::from_std(std_socket);
-
-    let rng = ring::rand::SystemRandom::new();
-    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-    use ring::rand::SecureRandom;
-    rng.fill(&mut scid_bytes).unwrap();
-    let scid = quiche::ConnectionId::from_vec(scid_bytes.to_vec());
-
-    let mut conn = quiche::connect(
-        Some(&spec.server_name),
-        &scid,
-        local_addr,
-        peer_addr,
-        &mut config,
-    )?;
-
-    // 0-RTT session resumption. Wired exactly like the REPL path
-    // (see main.rs); rejected tickets fall back silently to 1-RTT.
-    // This is what makes one-shot bursts like
-    //     for f in *.log; do qftp put "$f" qftp://host/logs/; done
-    // skip the TLS handshake after the first iteration.
+    let (mut conn, socket, mut poll, mut events) = crate::connect::establish(spec, "one-shot")?;
     let ticket_dir = session_store::default_dir();
-    if let Some(dir) = &ticket_dir {
-        if let Some(ticket) = session_store::load(dir, &spec.host, None) {
-            match conn.set_session(&ticket) {
-                Ok(()) => {
-                    tracing::info!(host = %spec.host, "one-shot: 0-RTT resuming");
-                }
-                Err(e) => {
-                    tracing::warn!(error = ?e, "stale session ticket; falling back to 1-RTT");
-                    let _ = session_store::forget(dir, &spec.host);
-                }
-            }
-        }
-    }
-
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(1024);
-    poll.registry()
-        .register(&mut socket, CLIENT, Interest::READABLE)?;
-
-    flush_egress(&mut conn, &socket)?;
-    loop {
-        poll.poll(
-            &mut events,
-            conn.timeout().or(Some(Duration::from_millis(100))),
-        )?;
-        conn.on_timeout();
-        handle_ingress(&mut conn, &socket, &mut [0u8; 65535])?;
-        flush_egress(&mut conn, &socket)?;
-
-        if conn.is_established() {
-            break;
-        }
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed during handshake");
-        }
-    }
 
     let mut next_stream_id: u64 = 0;
     let code = body(

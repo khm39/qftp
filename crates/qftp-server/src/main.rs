@@ -210,8 +210,8 @@ fn write_private_key(path: &Path, contents: &str) -> Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
-        opts.custom_flags(libc::O_NOFOLLOW);
     }
+    qftp_common::fs_safe::apply_no_follow(&mut opts);
     let mut f = opts.open(path).with_context(|| {
         format!(
             "failed to create {} with 0o600 + O_NOFOLLOW",

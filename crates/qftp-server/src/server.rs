@@ -239,7 +239,7 @@ pub fn run(
             if !alive {
                 let peer_ip = ctx.peer_addr.ip();
                 counter.release(peer_ip);
-                metrics.connections_open.fetch_sub(1, Ordering::Relaxed);
+                metrics.dec_connections_open();
                 info!(peer = %ctx.peer_addr, user = %ctx.user.name, "connection closed");
             }
             alive
@@ -279,12 +279,10 @@ fn try_accept(
     local_addr: std::net::SocketAddr,
     hdr: &quiche::Header,
     pkt: &mut [u8],
-    out_pkt: &mut [u8; 1350],
+    out_pkt: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<()> {
     if !rate_limiter.try_consume(from.ip()) {
-        metrics
-            .connections_rejected_rate
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.inc_connections_rejected_rate();
         debug!(peer = %from, "Initial dropped by rate limiter");
         return Ok(());
     }
@@ -296,7 +294,7 @@ fn try_accept(
         let has_token = hdr.token.as_ref().is_some_and(|t| !t.is_empty());
         if !has_token {
             send_retry(retry_key, rng, socket, hdr, from, out_pkt)?;
-            metrics.retries_issued.fetch_add(1, Ordering::Relaxed);
+            metrics.inc_retries_issued();
             return Ok(());
         }
         let token = hdr.token.as_ref().unwrap();
@@ -308,9 +306,7 @@ fn try_accept(
     }
 
     if !counter.try_acquire(cfg.caps, from.ip()) {
-        metrics
-            .connections_rejected_caps
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.inc_connections_rejected_caps();
         debug!(peer = %from, "Initial dropped by connection cap");
         return Ok(());
     }
@@ -349,8 +345,8 @@ fn try_accept(
     // connection as the anonymous user and upgrade later if we can.
     let ctx = ConnectionContext::new(conn, from, users.anonymous());
     info!(peer = %from, "connection accepted");
-    metrics.connections_total.fetch_add(1, Ordering::Relaxed);
-    metrics.connections_open.fetch_add(1, Ordering::Relaxed);
+    metrics.inc_connections_total();
+    metrics.inc_connections_open();
 
     // If a previous Initial from this peer already created the slot
     // (the deterministic SCID collapses retransmits onto the same key),
@@ -382,7 +378,7 @@ fn send_retry(
     socket: &mio::net::UdpSocket,
     hdr: &quiche::Header,
     from: std::net::SocketAddr,
-    out: &mut [u8; 1350],
+    out: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<()> {
     let mut new_scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SecureRandom::fill(rng, &mut new_scid_bytes).expect("system RNG failed");
@@ -561,7 +557,7 @@ fn process_readable_streams(
                         *state = StreamState::Done;
                         continue;
                     }
-                    metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.inc_requests_total();
                     debug!(
                         peer = %ctx.peer_addr,
                         user = %ctx.user.name,
@@ -575,9 +571,7 @@ fn process_readable_streams(
                     // single accepted peer can't burn the server with
                     // command floods.
                     if !rate_limiter.try_consume(peer_ip) {
-                        metrics
-                            .requests_rate_limited
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics.inc_requests_rate_limited();
                         actions.push(PendingAction::AclReject {
                             stream_id,
                             resp: err(ErrorCode::RateLimited, "Rate limit exceeded"),
@@ -596,9 +590,9 @@ fn process_readable_streams(
                     // 1-RTT retry.
                     if ctx.conn.is_in_early_data() {
                         if request_is_replay_safe(&req) {
-                            metrics.zero_rtt_accepted.fetch_add(1, Ordering::Relaxed);
+                            metrics.inc_zero_rtt_accepted();
                         } else {
-                            metrics.zero_rtt_rejected.fetch_add(1, Ordering::Relaxed);
+                            metrics.inc_zero_rtt_rejected();
                             actions.push(PendingAction::AclReject {
                                 stream_id,
                                 resp: err(ErrorCode::Unsupported, "Operation requires 1-RTT data"),
@@ -668,7 +662,7 @@ fn process_readable_streams(
             StreamState::ReadingFileData { .. } => {
                 if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, tmp, metrics)? {
                     if matches!(resp, Response::Err(_)) {
-                        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+                        metrics.inc_requests_failed();
                     }
                     send_message(&mut ctx.conn, stream_id, &resp)?;
                     *state = StreamState::Done;
@@ -686,7 +680,7 @@ fn process_readable_streams(
         match action {
             PendingAction::AclReject { stream_id, resp } => {
                 send_message(&mut ctx.conn, stream_id, &resp)?;
-                metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+                metrics.inc_requests_failed();
             }
             PendingAction::StartGet {
                 stream_id,
@@ -783,12 +777,27 @@ fn process_readable_streams(
                     handler::handle_request(&req, &mut ctx.cwd, &ctx.user.home)
                 };
                 if matches!(response, Response::Err(_)) {
-                    metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    metrics.inc_requests_failed();
                 }
                 send_message(&mut ctx.conn, stream_id, &response)?;
             }
         }
     }
+    Ok(())
+}
+
+/// Send a one-shot error response for a stream and mark it Done.
+/// Used by both `start_get` and `start_put` to collapse what was the
+/// same `send_err` closure repeated in each.
+fn fail_stream(
+    ctx: &mut ConnectionContext,
+    stream_id: u64,
+    metrics: &Metrics,
+    response: Response,
+) -> Result<()> {
+    send_message(&mut ctx.conn, stream_id, &response)?;
+    metrics.inc_requests_failed();
+    ctx.streams.insert(stream_id, StreamState::Done);
     Ok(())
 }
 
@@ -802,20 +811,12 @@ fn start_get(
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
-        send_message(&mut ctx.conn, stream_id, &err(code, msg))?;
-        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-        ctx.streams.insert(stream_id, StreamState::Done);
-        Ok(())
+        fail_stream(ctx, stream_id, metrics, err(code, msg))
     };
 
     let file_path = match handler::resolve(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
-        Err(e) => {
-            send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
-            metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-            ctx.streams.insert(stream_id, StreamState::Done);
-            return Ok(());
-        }
+        Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
     };
     // #137: parent-dir symlink TOCTOU re-check. O_NOFOLLOW below
     // protects the leaf only; an intermediate parent that was swapped
@@ -830,11 +831,7 @@ fn start_get(
     // window between `walk_safe` and `fs::open`.
     let mut open_opts = std::fs::OpenOptions::new();
     open_opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.custom_flags(libc::O_NOFOLLOW);
-    }
+    qftp_common::fs_safe::apply_no_follow(&mut open_opts);
     let mut file = match open_opts.open(&file_path) {
         Ok(f) => f,
         Err(e) => {
@@ -985,7 +982,7 @@ fn drive_one_sender(
             Ok(n) => {
                 hasher.update(&chunk[..n]);
                 *sent += n as u64;
-                metrics.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                metrics.add_bytes_sent(n as u64);
                 if n < want {
                     if let Err(e) = reader.seek_relative(-((want - n) as i64)) {
                         warn!(stream_id, error = %e, "seek failed during partial send");
@@ -1031,7 +1028,7 @@ fn drive_one_sender(
             Ok(0) => return SendOutcome::Blocked,
             Ok(n) => {
                 *trailer_offset += n;
-                metrics.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                metrics.add_bytes_sent(n as u64);
             }
             Err(quiche::Error::Done) => return SendOutcome::Blocked,
             Err(e) => {
@@ -1050,7 +1047,7 @@ fn drive_one_sender(
     }
 
     *finished = true;
-    metrics.downloads_completed.fetch_add(1, Ordering::Relaxed);
+    metrics.inc_downloads_completed();
     SendOutcome::Finished
 }
 
@@ -1067,10 +1064,7 @@ fn start_put(
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
-        send_message(&mut ctx.conn, stream_id, &err(code, msg))?;
-        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-        ctx.streams.insert(stream_id, StreamState::Done);
-        Ok(())
+        fail_stream(ctx, stream_id, metrics, err(code, msg))
     };
 
     if size > MAX_FILE_SIZE {
@@ -1112,12 +1106,7 @@ fn start_put(
         .fetch_add(new_bytes, Ordering::Relaxed);
     let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
-        Err(e) => {
-            send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
-            metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-            ctx.streams.insert(stream_id, StreamState::Done);
-            return Ok(());
-        }
+        Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
     };
     // #137: parent-dir symlink TOCTOU re-check. The temp file is
     // opened with O_NOFOLLOW, which protects the *leaf* but not the
@@ -1132,7 +1121,7 @@ fn start_put(
             .in_flight_bytes
             .fetch_sub(new_bytes, Ordering::Relaxed);
         send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
-        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+        metrics.inc_requests_failed();
         ctx.streams.insert(stream_id, StreamState::Done);
         return Ok(());
     }
@@ -1181,7 +1170,7 @@ fn start_put(
             );
         }
         let mut hasher = blake3::Hasher::new();
-        let mut existing = match open_existing_no_follow(&temp_path) {
+        let mut existing = match open_temp_for_resume(&temp_path, false) {
             Ok(f) => f,
             Err(e) => {
                 return send_err(
@@ -1207,7 +1196,7 @@ fn start_put(
                 }
             }
         }
-        let f = match open_append_no_follow(&temp_path) {
+        let f = match open_temp_for_resume(&temp_path, true) {
             Ok(f) => f,
             Err(e) => {
                 return send_err(
@@ -1242,30 +1231,24 @@ fn start_put(
         } = &mut new_state
         {
             if leftover.len() as u64 > *remaining {
-                send_message(
-                    &mut ctx.conn,
+                return fail_stream(
+                    ctx,
                     stream_id,
-                    &err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
-                )?;
-                metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-                ctx.streams.insert(stream_id, StreamState::Done);
-                return Ok(());
+                    metrics,
+                    err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
+                );
             }
             if let Err(e) = writer.write_all(&leftover) {
-                send_message(
-                    &mut ctx.conn,
+                return fail_stream(
+                    ctx,
                     stream_id,
-                    &err(ErrorCode::Internal, format!("Failed to write file: {e}")),
-                )?;
-                metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-                ctx.streams.insert(stream_id, StreamState::Done);
-                return Ok(());
+                    metrics,
+                    err(ErrorCode::Internal, format!("Failed to write file: {e}")),
+                );
             }
             hasher.update(&leftover);
             *remaining -= leftover.len() as u64;
-            metrics
-                .bytes_received
-                .fetch_add(leftover.len() as u64, Ordering::Relaxed);
+            metrics.add_bytes_received(leftover.len() as u64);
         }
     }
     ctx.streams.insert(stream_id, new_state);
@@ -1275,7 +1258,7 @@ fn start_put(
     if let Some(state) = ctx.streams.get_mut(&stream_id) {
         if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, &mut tmp, metrics)? {
             if matches!(resp, Response::Err(_)) {
-                metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+                metrics.inc_requests_failed();
             }
             send_message(&mut ctx.conn, stream_id, &resp)?;
             *state = StreamState::Done;
@@ -1322,9 +1305,7 @@ fn drive_put(
                 }
                 hasher.update(&tmp[..to_take]);
                 *remaining -= to_take as u64;
-                metrics
-                    .bytes_received
-                    .fetch_add(to_take as u64, Ordering::Relaxed);
+                metrics.add_bytes_received(to_take as u64);
                 if to_take < len {
                     return Ok(Some(err(
                         ErrorCode::UploadOverflow,
@@ -1383,7 +1364,7 @@ fn drive_put(
         owner
             .used_bytes
             .fetch_add(*reserved_bytes, Ordering::Relaxed);
-        metrics.uploads_completed.fetch_add(1, Ordering::Relaxed);
+        metrics.inc_uploads_completed();
         return Ok(Some(Response::Ok));
     }
 
@@ -1412,62 +1393,27 @@ fn apply_mode(_path: &Path, _mode: u32) {}
 fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // #136: pin the create mode to 0o600 so the in-flight
-        // `.qftp.partial.*` file is never readable by other local
-        // users on a multi-user host. Without this, the file inherits
-        // the daemon umask (typically 0o022 -> 0o644 = world-readable)
-        // until apply_mode runs on the renamed final_path.
-        opts.mode(0o600);
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    opts.open(path)
+    // #136: 0o600 + O_NOFOLLOW so the in-flight `.qftp.partial.*` file
+    // is never readable by other local users on a multi-user host.
+    // Without the explicit mode, daemon umask (typically 0o022)
+    // would land the file at 0o644 = world-readable until
+    // apply_mode runs on the renamed final_path.
+    qftp_common::fs_safe::apply_owner_only_no_follow(&mut opts).open(path)
 }
 
-/// Reopen an existing temp file for read-only rehashing on the Put
-/// resume path. O_NOFOLLOW so a swapped-in symlink can't redirect us
-/// to read arbitrary files; also assert it's a regular file before
-/// accepting it.
-fn open_existing_no_follow(path: &Path) -> std::io::Result<File> {
-    use std::io::{Error, ErrorKind};
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_file() {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "resume temp is not a regular file (symlink or directory?)",
-        ));
-    }
+/// Reopen an existing temp file for the Put resume path. Asserts it
+/// is a regular file (so a swapped-in symlink or directory can't
+/// redirect us) and applies `O_NOFOLLOW`. `for_append=true` reopens
+/// the file for append; `false` opens it read-only for rehashing.
+fn open_temp_for_resume(path: &Path, for_append: bool) -> std::io::Result<File> {
+    qftp_common::fs_safe::require_regular_file(path)?;
     let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+    if for_append {
+        opts.append(true);
+    } else {
+        opts.read(true);
     }
-    opts.open(path)
-}
-
-/// Reopen an existing temp file for append on the Put resume path.
-/// Same O_NOFOLLOW + regular-file requirement as `open_existing_no_follow`.
-fn open_append_no_follow(path: &Path) -> std::io::Result<File> {
-    use std::io::{Error, ErrorKind};
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_file() {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "resume temp is not a regular file (symlink or directory?)",
-        ));
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    opts.open(path)
+    qftp_common::fs_safe::apply_no_follow(&mut opts).open(path)
 }
 
 fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
