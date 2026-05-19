@@ -130,6 +130,8 @@ qftp-client \
 | `--root <path>` | Storage root. Per-user homes are created under it unless they're absolute paths. |
 | `--cert <pem>` / `--key <pem>` | Server certificate and key. Required unless `--self-signed`. The key file must be owner-readable only. |
 | `--self-signed` | Generate an ephemeral cert at startup. Development only. |
+| `--self-signed-persistent` | Keep the self-signed cert across restarts (stored under `$XDG_STATE_HOME/qftp/self-signed/`). Pairs with `qftp-client --trust-on-first-use` for stable fingerprint pinning on home LANs. |
+| `--self-signed-state-dir <path>` | Override the persistent self-signed state directory. |
 | `--client-ca <pem>` | When set, clients must present an mTLS cert chained to this CA. |
 | `--users <toml>` | TOML file defining users, homes, and permissions. Without it, every connection is an anonymous user with full perms on `--root`. |
 | `--max-connections <n>` | Hard cap on concurrent connections. Default 64. |

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -35,6 +35,17 @@ struct Args {
     /// Generate a fresh self-signed certificate at startup. Development only.
     #[arg(long, default_value_t = false)]
     self_signed: bool,
+    /// Keep the self-signed certificate across restarts. Stored under
+    /// `--self-signed-state-dir` (default
+    /// `${XDG_STATE_HOME}/qftp/self-signed/` or
+    /// `~/.local/state/qftp/self-signed/`). Use this together with a
+    /// TOFU client (`qftp-client --trust-on-first-use`) so the
+    /// fingerprint stays stable across server restarts.
+    #[arg(long, default_value_t = false, requires = "self_signed")]
+    self_signed_persistent: bool,
+    /// Override the directory used by `--self-signed-persistent`.
+    #[arg(long, requires = "self_signed_persistent")]
+    self_signed_state_dir: Option<PathBuf>,
     /// Path to a PEM CA bundle. When set, clients must present a certificate
     /// signed by this CA (mTLS).
     #[arg(long)]
@@ -146,6 +157,9 @@ fn init_tracing(format: &str) -> Result<()> {
 }
 
 fn load_or_make_tls(args: &Args) -> Result<ServerTlsConfig> {
+    if args.self_signed && args.self_signed_persistent {
+        return load_or_make_persistent_self_signed(args);
+    }
     if args.self_signed {
         warn!("Generating ephemeral self-signed certificate (--self-signed). Do not use in production.");
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -162,6 +176,8 @@ fn load_or_make_tls(args: &Args) -> Result<ServerTlsConfig> {
         #[cfg(unix)]
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
             .context("failed to set key file permissions")?;
+
+        log_fingerprint(&cert_pem, "ephemeral");
 
         Ok(ServerTlsConfig {
             cert_pem: cert_path.to_string_lossy().to_string(),
@@ -183,6 +199,134 @@ fn load_or_make_tls(args: &Args) -> Result<ServerTlsConfig> {
             key_pem: key.clone(),
             client_ca_pem: args.client_ca.clone(),
         })
+    }
+}
+
+/// Load or create a self-signed cert at a stable on-disk path. The
+/// fingerprint stays the same across restarts, which is what TOFU
+/// clients (`qftp-client -T`) need to avoid "host key changed"
+/// warnings every reboot.
+fn load_or_make_persistent_self_signed(args: &Args) -> Result<ServerTlsConfig> {
+    let dir = persistent_state_dir(args)?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create state dir {}", dir.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to set 0700 on {}", dir.display()))?;
+
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+
+    let need_regen = match (cert_path.exists(), key_path.exists()) {
+        (true, true) => match cert_is_valid(&cert_path) {
+            Ok(true) => false,
+            Ok(false) => {
+                warn!(
+                    cert = %cert_path.display(),
+                    "persistent self-signed cert is expired or unreadable; regenerating"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    cert = %cert_path.display(),
+                    "failed to parse persistent self-signed cert; regenerating"
+                );
+                true
+            }
+        },
+        _ => true,
+    };
+
+    if need_regen {
+        // 10-year validity. Long lives match the TOFU pattern: pin
+        // once, keep working. rcgen 0.13 generate_simple_self_signed
+        // produces a default that's already 5+ years; we let that
+        // stand to avoid pulling in extra cert-customisation
+        // machinery for a Phase 0.5 feature.
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .context("failed to generate self-signed certificate")?;
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        fs::write(&cert_path, &cert_pem)
+            .with_context(|| format!("failed to write {}", cert_path.display()))?;
+        fs::write(&key_path, &key_pem)
+            .with_context(|| format!("failed to write {}", key_path.display()))?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("failed to chmod {}", cert_path.display()))?;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to chmod {}", key_path.display()))?;
+        }
+        info!(dir = %dir.display(), "wrote new persistent self-signed cert");
+    } else {
+        info!(dir = %dir.display(), "loaded existing persistent self-signed cert");
+    }
+
+    let cert_pem_str = fs::read_to_string(&cert_path)
+        .with_context(|| format!("failed to read {}", cert_path.display()))?;
+    log_fingerprint(&cert_pem_str, "persistent");
+
+    Ok(ServerTlsConfig {
+        cert_pem: cert_path.to_string_lossy().to_string(),
+        key_pem: key_path.to_string_lossy().to_string(),
+        client_ca_pem: args.client_ca.clone(),
+    })
+}
+
+fn persistent_state_dir(args: &Args) -> Result<PathBuf> {
+    if let Some(p) = &args.self_signed_state_dir {
+        return Ok(p.clone());
+    }
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(xdg).join("qftp/self-signed"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".local/state/qftp/self-signed"));
+    }
+    anyhow::bail!(
+        "cannot derive state dir: neither $XDG_STATE_HOME nor $HOME is set. \
+         Pass --self-signed-state-dir explicitly."
+    )
+}
+
+/// Walk the PEM cert and report whether `Not After` is still in the
+/// future. A `false` return means the caller should regenerate.
+fn cert_is_valid(path: &Path) -> Result<bool> {
+    use x509_parser::pem::parse_x509_pem;
+    use x509_parser::prelude::FromDer;
+    let pem_bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let (_, pem) = parse_x509_pem(&pem_bytes).context("failed to parse PEM block")?;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&pem.contents)
+        .context("failed to parse DER")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before epoch?")?
+        .as_secs() as i64;
+    Ok(cert.validity().not_after.timestamp() > now)
+}
+
+/// Compute and log the SHA-256 fingerprint of the leaf cert so an
+/// operator setting up TOFU has it visible at startup time.
+fn log_fingerprint(cert_pem: &str, source: &str) {
+    use x509_parser::pem::parse_x509_pem;
+    let bytes = cert_pem.as_bytes();
+    match parse_x509_pem(bytes) {
+        Ok((_, pem)) => {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(&pem.contents);
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            info!(
+                source,
+                fingerprint = %format!("sha256:{hex}"),
+                "self-signed leaf cert fingerprint"
+            );
+        }
+        Err(e) => {
+            warn!(error = ?e, "could not compute self-signed cert fingerprint");
+        }
     }
 }
 
