@@ -223,6 +223,55 @@ pub fn display_response(resp: &Response) {
 
 pub fn display_error(e: &ErrorResponse) {
     println!("Error [{:?}]: {}", e.code, e.message);
+    if let Some(hint) = error_hint(&e.code) {
+        println!("  hint: {hint}");
+    }
+}
+
+/// Short, actionable suggestion to show after an `ErrorCode`. None
+/// for codes that already speak for themselves (`AlreadyExists`,
+/// `NotADirectory`, ...).
+pub fn error_hint(code: &qftp_common::protocol::ErrorCode) -> Option<&'static str> {
+    use qftp_common::protocol::ErrorCode::*;
+    Some(match code {
+        NotFound => "use `ls` to see what's actually there.",
+        PermissionDenied => {
+            "check the user's permissions in users.toml \
+            (run `qftp-admin set-permissions ...`)."
+        }
+        Unauthorized => {
+            "did you pass `--client-cert` / `--client-key`? \
+            If the server uses TOFU, did the host fingerprint change?"
+        }
+        ChecksumMismatch => {
+            "the bytes arrived but didn't hash correctly. \
+            Network corruption or a storage fault; retry the transfer."
+        }
+        InvalidRange => {
+            "the resume offset doesn't match the server's \
+            partial-file length. Remove the local file (or the server's \
+            `.qftp.partial.*`) and retry."
+        }
+        RateLimited => {
+            "the server's per-IP token bucket refused this \
+            request. Back off, or raise `--max-connections-per-ip` on the server."
+        }
+        FileTooLarge => {
+            "the file exceeds the server's MAX_FILE_SIZE. \
+            See docs/protocol.md and consider splitting or compressing."
+        }
+        Unsupported => {
+            "the server doesn't support this operation in the \
+            current context. If you got this on a write while resuming, \
+            it likely arrived in 0-RTT (#76); retry after the handshake \
+            completes (the client does so automatically)."
+        }
+        Malformed => {
+            "the server rejected the framing as malformed. \
+            Are the client and server the same major version (qftp/1)?"
+        }
+        _ => return None,
+    })
 }
 
 fn format_size(bytes: u64) -> String {
