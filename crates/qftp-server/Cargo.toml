@@ -18,6 +18,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 ring = "0.17"
 signal-hook = "0.3"
 serde = { version = "1", features = ["derive"] }

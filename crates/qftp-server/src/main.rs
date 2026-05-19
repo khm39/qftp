@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 use qftp_common::transport::{create_server_config, ServerTlsConfig};
 use tracing::{info, warn};
 
@@ -28,9 +29,9 @@ struct Args {
     root: String,
 
     // --- TLS ---
-    #[arg(long, required_unless_present = "self_signed")]
+    #[arg(long, required_unless_present_any = ["self_signed", "generate_completions"])]
     cert: Option<String>,
-    #[arg(long, required_unless_present = "self_signed")]
+    #[arg(long, required_unless_present_any = ["self_signed", "generate_completions"])]
     key: Option<String>,
     /// Generate a fresh self-signed certificate at startup. Development only.
     #[arg(long, default_value_t = false)]
@@ -75,10 +76,24 @@ struct Args {
     metrics_bind: Option<String>,
     #[arg(long, default_value = "text")]
     log_format: String,
+    /// Print a shell-completion script to stdout and exit.
+    /// Pipe it into the right place for your shell, e.g.
+    ///   `qftp-server --generate-completions bash | sudo tee \
+    ///   /etc/bash_completion.d/qftp-server`.
+    #[arg(long, value_name = "SHELL")]
+    generate_completions: Option<Shell>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(shell) = args.generate_completions {
+        let mut cmd = Args::command();
+        let bin = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
+        return Ok(());
+    }
+
     init_tracing(&args.log_format)?;
 
     let root = fs::canonicalize(&args.root).context("failed to canonicalize root directory")?;
