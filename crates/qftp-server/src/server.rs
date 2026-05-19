@@ -1382,14 +1382,29 @@ fn open_append_no_follow(path: &Path) -> std::io::Result<File> {
 }
 
 fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
+    // #119: append 8 bytes (16 hex chars) of cryptographic randomness
+    // to the temp name so a colluding user on the same writable
+    // directory can't plant a regular file at the predicted path
+    // and block legitimate uploads. The pid + stream_id form is
+    // kept for diagnostic value; the random suffix is what
+    // collapses the planting attack to ~2^64.
+    let mut rand_bytes = [0u8; 8];
+    use ring::rand::SecureRandom as _;
+    let _ = ring::rand::SystemRandom::new().fill(&mut rand_bytes);
+    let mut suffix = String::with_capacity(16);
+    for b in rand_bytes {
+        suffix.push_str(&format!("{b:02x}"));
+    }
+
     let mut name = final_path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
     name.push(format!(
-        ".qftp.partial.{}.{}",
+        ".qftp.partial.{}.{}.{}",
         std::process::id(),
-        stream_id
+        stream_id,
+        suffix,
     ));
     final_path
         .parent()
