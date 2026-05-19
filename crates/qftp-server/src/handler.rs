@@ -164,7 +164,7 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
 /// Required permission for a given request.
 fn required_op(req: &Request) -> Option<Op> {
     match req {
-        Request::Pwd | Request::Cd { .. } | Request::Quit => None,
+        Request::Pwd | Request::Cd { .. } | Request::Quit | Request::Quota => None,
         Request::Ls { .. } | Request::Stat { .. } | Request::Get { .. } => Some(Op::Read),
         Request::Put { .. } => Some(Op::Write),
         Request::Mkdir { .. } => Some(Op::Mkdir),

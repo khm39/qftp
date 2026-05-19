@@ -155,6 +155,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
                 path: args[0].to_string(),
             }))
         }
+        "quota" => Some(Command::Remote(Request::Quota)),
         "lcd" => Some(Command::Lcd(args.first().map(|s| s.to_string()))),
         "lpwd" => Some(Command::Lpwd),
         "lls" => Some(Command::Lls(args.first().map(|s| s.to_string()))),
@@ -202,6 +203,24 @@ pub fn display_response(resp: &Response) {
             println!("  Type: {type_str}");
             println!("  Mode: {:o}", s.mode & 0o777);
             println!("  Modified: {}", s.modified);
+        }
+        Response::QuotaInfo {
+            used_bytes,
+            file_count,
+            limit_bytes,
+        } => {
+            println!("Used:  {} ({file_count} files)", format_size(*used_bytes));
+            match limit_bytes {
+                Some(lim) => {
+                    let pct = if *lim > 0 {
+                        (*used_bytes as f64 / *lim as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!("Quota: {} ({pct:.1}% used)", format_size(*lim));
+                }
+                None => println!("Quota: unlimited"),
+            }
         }
         Response::FileReady {
             size,
@@ -270,6 +289,10 @@ pub fn error_hint(code: &qftp_common::protocol::ErrorCode) -> Option<&'static st
             "the server rejected the framing as malformed. \
             Are the client and server the same major version (qftp/1)?"
         }
+        QuotaExceeded => {
+            "you've hit your per-user storage limit. Free some space (`rm`), \
+            or ask the operator to raise `quota_bytes` in users.toml."
+        }
         _ => return None,
     })
 }
@@ -323,6 +346,7 @@ fn print_help() {
     println!("  rename <from> <to>           Rename/move a file");
     println!("  chmod <mode> <path>          Change file permissions (octal)");
     println!("  stat <path>                  Show file information");
+    println!("  quota                        Show your storage usage and limit");
     println!("  lcd [path]                   Change the REPL's local cwd (no $HOME → /)");
     println!("  lpwd                         Print the REPL's local cwd");
     println!("  lls [path]                   List a local directory");
