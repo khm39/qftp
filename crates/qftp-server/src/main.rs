@@ -85,8 +85,11 @@ struct Args {
     require_retry: bool,
 
     // --- Observability ---
-    /// Bind address for the Prometheus / healthz HTTP endpoint. Disabled
-    /// when omitted.
+    /// Bind address for the Prometheus /metrics and /healthz HTTP
+    /// endpoint. Disabled when omitted. The endpoint is *unauthenticated*
+    /// (#143): bind to 127.0.0.1 or a management VLAN and scrape via
+    /// a reverse proxy or SSH tunnel. The server logs a warning if it
+    /// detects a non-loopback bind so this isn't silently exposed.
     #[arg(long)]
     metrics_bind: Option<String>,
     #[arg(long, default_value = "text")]

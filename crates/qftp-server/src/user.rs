@@ -424,6 +424,7 @@ pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
 /// wants a single string; new code should use
 /// `extract_identity_candidates` + `lookup_strict` so it can try
 /// multiple identities against `users.toml`.
+#[allow(dead_code)] // referenced by tests below + kept for downstream consumers (#142).
 pub fn extract_cn(der: &[u8]) -> Option<String> {
     extract_identity_candidates(der).into_iter().next()
 }

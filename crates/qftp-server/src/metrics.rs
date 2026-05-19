@@ -177,6 +177,27 @@ pub fn spawn(metrics: Arc<Metrics>, bind: &str, shutdown: Arc<AtomicBool>) -> Re
     listener
         .set_nonblocking(true)
         .context("failed to set metrics listener nonblocking")?;
+    // #143: the /metrics and /healthz endpoints are unauthenticated.
+    // Surface a loud warning when the operator bound them to a
+    // non-loopback address so this isn't silently exposed to the
+    // internet. We log via the resolved local_addr rather than the
+    // input string so `--metrics-bind localhost:9090` still resolves
+    // to the loopback and stays quiet.
+    if let Ok(addr) = listener.local_addr() {
+        let is_loopback = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+        if !is_loopback {
+            warn!(
+                bind = %addr,
+                "metrics endpoint bound to a non-loopback address; \
+                 /metrics and /healthz are UNAUTHENTICATED. Bind to \
+                 127.0.0.1 / [::1] or a management VLAN and scrape via \
+                 reverse proxy / SSH tunnel (#143)"
+            );
+        }
+    }
     info!(%bind, "metrics endpoint listening");
 
     thread::Builder::new()
