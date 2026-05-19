@@ -400,6 +400,7 @@ fn log_fingerprint(cert_pem: &str, source: &str) {
 
 #[cfg(unix)]
 fn check_key_permissions(path: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path).context("failed to stat key file")?;
     let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
@@ -409,12 +410,81 @@ fn check_key_permissions(path: &str) -> Result<()> {
             mode & 0o777
         );
     }
+    // #144: also require the file to be owned by the current
+    // effective uid. mode 0o600 on a file owned by another uid means
+    // "the other uid can read this and we just happen to also be
+    // able to", which is a config-error / privilege-mismatch we
+    // should fail loud on rather than ignore. root (euid 0) bypasses
+    // because it can read anything regardless.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 && meta.uid() != euid {
+        anyhow::bail!(
+            "key file {} is owned by uid {}, but the server runs as uid {} (#144); \
+             chown the key to the server's uid or run the server as the key's owner",
+            path,
+            meta.uid(),
+            euid
+        );
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn check_key_permissions(_path: &str) -> Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod check_key_permissions_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_key(mode: u32) -> tempfile::NamedTempFile {
+        let mut tf = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tf, "key").unwrap();
+        let mut perms = std::fs::metadata(tf.path()).unwrap().permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(tf.path(), perms).unwrap();
+        tf
+    }
+
+    #[test]
+    fn accepts_owner_only_0o600() {
+        let tf = write_key(0o600);
+        check_key_permissions(tf.path().to_str().unwrap())
+            .expect("0o600 owned by current uid should pass");
+    }
+
+    #[test]
+    fn rejects_group_readable_0o640() {
+        let tf = write_key(0o640);
+        let err = check_key_permissions(tf.path().to_str().unwrap())
+            .err()
+            .expect("0o640 must be refused");
+        assert!(
+            err.to_string().contains("permissions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_world_readable_0o644() {
+        let tf = write_key(0o644);
+        let err = check_key_permissions(tf.path().to_str().unwrap())
+            .err()
+            .expect("0o644 must be refused");
+        assert!(
+            err.to_string().contains("permissions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // The cross-uid case (#144) requires root to reproduce in a test,
+    // so we don't exercise that path here. The owner-equality check
+    // is guarded by `euid != 0 && meta.uid() != euid`; the happy
+    // paths above prove the branch is taken under the normal
+    // single-uid layout.
 }
 
 fn install_signal_handler() -> Result<Arc<AtomicBool>> {
