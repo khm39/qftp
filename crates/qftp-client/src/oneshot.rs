@@ -325,6 +325,12 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
             },
             &overrides,
         ),
+        OneShot::PutMulti {
+            local,
+            remote_path,
+            to,
+            strict,
+        } => crate::fanout::run(&local, &remote_path, &to, strict, &overrides),
     }
 }
 
