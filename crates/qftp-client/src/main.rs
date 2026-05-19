@@ -11,6 +11,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 mod config;
+mod fanout;
 mod known_hosts;
 mod oneshot;
 mod repl;
@@ -196,6 +197,25 @@ enum OneShot {
         checksum: bool,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Fan-out: upload one local file to multiple servers in
+    /// parallel. Each `--to` is a `qftp://host[:port]` (the path
+    /// comes from the second positional argument, applied to every
+    /// host). The BLAKE3 checksum is computed once and reused.
+    PutMulti {
+        /// Local file to upload.
+        local: String,
+        /// Remote path component (applied to every target).
+        remote_path: String,
+        /// Target hosts. Repeat the flag or pass a
+        /// comma-separated list.
+        #[arg(long, required = true, value_delimiter = ',')]
+        to: Vec<String>,
+        /// `--strict` aborts the whole batch on any failure;
+        /// `--best-effort` (default) carries on with the survivors
+        /// and reports at the end.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
 }
 
