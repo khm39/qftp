@@ -194,10 +194,7 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
 /// operations whose parents (not just the leaf) need to stay rooted.
 /// True closure would require openat2(RESOLVE_BENEATH); this re-lstat
 /// only narrows the window.
-pub fn recheck_ancestors_no_symlinks(
-    target: &Path,
-    root: &Path,
-) -> Result<(), ErrorResponse> {
+pub fn recheck_ancestors_no_symlinks(target: &Path, root: &Path) -> Result<(), ErrorResponse> {
     // Collect ancestors strictly between `target` (exclusive) and
     // `root` (inclusive), then walk them root-first so a swap at any
     // depth is caught.
@@ -236,7 +233,10 @@ pub fn recheck_ancestors_no_symlinks(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ErrorResponse::new(
                     ErrorCode::NotFound,
-                    format!("parent disappeared between resolve and op: {}", ancestor.display()),
+                    format!(
+                        "parent disappeared between resolve and op: {}",
+                        ancestor.display()
+                    ),
                 ));
             }
             Err(e) => {

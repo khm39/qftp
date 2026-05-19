@@ -141,7 +141,10 @@ pub fn validate_response(resp: &Response) -> Result<(), ValidationError> {
             Ok(())
         }
         Response::Path(p) => check_path("Path", p),
-        Response::Ok | Response::FileStat(_) | Response::FileReady { .. } | Response::QuotaInfo { .. } => Ok(()),
+        Response::Ok
+        | Response::FileStat(_)
+        | Response::FileReady { .. }
+        | Response::QuotaInfo { .. } => Ok(()),
     }
 }
 

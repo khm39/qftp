@@ -459,9 +459,8 @@ mod check_key_permissions_tests {
     #[test]
     fn rejects_group_readable_0o640() {
         let tf = write_key(0o640);
-        let err = check_key_permissions(tf.path().to_str().unwrap())
-            .err()
-            .expect("0o640 must be refused");
+        let err =
+            check_key_permissions(tf.path().to_str().unwrap()).expect_err("0o640 must be refused");
         assert!(
             err.to_string().contains("permissions"),
             "unexpected error: {err}"
@@ -471,9 +470,8 @@ mod check_key_permissions_tests {
     #[test]
     fn rejects_world_readable_0o644() {
         let tf = write_key(0o644);
-        let err = check_key_permissions(tf.path().to_str().unwrap())
-            .err()
-            .expect("0o644 must be refused");
+        let err =
+            check_key_permissions(tf.path().to_str().unwrap()).expect_err("0o644 must be refused");
         assert!(
             err.to_string().contains("permissions"),
             "unexpected error: {err}"

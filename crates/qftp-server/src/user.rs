@@ -694,10 +694,9 @@ mod tests {
         san_uri: &[&str],
     ) -> Vec<u8> {
         use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
-        let mut params = CertificateParams::new(
-            san_dns.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        )
-        .expect("rcgen new");
+        let mut params =
+            CertificateParams::new(san_dns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .expect("rcgen new");
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, common_name);
         params.distinguished_name = dn;
@@ -722,7 +721,10 @@ mod tests {
         let ids = extract_identity_candidates(&der);
         // SAN dNSName comes first; CN follows.
         assert_eq!(ids.first().map(|s| s.as_str()), Some("host.example"));
-        assert!(ids.contains(&"alice".to_string()), "CN should still be present: {ids:?}");
+        assert!(
+            ids.contains(&"alice".to_string()),
+            "CN should still be present: {ids:?}"
+        );
     }
 
     #[test]
@@ -737,7 +739,10 @@ mod tests {
         // dNSName < rfc822Name < URI < CN.
         let dns_pos = ids.iter().position(|s| s == "dns.example").unwrap();
         let mail_pos = ids.iter().position(|s| s == "bob@example.test").unwrap();
-        let uri_pos = ids.iter().position(|s| s == "spiffe://example/bob").unwrap();
+        let uri_pos = ids
+            .iter()
+            .position(|s| s == "spiffe://example/bob")
+            .unwrap();
         let cn_pos = ids.iter().position(|s| s == "cn-fallback").unwrap();
         assert!(dns_pos < mail_pos, "ids: {ids:?}");
         assert!(mail_pos < uri_pos, "ids: {ids:?}");

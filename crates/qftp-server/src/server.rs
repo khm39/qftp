@@ -760,8 +760,7 @@ fn process_readable_streams(
                                 match std::fs::remove_file(&target) {
                                     Ok(()) => {
                                         if pre_size > 0 {
-                                            let prev =
-                                                ctx.user.used_bytes.load(Ordering::Relaxed);
+                                            let prev = ctx.user.used_bytes.load(Ordering::Relaxed);
                                             let next = prev.saturating_sub(pre_size);
                                             ctx.user.used_bytes.store(next, Ordering::Relaxed);
                                         }
