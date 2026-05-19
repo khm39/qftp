@@ -348,20 +348,45 @@ impl UserDirectory {
     }
 }
 
-/// Pull the X.509 Common Name out of a DER-encoded leaf certificate. We
-/// use the CN as the user identifier in mTLS. Returns None if the cert
-/// fails to parse or has no CN, which means the caller will fall back to
-/// the anonymous user.
-pub fn extract_cn(der: &[u8]) -> Option<String> {
+/// #142: pull every subject identifier the caller might match on out
+/// of a DER-encoded leaf certificate, in preference order: SAN URI,
+/// SAN dNSName, SAN rfc822Name, then CN as a last resort. CN/Baseline
+/// Requirements has been deprecating CN as a primary identifier; modern
+/// PKIs (SPIFFE, Smallstep, Vault, Let's Encrypt) put the identity in
+/// the SAN extension and the CN may be missing or generic.
+///
+/// Duplicates are de-duplicated by string equality (case-insensitive on
+/// dNSName per RFC 5280 isn't worth the complexity here — server side
+/// `users.toml` controls the form anyway).
+pub fn extract_subject_identifiers(der: &[u8]) -> Vec<String> {
     use x509_parser::prelude::*;
-    let (_, cert) = X509Certificate::from_der(der).ok()?;
-    for attr in cert.subject().iter_common_name() {
-        if let Ok(s) = attr.as_str() {
-            return Some(s.to_string());
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(der) else {
+        return out;
+    };
+    if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
+        for name in &san_ext.value.general_names {
+            match name {
+                GeneralName::URI(s) => push((*s).to_string()),
+                GeneralName::DNSName(s) => push((*s).to_string()),
+                GeneralName::RFC822Name(s) => push((*s).to_string()),
+                _ => {}
+            }
         }
     }
-    None
+    for attr in cert.subject().iter_common_name() {
+        if let Ok(s) = attr.as_str() {
+            push(s.to_string());
+        }
+    }
+    out
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -613,5 +638,59 @@ mod tests {
             err.to_string().contains("escapes") || err.to_string().contains("#112"),
             "unexpected error: {err}"
         );
+    }
+
+    /// #142: a cert with SAN URI should be discoverable via the SAN,
+    /// not just the CN. Build a cert with both, and check that the
+    /// SAN URI shows up in the returned list before the CN.
+    #[test]
+    fn extract_identifiers_prefers_san_uri_before_cn() {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "fallback-cn");
+        params.distinguished_name = dn;
+        params.subject_alt_names = vec![
+            SanType::URI("spiffe://example.org/alice".try_into().unwrap()),
+            SanType::DnsName("alice.svc.example".try_into().unwrap()),
+            SanType::Rfc822Name("alice@example.org".try_into().unwrap()),
+        ];
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der().as_ref();
+
+        let ids = extract_subject_identifiers(der);
+        assert_eq!(
+            ids,
+            vec![
+                "spiffe://example.org/alice".to_string(),
+                "alice.svc.example".to_string(),
+                "alice@example.org".to_string(),
+                "fallback-cn".to_string(),
+            ],
+            "SAN URI/DNS/email must come before CN"
+        );
+    }
+
+    #[test]
+    fn extract_identifiers_returns_cn_only_when_no_san() {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "legacy");
+        params.distinguished_name = dn;
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der().as_ref();
+
+        let ids = extract_subject_identifiers(der);
+        assert_eq!(ids, vec!["legacy".to_string()]);
+    }
+
+    #[test]
+    fn extract_identifiers_empty_on_garbage() {
+        assert!(extract_subject_identifiers(b"not-a-cert").is_empty());
     }
 }

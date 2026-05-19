@@ -414,22 +414,44 @@ fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
     let Some(der) = ctx.conn.peer_cert() else {
         return;
     };
-    let Some(cn) = user::extract_cn(der) else {
+    // #142: collect SAN URI/DNS/email + CN and resolve each through
+    // users.toml. Two safety rails:
+    //   - if no identifier matches: same #105 behavior (close 0x101).
+    //   - if more than one identifier matches *different* users: refuse,
+    //     since silently picking one is a footgun and SAN-with-multiple-
+    //     identities usually indicates a misissued cert.
+    let ids = user::extract_subject_identifiers(der);
+    if ids.is_empty() {
         return;
-    };
-    // #105: a peer that presents a cert whose CN is not in the user
-    // directory must be rejected outright, not silently downgraded to
-    // anonymous. Close the QUIC connection with an application-layer
-    // error code so the client surfaces an explicit auth failure.
-    let Some(resolved) = users.lookup_strict(&cn) else {
+    }
+    let mut matched: Option<Arc<crate::user::User>> = None;
+    for id in &ids {
+        if let Some(u) = users.lookup_strict(id) {
+            match &matched {
+                None => matched = Some(u),
+                Some(prev) if Arc::ptr_eq(prev, &u) => {}
+                Some(prev) => {
+                    warn!(
+                        peer = %ctx.peer_addr,
+                        first = %prev.name,
+                        second = %u.name,
+                        "rejecting connection: cert identifiers resolve to multiple users (#142)"
+                    );
+                    let _ = ctx.conn.close(true, 0x101, b"ambiguous subject");
+                    return;
+                }
+            }
+        }
+    }
+    let Some(resolved) = matched else {
         warn!(
             peer = %ctx.peer_addr,
-            cn = %cn,
-            "rejecting connection: client presented a cert whose CN is not in users.toml"
+            identifiers = ?ids,
+            "rejecting connection: no cert identifier is in users.toml"
         );
         // 0x101 is our application-layer "unauthorized" close code.
         // No conflict with the existing 0x00 used for normal shutdown.
-        let _ = ctx.conn.close(true, 0x101, b"unknown CN");
+        let _ = ctx.conn.close(true, 0x101, b"unknown subject");
         return;
     };
     info!(peer = %ctx.peer_addr, user = %resolved.name, "upgraded connection to authenticated user");
