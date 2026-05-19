@@ -48,38 +48,6 @@ use crate::user::{self, UserDirectory};
 /// mutate persistent state. Anything that writes or renames is
 /// refused so a captured 0-RTT flight cannot be replayed to put the
 /// server into a different state.
-/// Walk `root` and return `(total_bytes, file_count)`. Used for the
-/// `Request::Quota` reply and for the `Put` pre-upload quota check.
-/// We deliberately skip non-regular files (symlinks, sockets) so the
-/// number matches what a `du -b --apparent-size` would report.
-fn walk_size(root: &Path) -> (u64, u64) {
-    let mut bytes = 0u64;
-    let mut count = 0u64;
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let read = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            let ft = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push(path);
-            } else if ft.is_file() {
-                if let Ok(m) = entry.metadata() {
-                    bytes = bytes.saturating_add(m.len());
-                    count += 1;
-                }
-            }
-        }
-    }
-    (bytes, count)
-}
-
 fn request_is_replay_safe(req: &Request) -> bool {
     matches!(
         req,
@@ -703,16 +671,52 @@ fn process_readable_streams(
                 ctx.conn.close(true, 0x00, b"bye").ok();
             }
             PendingAction::Quota { stream_id } => {
-                let (used_bytes, file_count) = walk_size(&ctx.user.home);
+                // #111: serve the cached value rather than re-walking
+                // the user's home on every Quota request. The cache
+                // is initialized once at startup and kept up to date
+                // by Put/Rm completion paths. file_count is no longer
+                // tracked exactly (it was advisory); report the
+                // user's current usage in bytes which is what the
+                // quota check actually cares about.
+                let used_bytes = ctx.user.current_usage();
                 let resp = Response::QuotaInfo {
                     used_bytes,
-                    file_count,
+                    file_count: 0,
                     limit_bytes: ctx.user.quota_bytes,
                 };
                 send_message(&mut ctx.conn, stream_id, &resp)?;
             }
             PendingAction::HandleSimple { stream_id, req } => {
-                let response = handler::handle_request(&req, &mut ctx.cwd, &ctx.user.home);
+                // #111: for Rm we want to decrement the per-user
+                // used-bytes cache by the deleted file's size on
+                // success. The plain handler path doesn't return the
+                // size, so we stat-then-delete here and only invoke
+                // the generic handler for non-Rm variants.
+                let response = if let Request::Rm { path } = &req {
+                    match handler::resolve(&ctx.cwd, &ctx.user.home, path) {
+                        Ok(target) => {
+                            let pre_size = std::fs::symlink_metadata(&target)
+                                .ok()
+                                .filter(|m| m.is_file())
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            match std::fs::remove_file(&target) {
+                                Ok(()) => {
+                                    if pre_size > 0 {
+                                        let prev = ctx.user.used_bytes.load(Ordering::Relaxed);
+                                        let next = prev.saturating_sub(pre_size);
+                                        ctx.user.used_bytes.store(next, Ordering::Relaxed);
+                                    }
+                                    Response::Ok
+                                }
+                                Err(e) => err(io_code(&e), format!("rm failed: {e}")),
+                            }
+                        }
+                        Err(e) => Response::Err(e),
+                    }
+                } else {
+                    handler::handle_request(&req, &mut ctx.cwd, &ctx.user.home)
+                };
                 if matches!(response, Response::Err(_)) {
                     metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1007,24 +1011,33 @@ fn start_put(
             ),
         );
     }
-    // Quota pre-check. Cheap: walk the user's home once. A naive
-    // implementation; a real deployment would cache. Refusing
-    // upfront avoids spending the body bytes only to discard them.
+    // #111: quota pre-check + in-flight reservation. The cache
+    // `used_bytes` and `in_flight_bytes` is kept up to date by Put
+    // commit/abort and Rm. Reserve atomically so two concurrent
+    // Puts can't both pass the check and overshoot the limit.
+    let new_bytes = size.saturating_sub(offset);
     if let Some(limit) = ctx.user.quota_bytes {
-        let (used, _) = walk_size(&ctx.user.home);
-        // Approximate post-upload size: `used + size - offset` since
-        // resume uploads only add the tail.
-        let projected = used.saturating_add(size.saturating_sub(offset));
+        let used = ctx.user.used_bytes.load(Ordering::Relaxed);
+        let in_flight = ctx.user.in_flight_bytes.load(Ordering::Relaxed);
+        let projected = used.saturating_add(in_flight).saturating_add(new_bytes);
         if projected > limit {
             return send_err(
                 ctx,
                 ErrorCode::QuotaExceeded,
                 format!(
-                    "Quota exceeded: would use {projected} bytes (limit {limit}, currently {used})"
+                    "Quota exceeded: would use {projected} bytes (limit {limit}, currently {} reserved {})",
+                    used, in_flight
                 ),
             );
         }
     }
+    // Reserve unconditionally so abort/disconnect bookkeeping is
+    // symmetric regardless of whether the user has a configured
+    // quota; the value only matters for limited users but the
+    // counter is cheap.
+    ctx.user
+        .in_flight_bytes
+        .fetch_add(new_bytes, Ordering::Relaxed);
     let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
         Err(e) => {
@@ -1128,6 +1141,8 @@ fn start_put(
         completed: false,
         hasher,
         expected_checksum,
+        reserved_bytes: new_bytes,
+        owner: Arc::clone(&ctx.user),
     };
     if !leftover.is_empty() {
         if let StreamState::ReadingFileData {
@@ -1196,6 +1211,8 @@ fn drive_put(
         completed,
         hasher,
         expected_checksum,
+        reserved_bytes,
+        owner,
     } = state
     else {
         return Ok(None);
@@ -1267,6 +1284,16 @@ fn drive_put(
         }
         apply_mode(final_path, *mode);
         *completed = true;
+        // #111: hand the reservation over to the persistent cache.
+        // Once `completed` is true the Drop impl no longer touches
+        // in_flight (it only does so on abort), so it's safe to
+        // drain the reservation here.
+        owner
+            .in_flight_bytes
+            .fetch_sub(*reserved_bytes, Ordering::Relaxed);
+        owner
+            .used_bytes
+            .fetch_add(*reserved_bytes, Ordering::Relaxed);
         metrics.uploads_completed.fetch_add(1, Ordering::Relaxed);
         return Ok(Some(Response::Ok));
     }

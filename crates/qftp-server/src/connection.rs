@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,6 +41,18 @@ pub enum StreamState {
         completed: bool,
         hasher: blake3::Hasher,
         expected_checksum: Option<[u8; 32]>,
+        /// #111: bytes reserved against `user.in_flight_bytes` when
+        /// the Put was accepted. The Drop impl releases them on
+        /// abort; the commit path consumes them and converts the
+        /// reservation into `used_bytes`.
+        reserved_bytes: u64,
+        /// Back-reference to the user whose counters we mutate. We
+        /// can't share the connection's Arc<User> directly here
+        /// because the StreamState is stored inside the connection;
+        /// this is a separate clone so Drop has stable access to
+        /// the atomics regardless of when the connection itself is
+        /// torn down.
+        owner: Arc<User>,
     },
     /// Streaming a file to the peer (Get). Driven from the main loop on
     /// every iteration so a single big transfer can't monopolize CPU at
@@ -67,10 +80,19 @@ impl Drop for StreamState {
         if let StreamState::ReadingFileData {
             temp_path,
             completed,
+            reserved_bytes,
+            owner,
             ..
         } = self
         {
             if !*completed {
+                // #111: release the in-flight reservation so the
+                // user's quota can recover. This runs on every abort
+                // path — explicit StreamState::Done replacement,
+                // connection drop, or panic unwind.
+                owner
+                    .in_flight_bytes
+                    .fetch_sub(*reserved_bytes, Ordering::Relaxed);
                 if let Err(e) = std::fs::remove_file(&temp_path) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(
