@@ -64,6 +64,8 @@ pub enum ErrorCode {
     InvalidRange,
     /// Feature isn't supported by this version of the protocol.
     Unsupported,
+    /// The operation would push the user past their configured quota.
+    QuotaExceeded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +136,11 @@ pub enum Request {
     Stat {
         path: String,
     },
+    /// Report on the user's storage usage and quota. The server walks
+    /// the requesting user's home and aggregates total bytes + file
+    /// count. Has no path argument; the home is implicit in the
+    /// authenticated user.
+    Quota,
     Quit,
 }
 
@@ -159,6 +166,14 @@ pub enum Response {
         total_size: u64,
         #[serde(default)]
         checksum_follows: bool,
+    },
+    /// Reply to `Request::Quota`. `limit_bytes = None` means "no
+    /// quota configured" (unlimited).
+    QuotaInfo {
+        used_bytes: u64,
+        file_count: u64,
+        #[serde(default)]
+        limit_bytes: Option<u64>,
     },
 }
 

@@ -48,6 +48,38 @@ use crate::user::{self, UserDirectory};
 /// mutate persistent state. Anything that writes or renames is
 /// refused so a captured 0-RTT flight cannot be replayed to put the
 /// server into a different state.
+/// Walk `root` and return `(total_bytes, file_count)`. Used for the
+/// `Request::Quota` reply and for the `Put` pre-upload quota check.
+/// We deliberately skip non-regular files (symlinks, sockets) so the
+/// number matches what a `du -b --apparent-size` would report.
+fn walk_size(root: &Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut count = 0u64;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                if let Ok(m) = entry.metadata() {
+                    bytes = bytes.saturating_add(m.len());
+                    count += 1;
+                }
+            }
+        }
+    }
+    (bytes, count)
+}
+
 fn request_is_replay_safe(req: &Request) -> bool {
     matches!(
         req,
@@ -56,6 +88,7 @@ fn request_is_replay_safe(req: &Request) -> bool {
             | Request::Pwd
             | Request::Stat { .. }
             | Request::Get { .. }
+            | Request::Quota
             | Request::Quit,
     )
 }
@@ -439,6 +472,9 @@ enum PendingAction {
     Quit {
         stream_id: u64,
     },
+    Quota {
+        stream_id: u64,
+    },
     AclReject {
         stream_id: u64,
         resp: Response,
@@ -584,6 +620,10 @@ fn process_readable_streams(
                             actions.push(PendingAction::Quit { stream_id });
                             *state = StreamState::Done;
                         }
+                        Request::Quota => {
+                            actions.push(PendingAction::Quota { stream_id });
+                            *state = StreamState::Done;
+                        }
                         other => {
                             actions.push(PendingAction::HandleSimple {
                                 stream_id,
@@ -650,6 +690,15 @@ fn process_readable_streams(
                 send_message(&mut ctx.conn, stream_id, &Response::Ok)?;
                 flush_egress(&mut ctx.conn, socket)?;
                 ctx.conn.close(true, 0x00, b"bye").ok();
+            }
+            PendingAction::Quota { stream_id } => {
+                let (used_bytes, file_count) = walk_size(&ctx.user.home);
+                let resp = Response::QuotaInfo {
+                    used_bytes,
+                    file_count,
+                    limit_bytes: ctx.user.quota_bytes,
+                };
+                send_message(&mut ctx.conn, stream_id, &resp)?;
             }
             PendingAction::HandleSimple { stream_id, req } => {
                 let response = handler::handle_request(&req, &mut ctx.cwd, &ctx.user.home);
@@ -930,6 +979,24 @@ fn start_put(
                 size, MAX_FILE_SIZE
             ),
         );
+    }
+    // Quota pre-check. Cheap: walk the user's home once. A naive
+    // implementation; a real deployment would cache. Refusing
+    // upfront avoids spending the body bytes only to discard them.
+    if let Some(limit) = ctx.user.quota_bytes {
+        let (used, _) = walk_size(&ctx.user.home);
+        // Approximate post-upload size: `used + size - offset` since
+        // resume uploads only add the tail.
+        let projected = used.saturating_add(size.saturating_sub(offset));
+        if projected > limit {
+            return send_err(
+                ctx,
+                ErrorCode::QuotaExceeded,
+                format!(
+                    "Quota exceeded: would use {projected} bytes (limit {limit}, currently {used})"
+                ),
+            );
+        }
     }
     let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,

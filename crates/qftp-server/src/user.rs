@@ -92,6 +92,12 @@ pub struct UserSpec {
     pub home: Option<PathBuf>,
     #[serde(default)]
     pub permissions: Permissions,
+    /// Optional storage quota in bytes. `Put` requests that would
+    /// push the user's home past this value are refused with
+    /// `ErrorCode::QuotaExceeded` *before* the body is accepted.
+    /// `None` (the default) is unlimited.
+    #[serde(default)]
+    pub quota_bytes: Option<u64>,
 }
 
 /// Resolved, immutable user record handed to per-connection contexts.
@@ -100,6 +106,7 @@ pub struct User {
     pub name: String,
     pub home: PathBuf,
     pub permissions: Permissions,
+    pub quota_bytes: Option<u64>,
 }
 
 /// Top-level user config, loaded from a TOML file.
@@ -126,6 +133,7 @@ impl UserDirectory {
             name: "anonymous".to_string(),
             home: global_root.to_path_buf(),
             permissions: Permissions::full(),
+            quota_bytes: None,
         });
         Self {
             by_name: HashMap::new(),
@@ -157,6 +165,7 @@ impl UserDirectory {
                 name: spec.name.clone(),
                 home,
                 permissions: spec.permissions.clone(),
+                quota_bytes: spec.quota_bytes,
             });
             if by_name.insert(spec.name.clone(), user).is_some() {
                 anyhow::bail!("duplicate user name in config: {}", spec.name);
@@ -176,12 +185,14 @@ impl UserDirectory {
                     name: spec.name.clone(),
                     home,
                     permissions: spec.permissions.clone(),
+                    quota_bytes: spec.quota_bytes,
                 })
             }
             None => Arc::new(User {
                 name: "anonymous".to_string(),
                 home: global_root.to_path_buf(),
                 permissions: Permissions::read_only(),
+                quota_bytes: None,
             }),
         };
 
