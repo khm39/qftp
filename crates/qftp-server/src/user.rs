@@ -348,19 +348,84 @@ impl UserDirectory {
     }
 }
 
-/// Pull the X.509 Common Name out of a DER-encoded leaf certificate. We
-/// use the CN as the user identifier in mTLS. Returns None if the cert
-/// fails to parse or has no CN, which means the caller will fall back to
-/// the anonymous user.
-pub fn extract_cn(der: &[u8]) -> Option<String> {
+/// Pull every plausible identity string out of a DER-encoded leaf
+/// certificate, in the order the caller should try them against
+/// `users.toml`. Returns an empty vector if the cert fails to parse.
+///
+/// #142: previously this function only inspected the X.509 Subject
+/// CN, which is deprecated by CA/Browser Forum baselines and is
+/// rarely populated by modern PKI tooling (cert-manager, smallstep,
+/// Vault PKI, SPIFFE). Now we look at:
+///
+///   1. SubjectAlternativeName / dNSName entries (modern convention)
+///   2. SubjectAlternativeName / rfc822Name entries (email/identity)
+///   3. SubjectAlternativeName / URI entries (SPIFFE IDs, custom URIs)
+///   4. Subject CN entries (legacy fallback)
+///
+/// The caller (`upgrade_user_from_cert`) walks the returned list
+/// until `lookup_strict` finds a configured user. An operator can
+/// therefore set `users.toml` `name = "alice"` and use a cert that
+/// carries `alice` in any of the supported fields; the cert vendor
+/// no longer matters.
+pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
     use x509_parser::prelude::*;
-    let (_, cert) = X509Certificate::from_der(der).ok()?;
-    for attr in cert.subject().iter_common_name() {
-        if let Ok(s) = attr.as_str() {
-            return Some(s.to_string());
+
+    let mut out: Vec<String> = Vec::new();
+    let Ok((_, cert)) = X509Certificate::from_der(der) else {
+        return out;
+    };
+
+    // SAN extension: iterate in dNSName -> rfc822Name -> URI order
+    // so DNS-style names (the closest analogue to a user identifier
+    // in modern PKI) win when both SAN and CN exist.
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for gn in &san.value.general_names {
+            if let GeneralName::DNSName(s) = gn {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+        for gn in &san.value.general_names {
+            if let GeneralName::RFC822Name(s) = gn {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+        for gn in &san.value.general_names {
+            if let GeneralName::URI(s) = gn {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
         }
     }
-    None
+
+    // CN fallback, last so SAN wins when both exist.
+    for attr in cert.subject().iter_common_name() {
+        if let Ok(s) = attr.as_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+
+    out
+}
+
+/// Backward-compatible wrapper. Returns the *first* identity
+/// candidate from the cert, which is the SAN dNSName when present
+/// and the CN otherwise. Kept for tests and any consumer that still
+/// wants a single string; new code should use
+/// `extract_identity_candidates` + `lookup_strict` so it can try
+/// multiple identities against `users.toml`.
+pub fn extract_cn(der: &[u8]) -> Option<String> {
+    extract_identity_candidates(der).into_iter().next()
 }
 
 #[cfg(test)]
@@ -613,5 +678,84 @@ mod tests {
             err.to_string().contains("escapes") || err.to_string().contains("#112"),
             "unexpected error: {err}"
         );
+    }
+
+    // #142 ------------------------------------------------------------
+    //
+    // Build a synthetic self-signed cert with rcgen and assert that
+    // extract_identity_candidates returns SAN entries first and falls
+    // back to CN.
+
+    fn make_cert_with_identities(
+        common_name: &str,
+        san_dns: &[&str],
+        san_email: &[&str],
+        san_uri: &[&str],
+    ) -> Vec<u8> {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+        let mut params = CertificateParams::new(
+            san_dns.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .expect("rcgen new");
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, common_name);
+        params.distinguished_name = dn;
+        for s in san_email {
+            params
+                .subject_alt_names
+                .push(SanType::Rfc822Name(s.to_string().try_into().unwrap()));
+        }
+        for s in san_uri {
+            params
+                .subject_alt_names
+                .push(SanType::URI(s.to_string().try_into().unwrap()));
+        }
+        let key_pair = KeyPair::generate().expect("rcgen keypair");
+        let cert = params.self_signed(&key_pair).expect("rcgen self_signed");
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn extract_identity_candidates_prefers_san_dns_over_cn() {
+        let der = make_cert_with_identities("alice", &["host.example"], &[], &[]);
+        let ids = extract_identity_candidates(&der);
+        // SAN dNSName comes first; CN follows.
+        assert_eq!(ids.first().map(|s| s.as_str()), Some("host.example"));
+        assert!(ids.contains(&"alice".to_string()), "CN should still be present: {ids:?}");
+    }
+
+    #[test]
+    fn extract_identity_candidates_orders_dns_email_uri_cn() {
+        let der = make_cert_with_identities(
+            "cn-fallback",
+            &["dns.example"],
+            &["bob@example.test"],
+            &["spiffe://example/bob"],
+        );
+        let ids = extract_identity_candidates(&der);
+        // dNSName < rfc822Name < URI < CN.
+        let dns_pos = ids.iter().position(|s| s == "dns.example").unwrap();
+        let mail_pos = ids.iter().position(|s| s == "bob@example.test").unwrap();
+        let uri_pos = ids.iter().position(|s| s == "spiffe://example/bob").unwrap();
+        let cn_pos = ids.iter().position(|s| s == "cn-fallback").unwrap();
+        assert!(dns_pos < mail_pos, "ids: {ids:?}");
+        assert!(mail_pos < uri_pos, "ids: {ids:?}");
+        assert!(uri_pos < cn_pos, "ids: {ids:?}");
+    }
+
+    #[test]
+    fn extract_identity_candidates_cn_only_still_works() {
+        // Legacy cert with only CN populated -- behaviour must match
+        // the pre-#142 extract_cn so existing deployments don't break.
+        let der = make_cert_with_identities("legacy-cn", &[], &[], &[]);
+        let ids = extract_identity_candidates(&der);
+        assert_eq!(ids, vec!["legacy-cn"]);
+        assert_eq!(extract_cn(&der).as_deref(), Some("legacy-cn"));
+    }
+
+    #[test]
+    fn extract_identity_candidates_returns_empty_on_garbage() {
+        assert!(extract_identity_candidates(&[]).is_empty());
+        assert!(extract_identity_candidates(b"not a cert").is_empty());
     }
 }

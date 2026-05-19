@@ -419,25 +419,40 @@ fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
     let Some(der) = ctx.conn.peer_cert() else {
         return;
     };
-    let Some(cn) = user::extract_cn(der) else {
+    // #142: try SAN dNSName / rfc822Name / URI before falling back to
+    // CN, so a modern PKI (cert-manager, smallstep, SPIFFE) that
+    // doesn't populate Subject CN still maps cleanly to users.toml.
+    // Order of candidates is fixed in extract_identity_candidates;
+    // first match wins. lookup_strict trims whitespace.
+    let candidates = user::extract_identity_candidates(der);
+    if candidates.is_empty() {
         return;
-    };
-    // #105: a peer that presents a cert whose CN is not in the user
-    // directory must be rejected outright, not silently downgraded to
-    // anonymous. Close the QUIC connection with an application-layer
-    // error code so the client surfaces an explicit auth failure.
-    let Some(resolved) = users.lookup_strict(&cn) else {
+    }
+    let resolved = candidates
+        .iter()
+        .find_map(|id| users.lookup_strict(id).map(|u| (id.clone(), u)));
+    // #105: a peer that presents a cert whose identity matches no
+    // configured user must be rejected outright, not silently
+    // downgraded to anonymous. Close the QUIC connection with an
+    // application-layer error code so the client surfaces an
+    // explicit auth failure.
+    let Some((matched_id, resolved)) = resolved else {
         warn!(
             peer = %ctx.peer_addr,
-            cn = %cn,
-            "rejecting connection: client presented a cert whose CN is not in users.toml"
+            ?candidates,
+            "rejecting connection: client cert identities are not in users.toml"
         );
         // 0x101 is our application-layer "unauthorized" close code.
         // No conflict with the existing 0x00 used for normal shutdown.
-        let _ = ctx.conn.close(true, 0x101, b"unknown CN");
+        let _ = ctx.conn.close(true, 0x101, b"unknown identity");
         return;
     };
-    info!(peer = %ctx.peer_addr, user = %resolved.name, "upgraded connection to authenticated user");
+    info!(
+        peer = %ctx.peer_addr,
+        user = %resolved.name,
+        matched = %matched_id,
+        "upgraded connection to authenticated user"
+    );
     ctx.cwd = resolved.home.clone();
     ctx.user = resolved;
 }
