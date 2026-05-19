@@ -1277,7 +1277,14 @@ fn drive_put(
 #[cfg(unix)]
 fn apply_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
-    let perms = fs::Permissions::from_mode(mode);
+    // #120: strip suid/sgid/sticky bits before applying. Letting
+    // clients land 04xxx / 02xxx / 01xxx on files inside the server
+    // root supplies a setuid primitive to any downstream process
+    // that later copies the tree (rsync --preserve-permissions,
+    // nightly backups, indexers running as root, ...). Operators
+    // who genuinely need special bits should set them out of band.
+    let masked = mode & 0o0777;
+    let perms = fs::Permissions::from_mode(masked);
     if let Err(e) = fs::set_permissions(path, perms) {
         warn!(path = %path.display(), error = %e, "failed to set permissions");
     }

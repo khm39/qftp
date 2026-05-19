@@ -297,6 +297,17 @@ fn main() -> Result<()> {
     let tofu_active = args.trust_on_first_use && spec.ca.is_none() && !spec.insecure;
     let effective_verify_peer = !spec.insecure && !tofu_active;
 
+    // #128: --insecure drops the only authentication we have over the
+    // wire. Surface that explicitly so it never lands in a script
+    // unnoticed.
+    if spec.insecure {
+        eprintln!(
+            "warning: --insecure disables TLS peer verification; \
+             traffic is authenticated only by mTLS (if any). \
+             Prefer --trust-on-first-use or --ca for production use."
+        );
+    }
+
     let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
         verify_peer: effective_verify_peer,
         ca_path: spec.ca.clone(),
