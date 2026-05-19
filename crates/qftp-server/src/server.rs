@@ -56,13 +56,24 @@ fn request_is_replay_safe(req: &Request) -> bool {
     // useful primarily as an amplification primitive. The latency
     // cost of forcing 1-RTT for Quota is negligible since it runs
     // once per session.
+    //
+    // #138: Get is also NOT in this set. Although a Get reply is
+    // idempotent and side-effect-free, it can return up to
+    // MAX_FILE_SIZE bytes, which turns a replayed 0-RTT flight into
+    // a bandwidth amplification primitive — at worst the captured
+    // request could be re-fired against a spoofed source IP for
+    // reflected-download attacks. The latency cost of forcing 1-RTT
+    // for Get is one extra round trip on the first request of a
+    // session; subsequent requests within the same session run at
+    // normal 1-RTT either way. The list below intentionally keeps
+    // only small fixed-size replies (Ls is capped at MAX_DIR_ENTRIES
+    // by #140, Stat is a fixed struct, Pwd/Cd/Quit are tiny acks).
     matches!(
         req,
         Request::Ls { .. }
             | Request::Cd { .. }
             | Request::Pwd
             | Request::Stat { .. }
-            | Request::Get { .. }
             | Request::Quit,
     )
 }
@@ -1485,12 +1496,20 @@ mod tests {
         assert!(request_is_replay_safe(&Request::Cd { path: "/".into() }));
         assert!(request_is_replay_safe(&Request::Pwd));
         assert!(request_is_replay_safe(&Request::Stat { path: "x".into() }));
-        assert!(request_is_replay_safe(&Request::Get {
+        assert!(request_is_replay_safe(&Request::Quit));
+    }
+
+    /// #138: Get must NOT be in the replay-safe set. Even though
+    /// its reply is side-effect-free, the body can be up to
+    /// MAX_FILE_SIZE -- replaying a captured 0-RTT Get against a
+    /// spoofed source IP is a bandwidth amplification primitive.
+    #[test]
+    fn replay_safe_rejects_get_for_amplification() {
+        assert!(!request_is_replay_safe(&Request::Get {
             path: "x".into(),
             offset: 0,
             length: None,
         }));
-        assert!(request_is_replay_safe(&Request::Quit));
     }
 
     #[test]
