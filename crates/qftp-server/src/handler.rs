@@ -181,6 +181,27 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
     Ok(path)
 }
 
+/// #137: re-lstat the parent of `target` immediately before a mutating
+/// fs syscall. `walk_safe` already verified each component, but a
+/// write-permitted attacker can swap the parent for a symlink in the
+/// TOCTOU window between resolve and the syscall, redirecting create/
+/// remove/rename to an arbitrary directory the daemon can reach. Same
+/// pattern as set_mode / Stat (#106), extended to the mutation handlers.
+fn ensure_parent_not_symlink(target: &Path) -> Result<(), Response> {
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Ok(()),
+    };
+    match fs::symlink_metadata(parent) {
+        Ok(m) if m.file_type().is_symlink() => Err(err(
+            ErrorCode::PermissionDenied,
+            "parent became a symlink between resolve and operation (#137)",
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(err(io_code(&e), format!("re-stat parent failed: {e}"))),
+    }
+}
+
 /// Required permission for a given request.
 fn required_op(req: &Request) -> Option<Op> {
     match req {
@@ -273,26 +294,41 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         }
 
         Request::Mkdir { path } => match resolve_parent(cwd, root, path) {
-            Ok(target) => match fs::create_dir(&target) {
-                Ok(()) => Response::Ok,
-                Err(e) => err(io_code(&e), format!("mkdir failed: {e}")),
-            },
+            Ok(target) => {
+                if let Err(resp) = ensure_parent_not_symlink(&target) {
+                    return resp;
+                }
+                match fs::create_dir(&target) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => err(io_code(&e), format!("mkdir failed: {e}")),
+                }
+            }
             Err(e) => Response::Err(e),
         },
 
         Request::Rmdir { path } => match resolve(cwd, root, path) {
-            Ok(target) => match fs::remove_dir(&target) {
-                Ok(()) => Response::Ok,
-                Err(e) => err(io_code(&e), format!("rmdir failed: {e}")),
-            },
+            Ok(target) => {
+                if let Err(resp) = ensure_parent_not_symlink(&target) {
+                    return resp;
+                }
+                match fs::remove_dir(&target) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => err(io_code(&e), format!("rmdir failed: {e}")),
+                }
+            }
             Err(e) => Response::Err(e),
         },
 
         Request::Rm { path } => match resolve(cwd, root, path) {
-            Ok(target) => match fs::remove_file(&target) {
-                Ok(()) => Response::Ok,
-                Err(e) => err(io_code(&e), format!("rm failed: {e}")),
-            },
+            Ok(target) => {
+                if let Err(resp) = ensure_parent_not_symlink(&target) {
+                    return resp;
+                }
+                match fs::remove_file(&target) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => err(io_code(&e), format!("rm failed: {e}")),
+                }
+            }
             Err(e) => Response::Err(e),
         },
 
@@ -305,6 +341,12 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                 Ok(p) => p,
                 Err(e) => return Response::Err(e),
             };
+            if let Err(resp) = ensure_parent_not_symlink(&src) {
+                return resp;
+            }
+            if let Err(resp) = ensure_parent_not_symlink(&dst) {
+                return resp;
+            }
             match fs::rename(&src, &dst) {
                 Ok(()) => Response::Ok,
                 Err(e) => err(io_code(&e), format!("rename failed: {e}")),
@@ -448,6 +490,38 @@ mod tests {
         let resp = handle_request(&Request::Cd { path: "sub".into() }, &mut cwd, &root);
         assert!(matches!(resp, Response::Ok));
         assert_eq!(cwd, root.join("sub"));
+    }
+
+    /// #137: simulate the TOCTOU: walk_safe succeeded because the
+    /// parent was a real directory, then it's swapped for a symlink
+    /// before the syscall. ensure_parent_not_symlink must catch it.
+    #[test]
+    fn ensure_parent_not_symlink_detects_swap() {
+        let (_dir, root) = setup_root();
+        let real_parent = root.join("real");
+        fs::create_dir(&real_parent).unwrap();
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let swapped = root.join("swapped");
+        // Drop the directory and put a symlink in its place to mimic
+        // the swap that walk_safe couldn't have seen.
+        std::os::unix::fs::symlink(&elsewhere, &swapped).unwrap();
+        let target = swapped.join("leaf");
+        let resp = ensure_parent_not_symlink(&target).unwrap_err();
+        match resp {
+            Response::Err(e) => {
+                assert_eq!(e.code, ErrorCode::PermissionDenied);
+                assert!(e.message.contains("#137"));
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_parent_not_symlink_passes_for_real_dir() {
+        let (_dir, root) = setup_root();
+        let target = root.join("sub/new-file");
+        ensure_parent_not_symlink(&target).unwrap();
     }
 
     #[test]
