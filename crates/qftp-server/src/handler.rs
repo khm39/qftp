@@ -23,6 +23,23 @@ fn mode_of(_meta: &fs::Metadata) -> u32 {
 /// don't silently lose ACLs they thought they were setting.
 #[cfg(unix)]
 fn set_mode(target: &Path, mode: u32) -> Response {
+    // #106: re-lstat immediately before the chmod. `walk_safe` lstat'd
+    // every component, but a TOCTOU window exists between that check
+    // and this syscall: a write-permitted attacker could swap the
+    // leaf with a symlink to /etc and chmod the target. Re-checking
+    // here closes most of the window. Full closure needs openat2 +
+    // fchmodat with AT_SYMLINK_NOFOLLOW (out of scope for this
+    // change).
+    match fs::symlink_metadata(target) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return err(
+                ErrorCode::PermissionDenied,
+                "target became a symlink between resolve and chmod (#106)",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return err(io_code(&e), format!("re-stat failed: {e}")),
+    }
     let perms = fs::Permissions::from_mode(mode);
     match fs::set_permissions(target, perms) {
         Ok(()) => Response::Ok,
@@ -297,8 +314,19 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         },
 
         Request::Stat { path } => match resolve(cwd, root, path) {
-            Ok(target) => match fs::metadata(&target) {
+            // #106: use symlink_metadata so a TOCTOU-swapped symlink at
+            // the leaf doesn't leak information about an external
+            // target's size/mode/mtime. If the leaf turned into a
+            // symlink between resolve() and here, refuse instead of
+            // reporting on the link.
+            Ok(target) => match fs::symlink_metadata(&target) {
                 Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return err(
+                            ErrorCode::PermissionDenied,
+                            "target became a symlink between resolve and stat (#106)",
+                        );
+                    }
                     let modified = meta
                         .modified()
                         .ok()

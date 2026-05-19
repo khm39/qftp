@@ -854,6 +854,17 @@ fn do_recursive_get(
         };
         std::fs::create_dir_all(&ldir).ok();
         for entry in entries {
+            // #108: a malicious server can return entry names containing
+            // `..` or absolute paths; `PathBuf::join` would silently
+            // escape `ldir`. Reject lexically before we touch the
+            // filesystem.
+            if !qftp_common::protocol::safe_entry_name(&entry.name) {
+                tracing::warn!(
+                    name = %entry.name,
+                    "recursive get: server returned unsafe entry name; skipping"
+                );
+                continue;
+            }
             let remote_child = if rdir.ends_with('/') {
                 format!("{rdir}{}", entry.name)
             } else {

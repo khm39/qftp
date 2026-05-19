@@ -748,7 +748,24 @@ fn start_get(
             return Ok(());
         }
     };
-    let meta = match fs::metadata(&file_path) {
+    // #106: open with O_NOFOLLOW first, then derive metadata from the
+    // resulting fd. This binds the metadata + the bytes we stream to
+    // the same inode the path resolved to, eliminating the TOCTOU
+    // window between `walk_safe` and `fs::open`.
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match open_opts.open(&file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return send_err(ctx, io_code(&e), format!("Failed to open file: {e}"));
+        }
+    };
+    let meta = match file.metadata() {
         Ok(m) => m,
         Err(e) => {
             return send_err(ctx, io_code(&e), format!("Failed to stat file: {e}"));
@@ -784,7 +801,6 @@ fn start_get(
         Some(n) => n.min(remaining),
         None => remaining,
     };
-    let mut file = File::open(&file_path).context("open file for streaming send")?;
     if offset > 0 {
         use std::io::Seek;
         file.seek(std::io::SeekFrom::Start(offset))
