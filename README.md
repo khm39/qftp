@@ -58,6 +58,25 @@ qftp> put -r local-dir remote-dir
 qftp> quit
 ```
 
+### One-shot subcommands
+
+For scp-style scripted use, the client accepts subcommands and exits
+after the single operation (sysexits-style codes: 0 ok, 64 usage,
+65 transfer, 77 auth):
+
+```sh
+qftp-client put ./dump.tar.gz qftp://files.example/backups/
+qftp-client get qftp://files.example/foo.bin ./foo.bin
+qftp-client ls qftp://files.example/dir
+qftp-client stat qftp://files.example/dir/file
+qftp-client rm qftp://files.example/old.log
+qftp-client mkdir qftp://files.example/new-dir
+qftp-client rmdir qftp://files.example/empty-dir
+qftp-client rename qftp://files.example/a qftp://files.example/b
+```
+
+A subcommand-less invocation drops into the REPL as before.
+
 ### Saved hosts
 
 The client reads `~/.qftp/config.toml` (override with `--config`). Define

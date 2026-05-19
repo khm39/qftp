@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use mio::{Events, Interest, Poll, Token};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 mod config;
 mod known_hosts;
+mod oneshot;
 mod repl;
 mod session_store;
 mod transfer;
@@ -24,9 +25,16 @@ const CLIENT: Token = Token(0);
     long_about = "Connect to a qftp server. The positional TARGET is either a \
         qftp:// URL (e.g. qftp://user@host:4433/path) or the name of a host \
         alias defined in ~/.qftp/config.toml. Flag overrides have the highest \
-        precedence; URL fields beat alias fields; builtin defaults are last."
+        precedence; URL fields beat alias fields; builtin defaults are last.\n\n\
+        With no subcommand, qftp opens an interactive REPL. With a subcommand \
+        (put / get / ls / rm / mkdir / rmdir / rename / stat), it performs the \
+        single operation and exits."
 )]
+#[command(args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<OneShot>,
+
     /// `qftp://[user@]host[:port][/path]`, `qftps://...`, or a host
     /// alias defined in the config file. When omitted, falls back to
     /// the legacy `--host` / `--server-name` flags and defaults.
@@ -83,6 +91,57 @@ struct Args {
     history: Option<PathBuf>,
 }
 
+/// One-shot subcommands modelled on scp / sftp's single-shot UX.
+/// Each takes one or two `qftp://[user@]host[:port]/path` URLs;
+/// path arguments without a scheme are treated as local files.
+///
+/// Exit codes follow sysexits.h:
+///   * 0 = success
+///   * 64 = usage error (bad URL, missing argument)
+///   * 65 = data / transfer error (network, ACL, checksum)
+///   * 77 = auth failure (mTLS / TOFU mismatch)
+#[derive(Subcommand)]
+enum OneShot {
+    /// Upload one or more local files to a remote URL.
+    Put {
+        /// Local path(s). Globs are expanded by the shell or, when
+        /// quoted, by qftp itself.
+        local: Vec<String>,
+        /// Destination `qftp://host[:port]/path`. The last argument.
+        remote: String,
+        /// Recurse into directories.
+        #[arg(short = 'r', long)]
+        recursive: bool,
+    },
+    /// Download a remote path to a local file.
+    Get {
+        /// Source `qftp://host[:port]/path`.
+        remote: String,
+        /// Local destination. Defaults to the basename of the remote
+        /// path.
+        local: Option<String>,
+        /// Recurse into directories.
+        #[arg(short = 'r', long)]
+        recursive: bool,
+    },
+    /// List a remote directory.
+    Ls {
+        /// `qftp://host[:port]/path`.
+        remote: String,
+    },
+    /// Remove a remote file.
+    Rm { remote: String },
+    /// Create a remote directory.
+    Mkdir { remote: String },
+    /// Remove an empty remote directory.
+    Rmdir { remote: String },
+    /// Rename / move a remote path. Both URLs must point to the same
+    /// host.
+    Rename { from: String, to: String },
+    /// Show metadata for a remote path.
+    Stat { remote: String },
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -111,6 +170,13 @@ fn main() -> Result<()> {
         client_cert: args.client_cert.clone(),
         client_key: args.client_key.clone(),
     };
+
+    // One-shot subcommand path. Bypasses the REPL entirely and exits
+    // with a sysexits-style code so shell scripts can branch.
+    if let Some(cmd) = args.command {
+        let code = oneshot::run(cmd, overrides)?;
+        std::process::exit(code);
+    }
 
     let spec = config::resolve(args.target.as_deref(), &cfg_file, &overrides)?;
 
