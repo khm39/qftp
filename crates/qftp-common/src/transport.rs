@@ -8,10 +8,7 @@ pub const STREAM_BUF_SIZE: usize = 65536;
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Flush pending outgoing packets from the QUIC connection to the UDP socket.
-pub fn flush_egress(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-) -> Result<()> {
+pub fn flush_egress(conn: &mut quiche::Connection, socket: &mio::net::UdpSocket) -> Result<()> {
     let mut out = [0u8; MAX_DATAGRAM_SIZE];
 
     loop {
@@ -167,10 +164,19 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_streams_bidi(100);
+    // Flow control windows large enough to admit a full file transfer
+    // (see qftp-server MAX_FILE_SIZE) without requiring an
+    // egress-flush-and-retry send loop. Phase 1 (issue #30, #31) will
+    // replace the buffered send path with proper streaming, at which point
+    // these can come back down. To bound the resulting DoS surface in the
+    // meantime, initial_max_streams_bidi is held to a small number: the
+    // current client only opens one bidi stream at a time, so 4 is plenty
+    // of headroom and caps worst-case in-memory buffering at well under
+    // the 2 GiB connection limit.
+    config.set_initial_max_data(2 * 1024 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_local(1024 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_remote(1024 * 1024 * 1024);
+    config.set_initial_max_streams_bidi(4);
     config.set_disable_active_migration(true);
 
     Ok(())
@@ -195,10 +201,12 @@ pub fn create_server_config(cert_pem: &str, key_pem: &str) -> Result<quiche::Con
 
 /// Create a QUIC client configuration.
 ///
-/// When `verify_peer` is false, certificate validation is skipped (useful for
-/// self-signed certs during development). Production deployments should set
-/// this to true.
+/// The `verify_peer` argument is currently ignored: certificate verification
+/// is hard-coded off because the server presents a freshly generated
+/// self-signed certificate on every start. Phase 1 (see issue #28) will wire
+/// the flag through and default verification on with a CA bundle option.
 pub fn create_client_config(verify_peer: bool) -> Result<quiche::Config> {
+    let _ = verify_peer;
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
 

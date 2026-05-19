@@ -61,19 +61,17 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             Response::Path(display)
         }
 
-        Request::Cd { path } => {
-            match resolve(cwd, root, path) {
-                Ok(target) => {
-                    if !target.is_dir() {
-                        Response::Err(format!("Not a directory: {path}"))
-                    } else {
-                        *cwd = target;
-                        Response::Ok
-                    }
+        Request::Cd { path } => match resolve(cwd, root, path) {
+            Ok(target) => {
+                if !target.is_dir() {
+                    Response::Err(format!("Not a directory: {path}"))
+                } else {
+                    *cwd = target;
+                    Response::Ok
                 }
-                Err(e) => Response::Err(e),
             }
-        }
+            Err(e) => Response::Err(e),
+        },
 
         Request::Ls { path } => {
             let dir = if path.is_empty() {
@@ -83,78 +81,64 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             };
 
             match dir {
-                Ok(dir) => {
-                    match fs::read_dir(&dir) {
-                        Ok(entries) => {
-                            let mut listing: Vec<DirEntry> = Vec::new();
-                            for entry in entries {
-                                let entry = match entry {
-                                    Ok(e) => e,
-                                    Err(e) => return Response::Err(format!("Read dir error: {e}")),
-                                };
-                                let meta = match entry.metadata() {
-                                    Ok(m) => m,
-                                    Err(e) => return Response::Err(format!("Metadata error: {e}")),
-                                };
-                                let modified = meta
-                                    .modified()
-                                    .ok()
-                                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                listing.push(DirEntry {
-                                    name: entry.file_name().to_string_lossy().into_owned(),
-                                    is_dir: meta.is_dir(),
-                                    size: meta.len(),
-                                    modified,
-                                    mode: meta.permissions().mode(),
-                                });
-                            }
-                            listing.sort_by(|a, b| a.name.cmp(&b.name));
-                            Response::DirListing(listing)
+                Ok(dir) => match fs::read_dir(&dir) {
+                    Ok(entries) => {
+                        let mut listing: Vec<DirEntry> = Vec::new();
+                        for entry in entries {
+                            let entry = match entry {
+                                Ok(e) => e,
+                                Err(e) => return Response::Err(format!("Read dir error: {e}")),
+                            };
+                            let meta = match entry.metadata() {
+                                Ok(m) => m,
+                                Err(e) => return Response::Err(format!("Metadata error: {e}")),
+                            };
+                            let modified = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            listing.push(DirEntry {
+                                name: entry.file_name().to_string_lossy().into_owned(),
+                                is_dir: meta.is_dir(),
+                                size: meta.len(),
+                                modified,
+                                mode: meta.permissions().mode(),
+                            });
                         }
-                        Err(e) => Response::Err(format!("Cannot list directory: {e}")),
+                        listing.sort_by(|a, b| a.name.cmp(&b.name));
+                        Response::DirListing(listing)
                     }
-                }
+                    Err(e) => Response::Err(format!("Cannot list directory: {e}")),
+                },
                 Err(e) => Response::Err(e),
             }
         }
 
-        Request::Mkdir { path } => {
-            match resolve_parent(cwd, root, path) {
-                Ok(target) => {
-                    match fs::create_dir(&target) {
-                        Ok(()) => Response::Ok,
-                        Err(e) => Response::Err(format!("mkdir failed: {e}")),
-                    }
-                }
-                Err(e) => Response::Err(e),
-            }
-        }
+        Request::Mkdir { path } => match resolve_parent(cwd, root, path) {
+            Ok(target) => match fs::create_dir(&target) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Err(format!("mkdir failed: {e}")),
+            },
+            Err(e) => Response::Err(e),
+        },
 
-        Request::Rmdir { path } => {
-            match resolve(cwd, root, path) {
-                Ok(target) => {
-                    match fs::remove_dir(&target) {
-                        Ok(()) => Response::Ok,
-                        Err(e) => Response::Err(format!("rmdir failed: {e}")),
-                    }
-                }
-                Err(e) => Response::Err(e),
-            }
-        }
+        Request::Rmdir { path } => match resolve(cwd, root, path) {
+            Ok(target) => match fs::remove_dir(&target) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Err(format!("rmdir failed: {e}")),
+            },
+            Err(e) => Response::Err(e),
+        },
 
-        Request::Rm { path } => {
-            match resolve(cwd, root, path) {
-                Ok(target) => {
-                    match fs::remove_file(&target) {
-                        Ok(()) => Response::Ok,
-                        Err(e) => Response::Err(format!("rm failed: {e}")),
-                    }
-                }
-                Err(e) => Response::Err(e),
-            }
-        }
+        Request::Rm { path } => match resolve(cwd, root, path) {
+            Ok(target) => match fs::remove_file(&target) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Err(format!("rm failed: {e}")),
+            },
+            Err(e) => Response::Err(e),
+        },
 
         Request::Rename { from, to } => {
             let src = match resolve(cwd, root, from) {
@@ -171,46 +155,147 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             }
         }
 
-        Request::Chmod { path, mode } => {
-            match resolve(cwd, root, path) {
-                Ok(target) => {
-                    let perms = fs::Permissions::from_mode(*mode);
-                    match fs::set_permissions(&target, perms) {
-                        Ok(()) => Response::Ok,
-                        Err(e) => Response::Err(format!("chmod failed: {e}")),
-                    }
+        Request::Chmod { path, mode } => match resolve(cwd, root, path) {
+            Ok(target) => {
+                let perms = fs::Permissions::from_mode(*mode);
+                match fs::set_permissions(&target, perms) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Err(format!("chmod failed: {e}")),
                 }
-                Err(e) => Response::Err(e),
             }
-        }
+            Err(e) => Response::Err(e),
+        },
 
-        Request::Stat { path } => {
-            match resolve(cwd, root, path) {
-                Ok(target) => {
-                    match fs::metadata(&target) {
-                        Ok(meta) => {
-                            let modified = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            Response::FileStat(FileStat {
-                                size: meta.len(),
-                                is_dir: meta.is_dir(),
-                                modified,
-                                mode: meta.permissions().mode(),
-                            })
-                        }
-                        Err(e) => Response::Err(format!("stat failed: {e}")),
-                    }
+        Request::Stat { path } => match resolve(cwd, root, path) {
+            Ok(target) => match fs::metadata(&target) {
+                Ok(meta) => {
+                    let modified = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    Response::FileStat(FileStat {
+                        size: meta.len(),
+                        is_dir: meta.is_dir(),
+                        modified,
+                        mode: meta.permissions().mode(),
+                    })
                 }
-                Err(e) => Response::Err(e),
-            }
-        }
+                Err(e) => Response::Err(format!("stat failed: {e}")),
+            },
+            Err(e) => Response::Err(e),
+        },
 
         Request::Get { .. } | Request::Put { .. } | Request::Quit => {
             Response::Err("Unexpected command".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Build a temporary root with one regular file and one nested dir.
+    fn setup_root() -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("file.txt"), b"hello").unwrap();
+        fs::write(root.join("sub/inner.txt"), b"world").unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn resolve_relative_path_under_cwd() {
+        let (_dir, root) = setup_root();
+        let resolved = resolve(&root, &root, "file.txt").unwrap();
+        assert_eq!(resolved, root.join("file.txt"));
+    }
+
+    #[test]
+    fn resolve_absolute_path_is_rooted() {
+        let (_dir, root) = setup_root();
+        let resolved = resolve(&root, &root, "/sub/inner.txt").unwrap();
+        assert_eq!(resolved, root.join("sub/inner.txt"));
+    }
+
+    #[test]
+    fn resolve_rejects_parent_escape() {
+        let (_dir, root) = setup_root();
+        // `etc/passwd` does not exist under root.parent(), so canonicalize()
+        // returns ENOENT before the starts_with(root) check ever runs. That
+        // path is still safely rejected, just for a different reason --
+        // pin the test to it so a future refactor doesn't silently turn a
+        // path-traversal rejection into a "no such file" leak.
+        let err = resolve(&root, &root, "../etc/passwd").unwrap_err();
+        assert!(
+            err.contains("No such file"),
+            "expected ENOENT-style error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_existing_path_outside_root() {
+        let (_dir, root) = setup_root();
+        // /tmp exists on every supported (unix) platform and tempfile puts
+        // our root underneath it, so the canonicalized result is reliably
+        // outside root and must hit the explicit "outside root" branch
+        // rather than ENOENT.
+        let err = resolve(&root, &root, "/../../../../../../tmp").unwrap_err();
+        assert!(
+            err.contains("outside root"),
+            "expected outside-root rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_missing_file_errors() {
+        let (_dir, root) = setup_root();
+        let err = resolve(&root, &root, "does-not-exist").unwrap_err();
+        assert!(err.contains("No such"));
+    }
+
+    #[test]
+    fn resolve_parent_allows_nonexistent_leaf() {
+        let (_dir, root) = setup_root();
+        // The parent (root) exists, the leaf does not -- resolve_parent should
+        // still succeed because mkdir/put need to create the leaf.
+        let resolved = resolve_parent(&root, &root, "new-file.txt").unwrap();
+        assert_eq!(resolved, root.join("new-file.txt"));
+    }
+
+    #[test]
+    fn resolve_parent_rejects_missing_parent_dir() {
+        let (_dir, root) = setup_root();
+        let err = resolve_parent(&root, &root, "no/such/parent/leaf").unwrap_err();
+        assert!(err.contains("Parent directory not found"));
+    }
+
+    #[test]
+    fn cd_into_directory_updates_cwd() {
+        let (_dir, root) = setup_root();
+        let mut cwd = root.clone();
+        let resp = handle_request(&Request::Cd { path: "sub".into() }, &mut cwd, &root);
+        assert!(matches!(resp, Response::Ok));
+        assert_eq!(cwd, root.join("sub"));
+    }
+
+    #[test]
+    fn cd_into_file_is_rejected() {
+        let (_dir, root) = setup_root();
+        let mut cwd = root.clone();
+        let resp = handle_request(
+            &Request::Cd {
+                path: "file.txt".into(),
+            },
+            &mut cwd,
+            &root,
+        );
+        assert!(matches!(resp, Response::Err(_)));
+        assert_eq!(cwd, root);
     }
 }
