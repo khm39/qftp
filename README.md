@@ -125,6 +125,8 @@ qftp-client \
 
 - [docs/protocol.md](docs/protocol.md) -- wire format and stream
   conventions.
+- [docs/adr/](docs/adr/) -- architectural decision records (the
+  `quiche` vs `quinn` choice is [0001](docs/adr/0001-quic-runtime.md)).
 - [SECURITY.md](SECURITY.md) -- vulnerability reporting and supported
   versions.
 - [CHANGELOG.md](CHANGELOG.md) -- per-release notes.
