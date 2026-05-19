@@ -15,6 +15,7 @@ mod known_hosts;
 mod oneshot;
 mod repl;
 mod session_store;
+mod sync;
 mod transfer;
 mod watch;
 
@@ -177,15 +178,24 @@ enum OneShot {
     /// Watch a local directory and mirror create / modify / delete
     /// events to a remote prefix. Runs until Ctrl-C.
     Watch {
-        /// Local directory to watch.
         local: String,
-        /// Remote URL prefix; events under <local> map to paths
-        /// under this prefix.
         remote: String,
-        /// Debounce window in milliseconds. Bursty editors save in
-        /// flurries; collapsing nearby events avoids spurious Puts.
         #[arg(long, default_value_t = 200)]
         debounce_ms: u64,
+    },
+    /// One-way upload sync (local → remote). Skips files whose size
+    /// and mtime already match. Pass `--checksum` to use BLAKE3
+    /// comparison instead. Pass `--delete` to remove remote files
+    /// that no longer exist locally.
+    Sync {
+        local: String,
+        remote: String,
+        #[arg(long)]
+        delete: bool,
+        #[arg(long)]
+        checksum: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

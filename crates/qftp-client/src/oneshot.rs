@@ -309,6 +309,22 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
             remote,
             debounce_ms,
         } => crate::watch::run(&local, &remote, debounce_ms, &overrides),
+        OneShot::Sync {
+            local,
+            remote,
+            delete,
+            checksum,
+            dry_run,
+        } => crate::sync::run(
+            &local,
+            &remote,
+            crate::sync::Opts {
+                delete,
+                use_checksum: checksum,
+                dry_run,
+            },
+            &overrides,
+        ),
     }
 }
 
