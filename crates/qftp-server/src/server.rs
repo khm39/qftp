@@ -437,10 +437,21 @@ fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
     let Some(cn) = user::extract_cn(der) else {
         return;
     };
-    let resolved = users.lookup(Some(&cn));
-    if Arc::ptr_eq(&resolved, &anon) {
+    // #105: a peer that presents a cert whose CN is not in the user
+    // directory must be rejected outright, not silently downgraded to
+    // anonymous. Close the QUIC connection with an application-layer
+    // error code so the client surfaces an explicit auth failure.
+    let Some(resolved) = users.lookup_strict(&cn) else {
+        warn!(
+            peer = %ctx.peer_addr,
+            cn = %cn,
+            "rejecting connection: client presented a cert whose CN is not in users.toml"
+        );
+        // 0x101 is our application-layer "unauthorized" close code.
+        // No conflict with the existing 0x00 used for normal shutdown.
+        let _ = ctx.conn.close(true, 0x101, b"unknown CN");
         return;
-    }
+    };
     info!(peer = %ctx.peer_addr, user = %resolved.name, "upgraded connection to authenticated user");
     ctx.cwd = resolved.home.clone();
     ctx.user = resolved;

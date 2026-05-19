@@ -3,7 +3,10 @@
 //! Users are looked up by the Common Name (CN) of the TLS client
 //! certificate they presented during the mTLS handshake. The anonymous
 //! user is used when mTLS is not configured or the peer did not present a
-//! cert; it shares the global root and (by default) full permissions.
+//! cert; it shares the global root and is **read-only by default** (#104).
+//! A peer that presents a cert whose CN is not in the directory is
+//! rejected with `Unauthorized` rather than silently downgraded to
+//! anonymous (#105).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +29,8 @@ pub enum Op {
 }
 
 /// Per-user permission set. Missing fields default to false on a custom
-/// user; the anonymous fallback defaults to all-true.
+/// user; the implicit anonymous fallback (no `--users` file) defaults to
+/// read-only.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Permissions {
     #[serde(default)]
@@ -46,6 +50,10 @@ pub struct Permissions {
 }
 
 impl Permissions {
+    /// All-true permission set; used by tests and by callers that want
+    /// to express "no ACL" explicitly. Not the default for anonymous —
+    /// see [`UserDirectory::default_anonymous`].
+    #[allow(dead_code)]
     pub const fn full() -> Self {
         Self {
             read: true,
@@ -126,13 +134,15 @@ pub struct UserDirectory {
 }
 
 impl UserDirectory {
-    /// Build a directory where the anonymous user gets the global root and
-    /// full permissions. Used when no `--users` file is configured.
+    /// Build a directory where the anonymous user gets the global root.
+    /// Used when no `--users` file is configured. The anonymous user is
+    /// **read-only** by default; operators wanting writable anonymous
+    /// access must declare it explicitly via `users.toml` (#104).
     pub fn default_anonymous(global_root: &Path) -> Self {
         let anon = Arc::new(User {
             name: "anonymous".to_string(),
             home: global_root.to_path_buf(),
-            permissions: Permissions::full(),
+            permissions: Permissions::read_only(),
             quota_bytes: None,
         });
         Self {
@@ -143,24 +153,58 @@ impl UserDirectory {
 
     /// Read a TOML config and resolve all home paths against `global_root`.
     pub fn from_config(global_root: &Path, cfg: UserConfig) -> Result<Self> {
-        let resolve_home = |spec: &UserSpec| -> PathBuf {
-            match &spec.home {
+        let canonical_root = global_root.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize global root {}",
+                global_root.display()
+            )
+        })?;
+
+        let resolve_home = |spec: &UserSpec| -> Result<PathBuf> {
+            let raw = match &spec.home {
                 Some(h) if h.is_absolute() => h.clone(),
-                Some(h) => global_root.join(h),
+                Some(h) => {
+                    if h.components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        anyhow::bail!(
+                            "user {}: relative home {} contains `..` (#112)",
+                            spec.name,
+                            h.display()
+                        );
+                    }
+                    global_root.join(h)
+                }
                 None => global_root.join(&spec.name),
+            };
+            std::fs::create_dir_all(&raw).with_context(|| {
+                format!(
+                    "failed to create home directory {} for user {}",
+                    raw.display(),
+                    spec.name
+                )
+            })?;
+            let canonical = raw.canonicalize().with_context(|| {
+                format!(
+                    "failed to canonicalize home {} for user {}",
+                    raw.display(),
+                    spec.name
+                )
+            })?;
+            if !canonical.starts_with(&canonical_root) {
+                anyhow::bail!(
+                    "user {} home {} escapes global root {} (#112)",
+                    spec.name,
+                    canonical.display(),
+                    canonical_root.display()
+                );
             }
+            Ok(canonical)
         };
 
         let mut by_name = HashMap::new();
         for spec in &cfg.users {
-            let home = resolve_home(spec);
-            std::fs::create_dir_all(&home).with_context(|| {
-                format!(
-                    "failed to create home directory {} for user {}",
-                    home.display(),
-                    spec.name
-                )
-            })?;
+            let home = resolve_home(spec)?;
             let user = Arc::new(User {
                 name: spec.name.clone(),
                 home,
@@ -174,13 +218,7 @@ impl UserDirectory {
 
         let anonymous = match &cfg.anonymous {
             Some(spec) => {
-                let home = resolve_home(spec);
-                std::fs::create_dir_all(&home).with_context(|| {
-                    format!(
-                        "failed to create anonymous home directory {}",
-                        home.display()
-                    )
-                })?;
+                let home = resolve_home(spec)?;
                 Arc::new(User {
                     name: spec.name.clone(),
                     home,
@@ -190,7 +228,7 @@ impl UserDirectory {
             }
             None => Arc::new(User {
                 name: "anonymous".to_string(),
-                home: global_root.to_path_buf(),
+                home: canonical_root,
                 permissions: Permissions::read_only(),
                 quota_bytes: None,
             }),
@@ -199,11 +237,25 @@ impl UserDirectory {
         Ok(Self { by_name, anonymous })
     }
 
+    /// Look up a user by CN. `None` selects the anonymous user (used when
+    /// no peer certificate is presented). A `Some(cn)` that does not match
+    /// any configured user **also** returns anonymous; callers that have a
+    /// peer cert should prefer [`lookup_strict`](Self::lookup_strict),
+    /// which surfaces the miss so the connection can be rejected (#105).
+    #[allow(dead_code)]
     pub fn lookup(&self, cn: Option<&str>) -> Arc<User> {
-        match cn.and_then(|n| self.by_name.get(n)) {
+        match cn.and_then(|n| self.by_name.get(n.trim())) {
             Some(u) => Arc::clone(u),
             None => Arc::clone(&self.anonymous),
         }
+    }
+
+    /// Strict CN lookup used after mTLS upgrade. Returns `None` for an
+    /// unknown CN so the caller can close the connection with
+    /// `Unauthorized` rather than silently falling back to anonymous
+    /// (#105). The CN is trimmed of surrounding whitespace before lookup.
+    pub fn lookup_strict(&self, cn: &str) -> Option<Arc<User>> {
+        self.by_name.get(cn.trim()).map(Arc::clone)
     }
 
     pub fn anonymous(&self) -> Arc<User> {
@@ -281,5 +333,97 @@ mod tests {
         let user = dir.lookup(Some("does-not-exist"));
         assert_eq!(user.name, "anonymous");
         assert!(user.permissions.allows(Op::Read));
+    }
+
+    #[test]
+    fn default_anonymous_is_read_only() {
+        // #104: without `--users`, the implicit anonymous user must not
+        // grant writes, deletes, or chmod.
+        let dir = UserDirectory::default_anonymous(Path::new("/tmp"));
+        let anon = dir.anonymous();
+        assert!(anon.permissions.allows(Op::Read));
+        assert!(!anon.permissions.allows(Op::Write));
+        assert!(!anon.permissions.allows(Op::Delete));
+        assert!(!anon.permissions.allows(Op::Mkdir));
+        assert!(!anon.permissions.allows(Op::Rmdir));
+        assert!(!anon.permissions.allows(Op::Rename));
+        assert!(!anon.permissions.allows(Op::Chmod));
+    }
+
+    #[test]
+    fn lookup_strict_misses_unknown_cn() {
+        // #105: a peer cert with an unknown CN must NOT silently
+        // downgrade to anonymous; lookup_strict returns None so the
+        // caller can close the connection.
+        let dir = UserDirectory::default_anonymous(Path::new("/tmp"));
+        assert!(dir.lookup_strict("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn lookup_strict_trims_whitespace() {
+        // #105: trailing/leading whitespace on the CN should not
+        // produce a different user than the configured name.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![UserSpec {
+                name: "alice".to_string(),
+                home: None,
+                permissions: Permissions::read_only(),
+                quota_bytes: None,
+            }],
+        };
+        let dir = UserDirectory::from_config(tmp.path(), cfg).unwrap();
+        assert!(dir.lookup_strict("alice").is_some());
+        assert!(dir.lookup_strict(" alice ").is_some());
+        assert!(dir.lookup_strict("alice\t").is_some());
+        // Case mismatch is intentional: still a miss.
+        assert!(dir.lookup_strict("Alice").is_none());
+    }
+
+    #[test]
+    fn from_config_rejects_parent_dir_in_relative_home() {
+        // #112: a relative `home = "../../etc"` in users.toml must not
+        // escape the global root.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![UserSpec {
+                name: "evil".to_string(),
+                home: Some(PathBuf::from("../../etc")),
+                permissions: Permissions::full(),
+                quota_bytes: None,
+            }],
+        };
+        let err = UserDirectory::from_config(tmp.path(), cfg)
+            .err()
+            .expect("expected from_config to reject this spec");
+        assert!(
+            err.to_string().contains("..") || err.to_string().contains("#112"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_absolute_home_outside_root() {
+        // #112: even an absolute home must canonicalize to inside the
+        // global root.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![UserSpec {
+                name: "escapee".to_string(),
+                home: Some(PathBuf::from("/etc")),
+                permissions: Permissions::read_only(),
+                quota_bytes: None,
+            }],
+        };
+        let err = UserDirectory::from_config(tmp.path(), cfg)
+            .err()
+            .expect("expected from_config to reject this spec");
+        assert!(
+            err.to_string().contains("escapes") || err.to_string().contains("#112"),
+            "unexpected error: {err}"
+        );
     }
 }
