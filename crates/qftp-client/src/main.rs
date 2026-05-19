@@ -11,6 +11,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 mod config;
+mod connect;
 mod fanout;
 mod known_hosts;
 mod oneshot;
@@ -282,13 +283,7 @@ fn main() -> Result<()> {
 
     let spec = config::resolve(args.target.as_deref(), &cfg_file, &overrides)?;
 
-    let client_cert = match (&spec.client_cert, &spec.client_key) {
-        (Some(c), Some(k)) => Some(qftp_common::transport::ClientCert {
-            cert_pem: c.clone(),
-            key_pem: k.clone(),
-        }),
-        _ => None,
-    };
+    let client_cert = connect::client_cert_from_spec(&spec);
 
     // TOFU is only meaningful when the user has *not* supplied a CA
     // bundle. A `--ca` overrides it (we trust the PKI chain). When

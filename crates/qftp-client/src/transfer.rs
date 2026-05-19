@@ -193,11 +193,7 @@ pub fn do_get(
     // via a planted symlink in the destination directory.
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(resume_offset == 0);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
+    qftp_common::fs_safe::apply_no_follow(&mut opts);
     let mut file = opts
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;

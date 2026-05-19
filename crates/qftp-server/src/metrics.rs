@@ -53,6 +53,58 @@ impl Kind {
 }
 
 impl Metrics {
+    /// Thin wrappers over the underlying atomics. Callers should
+    /// reach for these semantic helpers rather than poking the
+    /// `AtomicU64` fields directly — that keeps the `Ordering::Relaxed`
+    /// choice and the bump-vs-decrement direction in one place.
+    pub fn inc_connections_open(&self) {
+        self.connections_open.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn dec_connections_open(&self) {
+        self.connections_open.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub fn inc_connections_total(&self) {
+        self.connections_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_retries_issued(&self) {
+        self.retries_issued.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_requests_total(&self) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_requests_failed(&self) {
+        self.requests_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_zero_rtt_accepted(&self) {
+        self.zero_rtt_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_zero_rtt_rejected(&self) {
+        self.zero_rtt_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_uploads_completed(&self) {
+        self.uploads_completed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_downloads_completed(&self) {
+        self.downloads_completed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn add_bytes_sent(&self, n: u64) {
+        self.bytes_sent.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn add_bytes_received(&self, n: u64) {
+        self.bytes_received.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn inc_connections_rejected_rate(&self) {
+        self.connections_rejected_rate
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_connections_rejected_caps(&self) {
+        self.connections_rejected_caps
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_requests_rate_limited(&self) {
+        self.requests_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::new();
         let g = |out: &mut String, name: &str, help: &str, kind: Kind, v: u64| {
