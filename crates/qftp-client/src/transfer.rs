@@ -20,7 +20,19 @@ use qftp_common::transport::*;
 
 const CHUNK: usize = 64 * 1024;
 
+/// Process-wide flag set from `--quiet`. When true, `make_bar`
+/// returns a hidden ProgressBar so callers don't have to thread the
+/// flag through every transfer entry point.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn make_bar(total: u64, label: &str) -> ProgressBar {
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        return ProgressBar::hidden();
+    }
     let bar = ProgressBar::new(total);
     bar.set_message(label.to_string());
     bar.set_style(
