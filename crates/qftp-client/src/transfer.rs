@@ -29,6 +29,108 @@ pub fn set_quiet(q: bool) {
     QUIET.store(q, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Bandwidth limit in bytes/second. `0` (default) = unlimited.
+/// `--bwlimit` parses K/M/G suffixes and stores the byte rate here.
+/// Set once at startup, read from every chunk-loop iteration.
+static BW_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_bw_limit_bps(rate: u64) {
+    BW_LIMIT_BPS.store(rate, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Token-bucket throttle applied per chunk. Sleeps just long enough
+/// to keep the moving average at or below `--bwlimit`. The bucket
+/// holds 1s worth of tokens so short bursts don't get over-paced.
+pub struct Pacer {
+    last: std::time::Instant,
+    tokens: f64,
+    rate: f64,
+    burst: f64,
+}
+
+impl Pacer {
+    pub fn new() -> Self {
+        let rate = BW_LIMIT_BPS.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        Self {
+            last: std::time::Instant::now(),
+            tokens: rate,
+            rate,
+            burst: rate.max(64.0 * 1024.0),
+        }
+    }
+
+    /// Block until `bytes` tokens are available. No-op when the
+    /// limit is 0 (unlimited).
+    pub fn consume(&mut self, bytes: usize) {
+        if self.rate <= 0.0 {
+            return;
+        }
+        // Refill.
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        self.last = now;
+
+        if (bytes as f64) <= self.tokens {
+            self.tokens -= bytes as f64;
+            return;
+        }
+        let need = bytes as f64 - self.tokens;
+        let sleep = std::time::Duration::from_secs_f64(need / self.rate);
+        std::thread::sleep(sleep);
+        // Treat the sleep as having drained the deficit; new
+        // `last` accounts for it on the next refill.
+        self.last = std::time::Instant::now();
+        self.tokens = 0.0;
+    }
+}
+
+impl Default for Pacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse a `K`/`M`/`G` / `Ki`/`Mi`/`Gi` suffix into bytes/second.
+/// Examples: "5M" = 5_000_000, "1Gi" = 1_073_741_824.
+/// Returns 0 for "0" so callers can treat unlimited uniformly.
+pub fn parse_bw_limit(input: &str) -> anyhow::Result<u64> {
+    let s = input.trim();
+    if s.is_empty() {
+        anyhow::bail!("bwlimit is empty");
+    }
+    let bytes = s.as_bytes();
+    let (num_end, mult) = parse_suffix(bytes);
+    let num: f64 = std::str::from_utf8(&bytes[..num_end])
+        .map_err(|_| anyhow::anyhow!("bwlimit: non-utf8 number"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bwlimit: bad number '{input}'"))?;
+    if num < 0.0 {
+        anyhow::bail!("bwlimit: negative rate");
+    }
+    Ok((num * mult as f64) as u64)
+}
+
+fn parse_suffix(bytes: &[u8]) -> (usize, u64) {
+    // Walk back from the end to find the digit/suffix boundary.
+    let mut end = bytes.len();
+    while end > 0 && !bytes[end - 1].is_ascii_digit() && bytes[end - 1] != b'.' {
+        end -= 1;
+    }
+    let suffix = std::str::from_utf8(&bytes[end..]).unwrap_or("");
+    let mult: u64 = match suffix {
+        "" => 1,
+        "K" | "k" => 1_000,
+        "M" | "m" => 1_000_000,
+        "G" | "g" => 1_000_000_000,
+        "Ki" | "ki" => 1024,
+        "Mi" | "mi" => 1024 * 1024,
+        "Gi" | "gi" => 1024 * 1024 * 1024,
+        _ => 1,
+    };
+    (end, mult)
+}
+
 fn make_bar(total: u64, label: &str) -> ProgressBar {
     if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
         return ProgressBar::hidden();
@@ -247,12 +349,16 @@ pub fn do_put(
 
     let mut sent: u64 = 0;
     let mut buf = vec![0u8; CHUNK];
+    let mut pacer = Pacer::new();
     while sent < bytes_to_send {
         let want = (bytes_to_send - sent) as usize;
         let want = want.min(buf.len());
         f.read_exact(&mut buf[..want])
             .context("reading local chunk")?;
         let is_last = sent + want as u64 == bytes_to_send;
+
+        // Bandwidth throttle (`--bwlimit`). No-op when unlimited.
+        pacer.consume(want);
 
         // The whole batch is one stream_send_all call, but we still want
         // to flush egress periodically so the server actually sees the
@@ -318,5 +424,69 @@ fn poll_response(
         if conn.is_closed() {
             bail!("Connection closed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bw_limit_handles_suffixes() {
+        assert_eq!(parse_bw_limit("0").unwrap(), 0);
+        assert_eq!(parse_bw_limit("100").unwrap(), 100);
+        assert_eq!(parse_bw_limit("5K").unwrap(), 5_000);
+        assert_eq!(parse_bw_limit("5M").unwrap(), 5_000_000);
+        assert_eq!(parse_bw_limit("1G").unwrap(), 1_000_000_000);
+        assert_eq!(parse_bw_limit("1Ki").unwrap(), 1024);
+        assert_eq!(parse_bw_limit("1Mi").unwrap(), 1024 * 1024);
+        assert_eq!(parse_bw_limit("1Gi").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_bw_limit("1.5M").unwrap(), 1_500_000);
+    }
+
+    #[test]
+    fn parse_bw_limit_rejects_garbage() {
+        assert!(parse_bw_limit("").is_err());
+        assert!(parse_bw_limit("abc").is_err());
+        assert!(parse_bw_limit("-5M").is_err());
+    }
+
+    #[test]
+    fn pacer_zero_rate_is_noop() {
+        BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut p = Pacer::new();
+        let t = std::time::Instant::now();
+        p.consume(1 << 30);
+        assert!(t.elapsed() < std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn pacer_throttles_to_rate() {
+        // 1 MB/s; send 2 MB; expect roughly 2 seconds. We test a
+        // smaller window so the suite stays fast.
+        BW_LIMIT_BPS.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        let mut p = Pacer::new();
+        let t = std::time::Instant::now();
+        // 1 MB inside the burst window -> immediate.
+        p.consume(1_000_000);
+        let after_first = t.elapsed();
+        // 200 KB more -> should require ~200 ms wait.
+        p.consume(200_000);
+        let after_second = t.elapsed();
+        assert!(
+            after_first < std::time::Duration::from_millis(50),
+            "first consume should be instant, took {after_first:?}"
+        );
+        // Some slack for CI jitter (>=150 ms, <=600 ms).
+        assert!(
+            after_second >= std::time::Duration::from_millis(150),
+            "second consume should have slept >=150ms, took {after_second:?}"
+        );
+        assert!(
+            after_second <= std::time::Duration::from_millis(600),
+            "second consume should not exceed 600ms, took {after_second:?}"
+        );
+        // Reset for the next test.
+        BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }

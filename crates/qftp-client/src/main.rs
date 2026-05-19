@@ -111,6 +111,11 @@ struct Args {
     /// Beats `RUST_LOG`.
     #[arg(long, short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Throttle uploads to this byte rate. Accepts K/M/G (SI) or
+    /// Ki/Mi/Gi (binary) suffixes; `0` (default) is unlimited.
+    /// Examples: `--bwlimit 5M` = 5 MB/s, `--bwlimit 100Ki`.
+    #[arg(long, default_value = "0")]
+    bwlimit: String,
     /// Print a shell-completion script to stdout and exit.
     /// Pipe it into the right place for your shell, e.g.
     ///   `qftp-client --generate-completions bash | sudo tee \
@@ -191,6 +196,12 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     transfer::set_quiet(args.quiet);
+    let bw = transfer::parse_bw_limit(&args.bwlimit)
+        .with_context(|| format!("--bwlimit '{}'", args.bwlimit))?;
+    transfer::set_bw_limit_bps(bw);
+    if bw > 0 {
+        tracing::info!(bytes_per_sec = bw, "upload throttled by --bwlimit");
+    }
 
     if let Some(shell) = args.generate_completions {
         let mut cmd = Args::command();
