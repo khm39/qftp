@@ -1,0 +1,88 @@
+name: soak
+
+# Long-running stress test: keeps repeated qftp-client transfers going
+# against a single qftp-server while sampling RSS / open FDs to catch
+# memory leaks or descriptor leaks. Triggered on demand only -- it's not
+# cheap and isn't worth running on every PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How many minutes to run the soak for"
+        required: false
+        default: "30"
+      file_size_mb:
+        description: "Size of the file each iteration transfers"
+        required: false
+        default: "16"
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --workspace --bins
+
+      - name: Prepare test root and payload
+        run: |
+          mkdir -p soak/root soak/local
+          dd if=/dev/urandom of=soak/local/payload bs=1M \
+             count=${{ inputs.file_size_mb || 16 }}
+
+      - name: Start server
+        run: |
+          ./target/release/qftp-server \
+            --self-signed \
+            --bind 127.0.0.1:4433 \
+            --root soak/root \
+            --metrics-bind 127.0.0.1:9090 &
+          echo $! > soak/server.pid
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9090/healthz >/dev/null && break
+            sleep 1
+          done
+
+      - name: Run soak loop
+        run: |
+          end=$(( $(date +%s) + ${{ inputs.duration_minutes || 30 }} * 60 ))
+          iter=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            iter=$((iter + 1))
+            ./target/release/qftp-client \
+              --insecure --server-name localhost --host 127.0.0.1:4433 \
+              <<< "put soak/local/payload payload-${iter}" >/dev/null
+            ./target/release/qftp-client \
+              --insecure --server-name localhost --host 127.0.0.1:4433 \
+              <<< "get payload-${iter} soak/local/recv-${iter}" >/dev/null
+            cmp soak/local/payload soak/local/recv-${iter}
+            rm -f soak/local/recv-${iter}
+            if (( iter % 10 == 0 )); then
+              echo "iter=$iter  $(date)"
+              ps -o pid,rss,vsz,nlwp -p "$(cat soak/server.pid)"
+              ls /proc/"$(cat soak/server.pid)"/fd | wc -l
+            fi
+          done
+          echo "Completed $iter iterations"
+
+      - name: Stop server and dump metrics
+        if: always()
+        run: |
+          if [ -f soak/server.pid ]; then
+            kill -TERM "$(cat soak/server.pid)" 2>/dev/null || true
+            sleep 2
+          fi
+          curl -fsS http://127.0.0.1:9090/metrics || true

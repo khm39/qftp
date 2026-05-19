@@ -1,0 +1,49 @@
+name: fuzz
+
+# Quick fuzz pass over the bincode protocol deserializers. cargo-fuzz
+# requires nightly; we cap each target at a few minutes so the job
+# completes in a reasonable time. Schedule daily and on demand; do not
+# block PRs.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      max_total_seconds:
+        description: "Seconds budget per fuzz target"
+        required: false
+        default: "180"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [request_deser, response_deser]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+
+      - name: Run fuzz target ${{ matrix.target }}
+        working-directory: fuzz
+        run: |
+          cargo fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ inputs.max_total_seconds || 180 }} \
+            -timeout=10
