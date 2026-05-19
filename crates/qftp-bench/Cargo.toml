@@ -1,0 +1,27 @@
+[package]
+name = "qftp-bench"
+description = "QUIC File Transfer Protocol -- end-to-end throughput benchmarks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tempfile = "3"
+anyhow = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "plotters", "html_reports"] }
+
+[[bench]]
+name = "throughput"
+harness = false
