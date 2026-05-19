@@ -56,8 +56,8 @@ pub fn establish(
         .host
         .parse()
         .with_context(|| format!("{context_label}: bad host {}", spec.host))?;
-    let std_socket = UdpSocket::bind("0.0.0.0:0")
-        .with_context(|| format!("{context_label}: UDP bind"))?;
+    let std_socket =
+        UdpSocket::bind("0.0.0.0:0").with_context(|| format!("{context_label}: UDP bind"))?;
     std_socket.set_nonblocking(true)?;
     std_socket.connect(peer_addr)?;
     let local_addr = std_socket.local_addr()?;
@@ -105,7 +105,9 @@ pub fn establish(
             break;
         }
         if conn.is_closed() {
-            return Err(anyhow!("{context_label}: connection closed during handshake"));
+            return Err(anyhow!(
+                "{context_label}: connection closed during handshake"
+            ));
         }
     }
 
