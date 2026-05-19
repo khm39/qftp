@@ -31,6 +31,8 @@ pub struct Metrics {
     pub requests_rate_limited: AtomicU64,
     pub uploads_completed: AtomicU64,
     pub downloads_completed: AtomicU64,
+    pub zero_rtt_accepted: AtomicU64,
+    pub zero_rtt_rejected: AtomicU64,
 }
 
 /// Prometheus metric kind. counter -> monotonically increasing; gauge ->
@@ -146,6 +148,20 @@ impl Metrics {
             "Successful Get downloads.",
             Kind::Counter,
             self.downloads_completed.load(Ordering::Relaxed),
+        );
+        g(
+            &mut out,
+            "qftp_zero_rtt_accepted_total",
+            "Requests accepted while the QUIC handshake was still in the early-data phase. These are read-only ops served at 0-RTT.",
+            Kind::Counter,
+            self.zero_rtt_accepted.load(Ordering::Relaxed),
+        );
+        g(
+            &mut out,
+            "qftp_zero_rtt_rejected_total",
+            "Requests refused because they arrived during 0-RTT and would have mutated server state. The client retries them under 1-RTT.",
+            Kind::Counter,
+            self.zero_rtt_rejected.load(Ordering::Relaxed),
         );
         out
     }

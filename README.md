@@ -37,6 +37,9 @@ Pre-1.0, but functionally complete for the supported feature set:
   `--execute` / piped-stdin batch mode.
 - Prometheus metrics endpoint and `/healthz`.
 - Optional structured JSON logging.
+- 0-RTT session resumption: the second `qftp` connect to the same host
+  skips the TLS handshake. Writes are still gated to 1-RTT to defeat
+  replay; reads (Get / Ls / Stat / Pwd / Cd) go at 0-RTT.
 
 ## Quick start
 
@@ -155,6 +158,8 @@ legacy flags / defaults.
 | `--insecure` | Skip server cert verification. Dev only. |
 | `--trust-on-first-use` (`-T`) | SSH-style cert pinning. First connect saves the SHA-256 fingerprint to `~/.qftp/known_hosts`; later connects verify against it. Ignored when `--ca` is set. |
 | `--known-hosts <path>` | Override the default `~/.qftp/known_hosts`. |
+| `--no-zero-rtt` | Skip 0-RTT session resumption (every connect is a fresh handshake). |
+| `--session-ticket-dir <path>` | Override the default `~/.qftp/session-tickets/`. |
 | `--client-cert <pem>` / `--client-key <pem>` | mTLS client certificate. |
 | `--execute "<cmd>"` (`-e`) | Run a single command and exit. Repeatable. |
 | `--batch` | Read commands from stdin, one per line, instead of opening a REPL. Also implicit when stdin is not a TTY. |
