@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -110,13 +111,65 @@ pub struct UserSpec {
     pub quota_bytes: Option<u64>,
 }
 
-/// Resolved, immutable user record handed to per-connection contexts.
+/// Resolved user record handed to per-connection contexts. The
+/// quota counters (`used_bytes`, `in_flight_bytes`) are mutated
+/// concurrently from every connection that runs as this user, so the
+/// directory is intentionally an `Arc<User>` rather than `Arc<RwLock<User>>`
+/// — only the AtomicU64 fields mutate.
 #[derive(Debug)]
 pub struct User {
     pub name: String,
     pub home: PathBuf,
     pub permissions: Permissions,
     pub quota_bytes: Option<u64>,
+    /// Cached `walk_size(home).0` plus successful Put accruals minus
+    /// successful Rm decrements. Initialized once at startup
+    /// (avoids the per-Put `walk_size` DoS, #111).
+    pub used_bytes: AtomicU64,
+    /// Bytes reserved by accepted-but-not-yet-completed Put streams.
+    /// `start_put` adds the declared remaining bytes here; the Put
+    /// completion path subtracts them (and adds to `used_bytes` on
+    /// success). This closes the parallel-Put bypass (#111).
+    pub in_flight_bytes: AtomicU64,
+}
+
+impl User {
+    /// `used + in_flight`, the budget-aware "current usage" figure that
+    /// quota checks and the `Quota` response should both report.
+    pub fn current_usage(&self) -> u64 {
+        self.used_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.in_flight_bytes.load(Ordering::Relaxed))
+    }
+}
+
+/// Walk `root` and return `(total_bytes, file_count)`. Used to
+/// initialize a user's cached `used_bytes` at startup, and (until
+/// the cache lands) for `Request::Quota` replies. We deliberately
+/// skip non-regular files so the number matches `du -b --apparent-size`.
+pub fn walk_size(root: &Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut count = 0u64;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                bytes = bytes.saturating_add(meta.len());
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    (bytes, count)
 }
 
 /// Top-level user config, loaded from a TOML file.
@@ -147,6 +200,8 @@ impl UserDirectory {
             home: global_root.to_path_buf(),
             permissions: Permissions::read_only(),
             quota_bytes: None,
+            used_bytes: AtomicU64::new(0),
+            in_flight_bytes: AtomicU64::new(0),
         });
         Self {
             by_name: HashMap::new(),
@@ -223,15 +278,24 @@ impl UserDirectory {
             Ok(canonical)
         };
 
-        let mut by_name = HashMap::new();
-        for spec in &cfg.users {
-            let home = resolve_home(spec)?;
-            let user = Arc::new(User {
+        let build_user = |spec: &UserSpec, home: PathBuf| -> Arc<User> {
+            // #111: prime the used-bytes cache once at startup so the
+            // hot path (Put) doesn't re-walk the user's home.
+            let (used, _) = walk_size(&home);
+            Arc::new(User {
                 name: spec.name.clone(),
                 home,
                 permissions: spec.permissions.clone(),
                 quota_bytes: spec.quota_bytes,
-            });
+                used_bytes: AtomicU64::new(used),
+                in_flight_bytes: AtomicU64::new(0),
+            })
+        };
+
+        let mut by_name = HashMap::new();
+        for spec in &cfg.users {
+            let home = resolve_home(spec)?;
+            let user = build_user(spec, home);
             if by_name.insert(spec.name.clone(), user).is_some() {
                 anyhow::bail!("duplicate user name in config: {}", spec.name);
             }
@@ -240,19 +304,19 @@ impl UserDirectory {
         let anonymous = match &cfg.anonymous {
             Some(spec) => {
                 let home = resolve_home(spec)?;
+                build_user(spec, home)
+            }
+            None => {
+                let (used, _) = walk_size(&canonical_root);
                 Arc::new(User {
-                    name: spec.name.clone(),
-                    home,
-                    permissions: spec.permissions.clone(),
-                    quota_bytes: spec.quota_bytes,
+                    name: "anonymous".to_string(),
+                    home: canonical_root,
+                    permissions: Permissions::read_only(),
+                    quota_bytes: None,
+                    used_bytes: AtomicU64::new(used),
+                    in_flight_bytes: AtomicU64::new(0),
                 })
             }
-            None => Arc::new(User {
-                name: "anonymous".to_string(),
-                home: canonical_root,
-                permissions: Permissions::read_only(),
-                quota_bytes: None,
-            }),
         };
 
         Ok(Self { by_name, anonymous })
@@ -473,6 +537,59 @@ mod tests {
             .err()
             .expect("expected quota_bytes = 0 to be refused");
         assert!(err.to_string().contains("#126"));
+    }
+
+    #[test]
+    fn from_config_initializes_used_bytes_from_walk_size() {
+        // #111: a freshly built UserDirectory should reflect any
+        // pre-existing files under each user's home, not start at 0.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("alice");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("a.bin"), [0u8; 100]).unwrap();
+        std::fs::write(home.join("b.bin"), [0u8; 250]).unwrap();
+        std::fs::create_dir(home.join("sub")).unwrap();
+        std::fs::write(home.join("sub/c.bin"), [0u8; 50]).unwrap();
+
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![UserSpec {
+                name: "alice".to_string(),
+                home: Some(PathBuf::from("alice")),
+                permissions: Permissions::read_only(),
+                quota_bytes: Some(10_000),
+            }],
+        };
+        let dir = UserDirectory::from_config(tmp.path(), cfg).unwrap();
+        let alice = dir.lookup_strict("alice").unwrap();
+        assert_eq!(alice.used_bytes.load(Ordering::Relaxed), 400);
+        assert_eq!(alice.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(alice.current_usage(), 400);
+    }
+
+    #[test]
+    fn current_usage_tracks_in_flight_plus_used() {
+        // #111: parallel-Put bypass guard. The quota check must see
+        // committed + reserved, never just committed.
+        let user = User {
+            name: "u".to_string(),
+            home: PathBuf::from("/"),
+            permissions: Permissions::read_only(),
+            quota_bytes: Some(100),
+            used_bytes: AtomicU64::new(40),
+            in_flight_bytes: AtomicU64::new(0),
+        };
+        assert_eq!(user.current_usage(), 40);
+
+        // Two parallel Puts of 30 each would each see used=40, and
+        // before the fix both would project 40 + 30 = 70 <= 100 and
+        // commit, ending at 100. With the in_flight counter, the
+        // second see used=40, in_flight=30, projects 70+30 = 100,
+        // OK. A third would see 100+30 = 130 > 100 and be refused.
+        user.in_flight_bytes.fetch_add(30, Ordering::Relaxed);
+        assert_eq!(user.current_usage(), 70);
+        user.in_flight_bytes.fetch_add(30, Ordering::Relaxed);
+        assert_eq!(user.current_usage(), 100);
     }
 
     #[test]
