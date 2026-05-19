@@ -247,6 +247,15 @@ pub enum Request {
         checksum: Option<[u8; 32]>,
         #[serde(default)]
         no_clobber: bool,
+        /// When true, the client appends a 32-byte BLAKE3 trailer on
+        /// the same stream after the `size` body bytes (#152). This
+        /// lets the client hash as it sends instead of doing a full
+        /// pre-send pass to populate the header `checksum` field.
+        /// When false, `checksum` is authoritative (legacy path);
+        /// `None` here with `checksum_trailer = false` means no
+        /// verification at all (pre-existing behavior preserved).
+        #[serde(default)]
+        checksum_trailer: bool,
     },
     Mkdir {
         path: String,
@@ -349,6 +358,7 @@ mod tests {
             offset: 4096,
             checksum: Some([7u8; 32]),
             no_clobber: true,
+            checksum_trailer: false,
         };
         match round_trip_request(&req) {
             Request::Put {
@@ -358,6 +368,7 @@ mod tests {
                 offset,
                 checksum,
                 no_clobber,
+                checksum_trailer,
             } => {
                 assert_eq!(path, "dir/file.bin");
                 assert_eq!(size, 12345);
@@ -365,6 +376,7 @@ mod tests {
                 assert_eq!(offset, 4096);
                 assert_eq!(checksum, Some([7u8; 32]));
                 assert!(no_clobber);
+                assert!(!checksum_trailer);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
