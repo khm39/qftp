@@ -9,21 +9,41 @@ use mio::{Events, Interest, Poll, Token};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
+mod config;
 mod repl;
 mod transfer;
 
 const CLIENT: Token = Token(0);
 
 #[derive(Parser)]
-#[command(name = "qftp-client", about = "QUIC File Transfer Protocol Client")]
+#[command(
+    name = "qftp-client",
+    about = "QUIC File Transfer Protocol Client",
+    long_about = "Connect to a qftp server. The positional TARGET is either a \
+        qftp:// URL (e.g. qftp://user@host:4433/path) or the name of a host \
+        alias defined in ~/.qftp/config.toml. Flag overrides have the highest \
+        precedence; URL fields beat alias fields; builtin defaults are last."
+)]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:4433")]
-    host: String,
-    #[arg(long, default_value = "localhost")]
-    server_name: String,
+    /// `qftp://[user@]host[:port][/path]`, `qftps://...`, or a host
+    /// alias defined in the config file. When omitted, falls back to
+    /// the legacy `--host` / `--server-name` flags and defaults.
+    target: Option<String>,
+    /// Path to the client config file. Defaults to
+    /// `~/.qftp/config.toml`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Override host (and optionally port) as `ip:port`. Beats URL /
+    /// alias.
+    #[arg(long)]
+    host: Option<String>,
+    /// Override SNI / certificate name expected on the server cert.
+    #[arg(long)]
+    server_name: Option<String>,
     #[arg(long)]
     ca: Option<String>,
-    #[arg(long, default_value_t = false)]
+    /// Skip server certificate verification. Development only.
+    #[arg(long)]
     insecure: bool,
     #[arg(long, requires = "client_key")]
     client_cert: Option<String>,
@@ -52,7 +72,28 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let client_cert = match (&args.client_cert, &args.client_key) {
+    let config_path = args
+        .config
+        .as_ref()
+        .map(|p| PathBuf::from(config::expand_tilde(&p.to_string_lossy())))
+        .or_else(config::default_config_path);
+    let cfg_file = match &config_path {
+        Some(p) => config::ConfigFile::load(p)?,
+        None => config::ConfigFile::default(),
+    };
+
+    let overrides = config::Overrides {
+        host: args.host.clone(),
+        server_name: args.server_name.clone(),
+        insecure: if args.insecure { Some(true) } else { None },
+        ca: args.ca.clone(),
+        client_cert: args.client_cert.clone(),
+        client_key: args.client_key.clone(),
+    };
+
+    let spec = config::resolve(args.target.as_deref(), &cfg_file, &overrides)?;
+
+    let client_cert = match (&spec.client_cert, &spec.client_key) {
         (Some(c), Some(k)) => Some(qftp_common::transport::ClientCert {
             cert_pem: c.clone(),
             key_pem: k.clone(),
@@ -61,12 +102,15 @@ fn main() -> Result<()> {
     };
 
     let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
-        verify_peer: !args.insecure,
-        ca_path: args.ca.clone(),
+        verify_peer: !spec.insecure,
+        ca_path: spec.ca.clone(),
         client_cert,
     })?;
 
-    let peer_addr = args.host.parse().context("failed to parse host address")?;
+    let peer_addr = spec
+        .host
+        .parse()
+        .with_context(|| format!("failed to parse host address: {}", spec.host))?;
     let std_socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
     std_socket.set_nonblocking(true)?;
     std_socket.connect(peer_addr)?;
@@ -80,7 +124,7 @@ fn main() -> Result<()> {
     let scid = quiche::ConnectionId::from_vec(scid_bytes.to_vec());
 
     let mut conn = quiche::connect(
-        Some(&args.server_name),
+        Some(&spec.server_name),
         &scid,
         local_addr,
         peer_addr,
@@ -110,12 +154,28 @@ fn main() -> Result<()> {
         }
     }
 
-    eprintln!("Connected to {}", args.host);
+    eprintln!("Connected to {}", spec.host);
 
     // Determine the source of commands: --execute > --batch/stdin
     // pipeline > interactive TTY.
     let mut next_stream_id: u64 = 0;
     let mut quit_requested = false;
+
+    if let Some(path) = &spec.initial_path {
+        let stream_id = take_stream(&mut next_stream_id);
+        send_message(&mut conn, stream_id, &Request::Cd { path: path.clone() })?;
+        stream_send_all(&mut conn, stream_id, &[], true)?;
+        flush_egress(&mut conn, &socket)?;
+        match poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)? {
+            Response::Ok => {}
+            Response::Err(e) => {
+                eprintln!("initial cd {} failed: [{:?}] {}", path, e.code, e.message);
+            }
+            other => {
+                eprintln!("initial cd: unexpected response {other:?}");
+            }
+        }
+    }
 
     if !args.execute.is_empty() {
         for line in &args.execute {

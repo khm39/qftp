@@ -45,12 +45,36 @@ Pre-1.0, but functionally complete for the supported feature set:
 qftp-server --self-signed --bind 127.0.0.1:4433 --root ./srv
 
 # Client (development: trust the self-signed cert)
-qftp-client --insecure --server-name localhost --host 127.0.0.1:4433
+qftp-client --insecure qftp://localhost:4433
 qftp> ls
 qftp> get -r remote-dir local-dir
 qftp> put -r local-dir remote-dir
 qftp> quit
 ```
+
+### Saved hosts
+
+The client reads `~/.qftp/config.toml` (override with `--config`). Define
+host aliases and point the CLI at the alias name:
+
+```toml
+[host.work]
+endpoint = "qftps://files.work.example:4433"
+ca = "~/.qftp/work-ca.pem"
+client_cert = "~/.qftp/work-cert.pem"
+client_key = "~/.qftp/work-key.pem"
+
+[host.home]
+endpoint = "qftp://home.lan:4433"
+insecure = true   # dev only -- TOFU planned in #61
+```
+
+```sh
+qftp-client work          # uses the [host.work] alias
+qftp-client qftp://server.example:4433/data  # raw URL + initial cd
+```
+
+Precedence (highest wins): CLI flag > URL fields > alias fields.
 
 ## Production deployment
 
@@ -110,10 +134,20 @@ qftp-client \
 
 ### qftp-client
 
+```
+qftp-client [OPTIONS] [TARGET]
+```
+
+`TARGET` is either a `qftp://[user@]host[:port][/initial-path]` URL
+(`qftps://` is accepted as a synonym) or the name of a host alias
+defined in the config file. Omitted, the client falls back to the
+legacy flags / defaults.
+
 | Flag | Purpose |
 |---|---|
-| `--host <ip:port>` | Server UDP address. Default `127.0.0.1:4433`. |
-| `--server-name <name>` | SNI / cert CN expected. Default `localhost`. |
+| `--config <path>` | Override the default `~/.qftp/config.toml`. |
+| `--host <ip:port>` | Override host. Beats URL / alias. |
+| `--server-name <name>` | Override SNI / cert CN expected. |
 | `--ca <pem>` | PEM CA bundle to verify the server cert. Falls back to system trust store. |
 | `--insecure` | Skip server cert verification. Dev only. |
 | `--client-cert <pem>` / `--client-key <pem>` | mTLS client certificate. |
