@@ -1332,6 +1332,12 @@ fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // #136: pin the create mode to 0o600 so the in-flight
+        // `.qftp.partial.*` file is never readable by other local
+        // users on a multi-user host. Without this, the file inherits
+        // the daemon umask (typically 0o022 -> 0o644 = world-readable)
+        // until apply_mode runs on the renamed final_path.
+        opts.mode(0o600);
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     opts.open(path)
@@ -1454,5 +1460,29 @@ mod tests {
             path: "x".into(),
             mode: 0o644,
         }));
+    }
+
+    /// #136: the in-flight partial-upload temp file must be 0o600
+    /// regardless of the process umask, so it isn't readable by
+    /// other local users while the upload is still in progress.
+    #[cfg(unix)]
+    #[test]
+    fn temp_upload_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("victim.partial");
+        // Force a permissive umask so the bug would be observable
+        // without the explicit mode call.
+        let _restore = UmaskGuard(unsafe { libc::umask(0o000) });
+        let f = open_temp_no_follow(&path).expect("temp create");
+        drop(f);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "temp file mode was {mode:o}, expected 0o600");
     }
 }
