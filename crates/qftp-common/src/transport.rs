@@ -66,8 +66,46 @@ pub fn tune_udp_buffers(socket: &std::net::UdpSocket) {
 #[cfg(not(unix))]
 pub fn tune_udp_buffers(_socket: &std::net::UdpSocket) {}
 
-/// Flush pending outgoing packets from the QUIC connection to the UDP socket.
+/// Maximum number of QUIC datagrams to coalesce into a single
+/// `sendmsg(UDP_SEGMENT)` burst (#151). Sized so one burst is ~86 KiB
+/// at our MTU — large enough to cut the per-packet syscall rate by
+/// ~64× without holding the egress path so long that pacing turns
+/// into jitter. Linux UDP_SEGMENT itself caps at 64 segments per
+/// skbuff, so going higher would just be wasted buffer.
+const GSO_BURST_PACKETS: usize = 64;
+
+/// Tracks whether UDP_SEGMENT (GSO) is usable on this socket. Starts
+/// in "try" state, flips to "off" the first time the kernel rejects a
+/// GSO send (older kernels, some virtual NICs). After that we stay on
+/// the per-packet fallback for the lifetime of the process.
+#[cfg(target_os = "linux")]
+static GSO_USABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Flush pending outgoing packets from the QUIC connection to the UDP
+/// socket. On Linux this coalesces up to `GSO_BURST_PACKETS` datagrams
+/// into a single `sendmsg(UDP_SEGMENT)` (#151); on other platforms,
+/// and after a runtime fallback, it falls back to one `send_to` per
+/// datagram. The latter is what quiche's own examples used originally
+/// and what every earlier version of `flush_egress` did, so the
+/// fallback path is the safe equivalent of the old behavior.
 pub fn flush_egress(conn: &mut quiche::Connection, socket: &mio::net::UdpSocket) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        flush_egress_linux(conn, socket)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        flush_egress_per_packet(conn, socket)
+    }
+}
+
+/// Per-packet fallback: one `sendmsg` per QUIC datagram. Used on
+/// non-Linux platforms and on Linux when UDP_SEGMENT has been
+/// disabled at runtime (`GSO_USABLE = false`).
+fn flush_egress_per_packet(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+) -> Result<()> {
     let mut out = [0u8; MAX_DATAGRAM_SIZE];
 
     loop {
@@ -82,6 +120,210 @@ pub fn flush_egress(conn: &mut quiche::Connection, socket: &mio::net::UdpSocket)
             .context("UDP send_to failed")?;
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn flush_egress_linux(conn: &mut quiche::Connection, socket: &mio::net::UdpSocket) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    if !GSO_USABLE.load(Ordering::Relaxed) {
+        return flush_egress_per_packet(conn, socket);
+    }
+
+    let mut buf = vec![0u8; MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS];
+
+    'outer: loop {
+        let mut total = 0usize;
+        let mut seg_size = 0usize;
+        let mut dst: Option<std::net::SocketAddr> = None;
+        let mut packets = 0usize;
+
+        // Coalesce up to GSO_BURST_PACKETS datagrams. All but the last
+        // segment in a UDP_SEGMENT burst must be exactly `seg_size`
+        // bytes; the last one may be shorter and ends the batch.
+        // Different destinations or a packet that exceeds the
+        // established segment size also end the batch.
+        for _ in 0..GSO_BURST_PACKETS {
+            let cap = MAX_DATAGRAM_SIZE.min(buf.len() - total);
+            if cap == 0 {
+                break;
+            }
+            let (write, send_info) = match conn.send(&mut buf[total..total + cap]) {
+                Ok(v) => v,
+                Err(quiche::Error::Done) => break,
+                Err(e) => return Err(e).context("QUIC send failed"),
+            };
+
+            // From here on we only need disjoint subslices of `buf`;
+            // no named borrow of `buf` outlives the match arms.
+
+            if let Some(prev) = dst {
+                if prev != send_info.to {
+                    // Path swap mid-burst: commit what we have, send
+                    // the just-written packet on its own, then restart.
+                    if total > 0 {
+                        send_batch(socket, &buf[..total], prev, seg_size, packets)?;
+                    }
+                    socket
+                        .send_to(&buf[total..total + write], send_info.to)
+                        .context("UDP send_to (path swap) failed")?;
+                    continue 'outer;
+                }
+            } else {
+                dst = Some(send_info.to);
+                seg_size = write;
+            }
+
+            if write > seg_size {
+                // Larger than the segment size we already committed
+                // to: cannot extend this burst.
+                if total > 0 {
+                    send_batch(socket, &buf[..total], dst.unwrap(), seg_size, packets)?;
+                }
+                socket
+                    .send_to(&buf[total..total + write], send_info.to)
+                    .context("UDP send_to (oversize) failed")?;
+                continue 'outer;
+            }
+
+            let short_tail = write < seg_size;
+            total += write;
+            packets += 1;
+            if short_tail {
+                // Must be the last segment in a UDP_SEGMENT burst.
+                break;
+            }
+        }
+
+        if total == 0 {
+            break;
+        }
+
+        send_batch(socket, &buf[..total], dst.unwrap(), seg_size, packets)?;
+    }
+
+    Ok(())
+}
+
+/// Send a single batch. Uses `sendmsg(UDP_SEGMENT)` when the batch
+/// contains more than one packet; otherwise falls back to `send_to`.
+/// Disables GSO for the rest of the process on the first kernel
+/// rejection so we don't spam EIO / EINVAL on each subsequent flush.
+#[cfg(target_os = "linux")]
+fn send_batch(
+    socket: &mio::net::UdpSocket,
+    buf: &[u8],
+    dst: std::net::SocketAddr,
+    seg_size: usize,
+    packets: usize,
+) -> Result<()> {
+    if packets <= 1 {
+        socket
+            .send_to(buf, dst)
+            .context("UDP send_to (single) failed")?;
+        return Ok(());
+    }
+
+    match sendmsg_udp_segment(socket, buf, dst, seg_size as u16) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                packets,
+                seg_size,
+                "UDP_SEGMENT send failed; disabling GSO and falling back to per-packet"
+            );
+            use std::sync::atomic::Ordering;
+            GSO_USABLE.store(false, Ordering::Relaxed);
+            // Replay the batch one packet at a time so we don't drop
+            // this flight on the floor.
+            let mut off = 0;
+            while off < buf.len() {
+                let n = seg_size.min(buf.len() - off);
+                socket
+                    .send_to(&buf[off..off + n], dst)
+                    .context("UDP send_to (fallback) failed")?;
+                off += n;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Linux `sendmsg(UDP_SEGMENT)` wrapper. The kernel splits `buf`
+/// into back-to-back datagrams of exactly `seg_size` bytes (the last
+/// may be shorter). Returns the raw OS error on rejection so the
+/// caller can fall back without losing the cause in `tracing`.
+#[cfg(target_os = "linux")]
+fn sendmsg_udp_segment(
+    socket: &mio::net::UdpSocket,
+    buf: &[u8],
+    dst: std::net::SocketAddr,
+    seg_size: u16,
+) -> std::io::Result<()> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::io::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+
+    // Stage dst as sockaddr_storage so we can hand a stable pointer to
+    // sendmsg without caring about v4/v6 at this layer.
+    let mut sa_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let sa_len = match dst {
+        std::net::SocketAddr::V4(v4) => {
+            let sa = unsafe { &mut *(&mut sa_storage as *mut _ as *mut libc::sockaddr_in) };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = v4.port().to_be();
+            sa.sin_addr = libc::in_addr {
+                s_addr: u32::from(*v4.ip()).to_be(),
+            };
+            size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let sa = unsafe { &mut *(&mut sa_storage as *mut _ as *mut libc::sockaddr_in6) };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = v6.port().to_be();
+            sa.sin6_flowinfo = v6.flowinfo();
+            sa.sin6_scope_id = v6.scope_id();
+            sa.sin6_addr.s6_addr = v6.ip().octets();
+            size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    };
+
+    let iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+
+    // Control buffer big enough for one UDP_SEGMENT cmsg.
+    let cmsg_space = unsafe { libc::CMSG_SPACE(size_of::<u16>() as u32) } as usize;
+    let mut cmsg_buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::zeroed(); cmsg_space];
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &mut sa_storage as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = sa_len;
+    msg.msg_iov = &iov as *const _ as *mut _;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space;
+
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(std::io::Error::other("CMSG_FIRSTHDR returned null"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<u16>() as u32) as _;
+        let data = libc::CMSG_DATA(cmsg) as *mut u16;
+        std::ptr::write_unaligned(data, seg_size);
+    }
+
+    let ret = unsafe { libc::sendmsg(fd, &msg, 0) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
