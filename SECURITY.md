@@ -46,6 +46,19 @@ qftp is designed for a workload where:
   grant a peer access to everything that user can read. Run it as an
   unprivileged user dedicated to qftp.
 
+### Trust on first use (TOFU)
+
+`qftp-client --trust-on-first-use` adopts the SSH `known_hosts` trust
+model when neither a `--ca` bundle nor an enterprise PKI is available
+(self-signed dev servers, home LAN). On first connect, the client
+pins the server's leaf-cert SHA-256 fingerprint to
+`~/.qftp/known_hosts`; subsequent connects refuse to continue if the
+fingerprint changes. The trust assumption is identical to SSH's: the
+**first** connection must not be intercepted. The fingerprint check
+runs after the TLS handshake completes, so a determined MitM could
+complete the handshake; the connection is then closed with the SSH-
+style banner. Use `--ca` whenever a real CA chain is available.
+
 ## Out of scope
 
 - Side channels in the BLAKE3 / HMAC implementations (we rely on the

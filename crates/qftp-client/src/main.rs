@@ -10,6 +10,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 mod config;
+mod known_hosts;
 mod repl;
 mod transfer;
 
@@ -45,6 +46,16 @@ struct Args {
     /// Skip server certificate verification. Development only.
     #[arg(long)]
     insecure: bool,
+    /// Pin the server's TLS leaf certificate on first connect
+    /// (SSH-style known_hosts). Subsequent connects refuse to
+    /// continue if the fingerprint changes. Use this instead of
+    /// `--insecure` when there is no CA infrastructure.
+    #[arg(long = "trust-on-first-use", short = 'T')]
+    trust_on_first_use: bool,
+    /// Override the known_hosts file location.
+    /// Defaults to `~/.qftp/known_hosts`.
+    #[arg(long)]
+    known_hosts: Option<PathBuf>,
     #[arg(long, requires = "client_key")]
     client_cert: Option<String>,
     #[arg(long, requires = "client_cert")]
@@ -101,8 +112,15 @@ fn main() -> Result<()> {
         _ => None,
     };
 
+    // TOFU is only meaningful when the user has *not* supplied a CA
+    // bundle. A `--ca` overrides it (we trust the PKI chain). When
+    // TOFU is active we ask quiche to skip its own peer verification
+    // and run the fingerprint check ourselves after the handshake.
+    let tofu_active = args.trust_on_first_use && spec.ca.is_none() && !spec.insecure;
+    let effective_verify_peer = !spec.insecure && !tofu_active;
+
     let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
-        verify_peer: !spec.insecure,
+        verify_peer: effective_verify_peer,
         ca_path: spec.ca.clone(),
         client_cert,
     })?;
@@ -151,6 +169,42 @@ fn main() -> Result<()> {
         }
         if conn.is_closed() {
             anyhow::bail!("Connection closed during handshake");
+        }
+    }
+
+    if tofu_active {
+        let kh_path = args
+            .known_hosts
+            .clone()
+            .or_else(known_hosts::default_path)
+            .context("$HOME is not set; --known-hosts must be provided for TOFU")?;
+        let der = conn
+            .peer_cert()
+            .context("server presented no certificate; cannot pin")?;
+        let seen = known_hosts::fingerprint_hex(der);
+        let kh = known_hosts::KnownHosts::load(&kh_path)?;
+        match kh.lookup(&spec.host, &seen) {
+            known_hosts::Verdict::Match => {
+                tracing::info!(
+                    host = %spec.host,
+                    fingerprint = %format!("sha256:{seen}"),
+                    "TOFU: pinned, matched"
+                );
+            }
+            known_hosts::Verdict::New => {
+                known_hosts::KnownHosts::append_to_file(&kh_path, &spec.host, &seen)?;
+                eprintln!(
+                    "The authenticity of host '{}' can't be established.",
+                    spec.host
+                );
+                eprintln!("Server cert fingerprint is sha256:{seen}");
+                eprintln!("Pinned in {}.", kh_path.display());
+            }
+            known_hosts::Verdict::Mismatch { pinned } => {
+                conn.close(true, 0x0, b"server cert pin mismatch").ok();
+                let _ = flush_egress(&mut conn, &socket);
+                return Err(known_hosts::mismatch_error(&spec.host, &pinned, &seen));
+            }
         }
     }
 
