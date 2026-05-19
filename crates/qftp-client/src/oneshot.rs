@@ -18,6 +18,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, ConnectionSpec, Overrides};
+use crate::session_store;
 use crate::transfer;
 use crate::OneShot;
 
@@ -130,6 +131,26 @@ where
         &mut config,
     )?;
 
+    // 0-RTT session resumption. Wired exactly like the REPL path
+    // (see main.rs); rejected tickets fall back silently to 1-RTT.
+    // This is what makes one-shot bursts like
+    //     for f in *.log; do qftp put "$f" qftp://host/logs/; done
+    // skip the TLS handshake after the first iteration.
+    let ticket_dir = session_store::default_dir();
+    if let Some(dir) = &ticket_dir {
+        if let Some(ticket) = session_store::load(dir, &spec.host) {
+            match conn.set_session(&ticket) {
+                Ok(()) => {
+                    tracing::info!(host = %spec.host, "one-shot: 0-RTT resuming");
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "stale session ticket; falling back to 1-RTT");
+                    let _ = session_store::forget(dir, &spec.host);
+                }
+            }
+        }
+    }
+
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
     poll.registry()
@@ -167,6 +188,15 @@ where
     let _ = send_message(&mut conn, qid, &Request::Quit);
     let _ = stream_send_all(&mut conn, qid, &[], true);
     let _ = flush_egress(&mut conn, &socket);
+
+    // Save the latest session ticket so the *next* one-shot can
+    // 0-RTT-resume. Best-effort: a write failure means the next
+    // invocation pays the 1-RTT cost, nothing worse.
+    if let Some(dir) = &ticket_dir {
+        if let Err(e) = session_store::save(dir, &spec.host, conn.session()) {
+            tracing::warn!(error = ?e, "failed to persist session ticket");
+        }
+    }
 
     Ok(code)
 }
