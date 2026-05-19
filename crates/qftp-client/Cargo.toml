@@ -22,3 +22,9 @@ ring = "0.17"
 blake3 = "1"
 indicatif = "0.18"
 glob = "0.3"
+url = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
