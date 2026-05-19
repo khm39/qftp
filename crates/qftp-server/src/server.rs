@@ -191,7 +191,7 @@ pub fn run(
 
         // 3-5. Per-connection work: streams + sending + egress.
         for ctx in connections.values_mut() {
-            process_readable_streams(ctx, &socket, &users, &metrics, &mut buf)?;
+            process_readable_streams(ctx, &socket, &users, &metrics, &mut rate_limiter, &mut buf)?;
             drive_sending_streams(ctx, &socket, &metrics)?;
             flush_egress(&mut ctx.conn, &socket)?;
         }
@@ -368,10 +368,13 @@ fn send_retry(
 }
 
 /// Try to look up the authenticated user once the handshake is far enough
-/// along that the peer cert is available. Idempotent: returns early if the
-/// connection is already on a non-anonymous user.
+/// along that the peer cert is available. Idempotent: returns early if
+/// the connection is already on something other than the directory's
+/// anonymous record (using Arc pointer equality, so a custom-named
+/// anonymous user is still correctly recognised as "not upgraded yet").
 fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
-    if ctx.user.name != "anonymous" {
+    let anon = users.anonymous();
+    if !Arc::ptr_eq(&ctx.user, &anon) {
         return;
     }
     if !ctx.conn.is_established() {
@@ -384,7 +387,7 @@ fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
         return;
     };
     let resolved = users.lookup(Some(&cn));
-    if resolved.name == ctx.user.name {
+    if Arc::ptr_eq(&resolved, &anon) {
         return;
     }
     info!(peer = %ctx.peer_addr, user = %resolved.name, "upgraded connection to authenticated user");
@@ -420,15 +423,18 @@ enum PendingAction {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_readable_streams(
     ctx: &mut ConnectionContext,
     socket: &mio::net::UdpSocket,
     users: &UserDirectory,
     metrics: &Arc<Metrics>,
+    rate_limiter: &mut RateLimiter,
     tmp: &mut [u8],
 ) -> Result<()> {
     upgrade_user_from_cert(ctx, users);
     let readable: Vec<u64> = ctx.conn.readable().collect();
+    let peer_ip = ctx.peer_addr.ip();
 
     let mut actions: Vec<PendingAction> = Vec::new();
 
@@ -442,7 +448,29 @@ fn process_readable_streams(
             StreamState::ReadingRequest {
                 buf: ref mut stream_buf,
             } => {
-                let req: Option<Request> = recv_message(&mut ctx.conn, stream_id, stream_buf)?;
+                // recv_message can fail on a malformed length prefix or
+                // an oversized frame from a hostile peer. That's a
+                // per-stream problem, not a server-wide one: surface it
+                // to the offender and reap the stream rather than
+                // letting `?` tear down the whole loop.
+                let req: Option<Request> = match recv_message(&mut ctx.conn, stream_id, stream_buf)
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            peer = %ctx.peer_addr,
+                            stream_id,
+                            error = %e,
+                            "malformed request frame; closing stream"
+                        );
+                        actions.push(PendingAction::AclReject {
+                            stream_id,
+                            resp: Response::Err("Malformed request".into()),
+                        });
+                        *state = StreamState::Done;
+                        continue;
+                    }
+                };
                 if let Some(req) = req {
                     metrics.requests_total.fetch_add(1, Ordering::Relaxed);
                     debug!(
@@ -452,6 +480,22 @@ fn process_readable_streams(
                         ?req,
                         "request received"
                     );
+
+                    // Per-request rate limit: token-bucket also gates
+                    // protocol requests on established connections so a
+                    // single accepted peer can't burn the server with
+                    // command floods.
+                    if !rate_limiter.try_consume(peer_ip) {
+                        metrics
+                            .requests_rate_limited
+                            .fetch_add(1, Ordering::Relaxed);
+                        actions.push(PendingAction::AclReject {
+                            stream_id,
+                            resp: Response::Err("Rate limit exceeded".into()),
+                        });
+                        *state = StreamState::Done;
+                        continue;
+                    }
 
                     if let Some(resp) = handler::acl_reject(&ctx.user, &req) {
                         actions.push(PendingAction::AclReject { stream_id, resp });
@@ -569,6 +613,20 @@ fn start_get(
             return Ok(());
         }
     };
+    if !meta.is_file() {
+        // Reject directories (and anything else not a regular file)
+        // before sending FileReady. On Unix open() on a directory
+        // succeeds, so without this check the client would be told to
+        // expect file bytes only to see the later read fail mid-stream.
+        send_message(
+            &mut ctx.conn,
+            stream_id,
+            &Response::Err("Not a regular file".into()),
+        )?;
+        metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
+        ctx.streams.insert(stream_id, StreamState::Done);
+        return Ok(());
+    }
     if meta.len() > MAX_FILE_SIZE {
         send_message(
             &mut ctx.conn,
@@ -631,9 +689,21 @@ fn drive_sending_streams(
             continue;
         }
         // Push as many chunks as the per-stream flow-control window will
-        // accept this iteration. When stream_send returns 0 the stream is
-        // blocked; we drop out and try again next iteration after the
-        // peer's ACKs have reopened capacity.
+        // accept this iteration. When stream_send returns 0 (or Done)
+        // the stream is blocked; we rewind the BufReader by the bytes
+        // we read but couldn't push and try again next iteration after
+        // the peer's ACKs have reopened capacity.
+        //
+        // Zero-length files need an explicit fin-only frame: the loop
+        // body never runs (sent == total_size from the start) and the
+        // peer needs EOF to surface from its read.
+        if *total_size == 0 {
+            let _ = ctx.conn.stream_send(stream_id, &[], true);
+            *finished = true;
+            metrics.downloads_completed.fetch_add(1, Ordering::Relaxed);
+            *state = StreamState::Done;
+            continue;
+        }
         loop {
             if *sent == *total_size {
                 *finished = true;
@@ -653,7 +723,16 @@ fn drive_sending_streams(
                 .conn
                 .stream_send(stream_id, &chunk[..want], chunk_is_last)
             {
-                Ok(0) => break, // blocked, retry next iteration
+                Ok(0) => {
+                    // Blocked: the bytes we read into chunk[..want] are
+                    // about to be dropped on the floor. Rewind so the
+                    // next call re-reads them.
+                    if let Err(e) = reader.seek_relative(-(want as i64)) {
+                        warn!(stream_id, error = %e, "seek failed when stream blocked");
+                        *state = StreamState::Done;
+                    }
+                    break;
+                }
                 Ok(n) => {
                     *sent += n as u64;
                     metrics.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
@@ -671,7 +750,14 @@ fn drive_sending_streams(
                         break;
                     }
                 }
-                Err(quiche::Error::Done) => break,
+                Err(quiche::Error::Done) => {
+                    // Same as Ok(0): blocked. Rewind before bailing.
+                    if let Err(e) = reader.seek_relative(-(want as i64)) {
+                        warn!(stream_id, error = %e, "seek failed on Done");
+                        *state = StreamState::Done;
+                    }
+                    break;
+                }
                 Err(e) => {
                     warn!(stream_id, error = ?e, "stream_send failed during Get");
                     *state = StreamState::Done;

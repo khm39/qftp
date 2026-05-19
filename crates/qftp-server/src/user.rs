@@ -166,7 +166,12 @@ impl UserDirectory {
         let anonymous = match &cfg.anonymous {
             Some(spec) => {
                 let home = resolve_home(spec);
-                std::fs::create_dir_all(&home).ok();
+                std::fs::create_dir_all(&home).with_context(|| {
+                    format!(
+                        "failed to create anonymous home directory {}",
+                        home.display()
+                    )
+                })?;
                 Arc::new(User {
                     name: spec.name.clone(),
                     home,
