@@ -85,6 +85,33 @@ Unauthorized      InvalidRange      Unsupported
 - **Minor changes** are made non-breaking by the use of `#[non_exhaustive]` enums and `#[serde(default)]` fields. New variants and fields are silently ignored by older binaries.
 - The wire format is bincode; field reordering is *not* a minor change.
 
+## 0-RTT session resumption
+
+The server enables QUIC 0-RTT (`Config::enable_early_data`). A client
+that has a fresh session ticket from a previous connect can send
+application data with its first flight, skipping the 1-RTT TLS
+handshake. The client stores tickets at
+`~/.qftp/session-tickets/<host>:<port>.ticket` (mode 0600, 24h TTL)
+and silently falls back to a 1-RTT handshake on rejection.
+
+### Replay protection
+
+A 0-RTT flight is replayable: an attacker who captures the Initial
+packets can resend them to the same server. We therefore split the
+request set:
+
+| Request | 0-RTT? |
+|---|---|
+| `Ls`, `Cd`, `Pwd`, `Stat`, `Get`, `Quit` | Allowed -- read-only / idempotent |
+| `Put`, `Rm`, `Mkdir`, `Rmdir`, `Rename`, `Chmod` | Refused with `ErrorCode::Unsupported` ("Operation requires 1-RTT data") |
+
+The check is `conn.is_in_early_data()` at request-decode time. After
+the handshake completes, every request is allowed; the client's retry
+of a refused mutation transparently goes through under 1-RTT.
+
+The server publishes `qftp_zero_rtt_accepted_total` and
+`qftp_zero_rtt_rejected_total` for visibility.
+
 ## Stateless retry
 
 When the server is started with `--require-retry`, the very first Initial packet from any peer triggers a QUIC RETRY containing an HMAC-signed token committing to `(peer_addr, original_dcid)`. The client transparently resends the Initial with the token attached; the server verifies the HMAC, recovers the original DCID, and only then commits any connection state. The token format is documented inline in [`crates/qftp-server/src/retry.rs`](../crates/qftp-server/src/retry.rs).

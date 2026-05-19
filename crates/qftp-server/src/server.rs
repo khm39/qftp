@@ -42,6 +42,24 @@ use crate::metrics::Metrics;
 use crate::retry::RetryKey;
 use crate::user::{self, UserDirectory};
 
+/// Which Request variants are safe to serve while the connection is
+/// still in the 0-RTT phase. The rule is "read-only / no
+/// side-effects": replays produce identical responses and never
+/// mutate persistent state. Anything that writes or renames is
+/// refused so a captured 0-RTT flight cannot be replayed to put the
+/// server into a different state.
+fn request_is_replay_safe(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Ls { .. }
+            | Request::Cd { .. }
+            | Request::Pwd
+            | Request::Stat { .. }
+            | Request::Get { .. }
+            | Request::Quit,
+    )
+}
+
 const SERVER_TOKEN: Token = Token(0);
 
 /// Static knobs the loop reads on every iteration.
@@ -499,6 +517,28 @@ fn process_readable_streams(
                         });
                         *state = StreamState::Done;
                         continue;
+                    }
+
+                    // 0-RTT replay protection. Any request decoded
+                    // while the QUIC handshake is still in the
+                    // early-data phase rode the first flight, which
+                    // an attacker can replay byte-for-byte. Read-only
+                    // ops are idempotent so we accept them; anything
+                    // that mutates server state is refused with
+                    // `Unsupported` and the client falls back to a
+                    // 1-RTT retry.
+                    if ctx.conn.is_in_early_data() {
+                        if request_is_replay_safe(&req) {
+                            metrics.zero_rtt_accepted.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            metrics.zero_rtt_rejected.fetch_add(1, Ordering::Relaxed);
+                            actions.push(PendingAction::AclReject {
+                                stream_id,
+                                resp: err(ErrorCode::Unsupported, "Operation requires 1-RTT data"),
+                            });
+                            *state = StreamState::Done;
+                            continue;
+                        }
                     }
 
                     if let Some(resp) = handler::acl_reject(&ctx.user, &req) {
@@ -1221,4 +1261,49 @@ fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_safe_allows_readonly_ops() {
+        assert!(request_is_replay_safe(&Request::Ls { path: "/".into() }));
+        assert!(request_is_replay_safe(&Request::Cd { path: "/".into() }));
+        assert!(request_is_replay_safe(&Request::Pwd));
+        assert!(request_is_replay_safe(&Request::Stat { path: "x".into() }));
+        assert!(request_is_replay_safe(&Request::Get {
+            path: "x".into(),
+            offset: 0,
+            length: None,
+        }));
+        assert!(request_is_replay_safe(&Request::Quit));
+    }
+
+    #[test]
+    fn replay_safe_rejects_mutations() {
+        assert!(!request_is_replay_safe(&Request::Put {
+            path: "x".into(),
+            size: 0,
+            mode: 0o644,
+            offset: 0,
+            checksum: Some([0u8; 32]),
+        }));
+        assert!(!request_is_replay_safe(&Request::Rm { path: "x".into() }));
+        assert!(!request_is_replay_safe(&Request::Mkdir {
+            path: "x".into()
+        }));
+        assert!(!request_is_replay_safe(&Request::Rmdir {
+            path: "x".into()
+        }));
+        assert!(!request_is_replay_safe(&Request::Rename {
+            from: "a".into(),
+            to: "b".into(),
+        }));
+        assert!(!request_is_replay_safe(&Request::Chmod {
+            path: "x".into(),
+            mode: 0o644,
+        }));
+    }
 }

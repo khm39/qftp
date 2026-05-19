@@ -12,6 +12,7 @@ use qftp_common::transport::*;
 mod config;
 mod known_hosts;
 mod repl;
+mod session_store;
 mod transfer;
 
 const CLIENT: Token = Token(0);
@@ -56,6 +57,15 @@ struct Args {
     /// Defaults to `~/.qftp/known_hosts`.
     #[arg(long)]
     known_hosts: Option<PathBuf>,
+    /// Disable 0-RTT session resumption. The client will still
+    /// receive new tickets but won't replay them. Useful for
+    /// debugging and when you need to ensure a fresh handshake.
+    #[arg(long, default_value_t = false)]
+    no_zero_rtt: bool,
+    /// Override the session-ticket directory.
+    /// Defaults to `~/.qftp/session-tickets/`.
+    #[arg(long)]
+    session_ticket_dir: Option<PathBuf>,
     #[arg(long, requires = "client_key")]
     client_cert: Option<String>,
     #[arg(long, requires = "client_cert")]
@@ -149,6 +159,33 @@ fn main() -> Result<()> {
         &mut config,
     )?;
 
+    // 0-RTT session resumption. If a fresh ticket exists for this
+    // host:port, hand it to quiche before any I/O so the first
+    // outgoing Initial carries 0-RTT data. A rejected ticket is a
+    // silent fallback to 1-RTT; we delete it so we don't keep
+    // replaying a bad blob.
+    let ticket_dir = args
+        .session_ticket_dir
+        .clone()
+        .or_else(session_store::default_dir);
+    let mut resumed = false;
+    if !args.no_zero_rtt {
+        if let Some(dir) = &ticket_dir {
+            if let Some(ticket) = session_store::load(dir, &spec.host) {
+                match conn.set_session(&ticket) {
+                    Ok(()) => {
+                        resumed = true;
+                        tracing::info!(host = %spec.host, "0-RTT: resuming session");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "stale session ticket; falling back to 1-RTT");
+                        let _ = session_store::forget(dir, &spec.host);
+                    }
+                }
+            }
+        }
+    }
+
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
     poll.registry()
@@ -208,7 +245,11 @@ fn main() -> Result<()> {
         }
     }
 
-    eprintln!("Connected to {}", spec.host);
+    if resumed && conn.is_resumed() {
+        eprintln!("Connected to {} (0-RTT resumed)", spec.host);
+    } else {
+        eprintln!("Connected to {}", spec.host);
+    }
 
     // Determine the source of commands: --execute > --batch/stdin
     // pipeline > interactive TTY.
@@ -281,6 +322,18 @@ fn main() -> Result<()> {
         let _ = send_message(&mut conn, stream_id, &Request::Quit);
         let _ = stream_send_all(&mut conn, stream_id, &[], true);
         let _ = flush_egress(&mut conn, &socket);
+    }
+
+    // Persist the latest session ticket so the next connect can
+    // 0-RTT-resume. `conn.session()` returns the freshest ticket
+    // received during this connection; saving on every clean exit
+    // means we keep the post-handshake-rotated ticket too.
+    if !args.no_zero_rtt {
+        if let Some(dir) = &ticket_dir {
+            if let Err(e) = session_store::save(dir, &spec.host, conn.session()) {
+                tracing::warn!(error = ?e, "failed to persist session ticket");
+            }
+        }
     }
 
     eprintln!("Goodbye.");

@@ -180,6 +180,14 @@ fn apply_common_config(config: &mut quiche::Config) -> Result<()> {
     config.set_initial_max_streams_bidi(4);
     config.set_disable_active_migration(true);
 
+    // 0-RTT resumption. Enabled unconditionally: it costs us nothing
+    // when no session ticket is offered (server falls back to a
+    // normal 1-RTT handshake), and the client gains the option of
+    // resuming if it has a saved ticket. Replay protection for 0-RTT
+    // data is enforced in the per-Request decode path on the server
+    // (write ops refused while `is_in_early_data()`).
+    config.enable_early_data();
+
     Ok(())
 }
 
