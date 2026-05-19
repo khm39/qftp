@@ -64,6 +64,7 @@ jobs:
         run: cargo build --release --workspace --bins --target ${{ matrix.target }}
 
       - name: Package
+        shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
@@ -73,7 +74,14 @@ jobs:
           cp target/${{ matrix.target }}/release/qftp-client "$dir/"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
-          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+          # macOS ships shasum but not coreutils' sha256sum; the Linux
+          # runners are the other way round. Pick whichever is present
+          # so the matrix doesn't fail on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+          else
+            shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

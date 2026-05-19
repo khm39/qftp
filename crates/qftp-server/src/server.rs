@@ -827,9 +827,15 @@ fn drive_one_sender(
         *trailer_offset = 0;
     }
     let bytes = trailer.unwrap();
+    // Push the trailer bytes WITHOUT fin first; we only emit the FIN as
+    // a separate empty frame once all 32 bytes are accepted. quiche's
+    // documented behaviour does keep fin pending across partial writes,
+    // but the explicit fin-only step is the same pattern stream_send_all
+    // uses elsewhere and makes the "stream closes only when the last
+    // byte has been queued" invariant impossible to misread.
     while *trailer_offset < bytes.len() {
         let remaining = &bytes[*trailer_offset..];
-        match ctx.conn.stream_send(stream_id, remaining, true) {
+        match ctx.conn.stream_send(stream_id, remaining, false) {
             Ok(0) => return SendOutcome::Blocked,
             Ok(n) => {
                 *trailer_offset += n;
@@ -840,6 +846,14 @@ fn drive_one_sender(
                 warn!(stream_id, error = ?e, "stream_send for trailer failed");
                 return SendOutcome::Failed;
             }
+        }
+    }
+    // All 32 trailer bytes are queued -- emit the FIN.
+    match ctx.conn.stream_send(stream_id, &[], true) {
+        Ok(_) | Err(quiche::Error::Done) => {}
+        Err(e) => {
+            warn!(stream_id, error = ?e, "stream_send for trailer FIN failed");
+            return SendOutcome::Failed;
         }
     }
 
@@ -931,7 +945,7 @@ fn start_put(
             );
         }
         let mut hasher = blake3::Hasher::new();
-        let mut existing = match File::open(&temp_path) {
+        let mut existing = match open_existing_no_follow(&temp_path) {
             Ok(f) => f,
             Err(e) => {
                 return send_err(
@@ -957,7 +971,7 @@ fn start_put(
                 }
             }
         }
-        let f = match std::fs::OpenOptions::new().append(true).open(&temp_path) {
+        let f = match open_append_no_follow(&temp_path) {
             Ok(f) => f,
             Err(e) => {
                 return send_err(
@@ -1141,6 +1155,50 @@ fn apply_mode(_path: &Path, _mode: u32) {}
 fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
+/// Reopen an existing temp file for read-only rehashing on the Put
+/// resume path. O_NOFOLLOW so a swapped-in symlink can't redirect us
+/// to read arbitrary files; also assert it's a regular file before
+/// accepting it.
+fn open_existing_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::io::{Error, ErrorKind};
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "resume temp is not a regular file (symlink or directory?)",
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
+/// Reopen an existing temp file for append on the Put resume path.
+/// Same O_NOFOLLOW + regular-file requirement as `open_existing_no_follow`.
+fn open_append_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::io::{Error, ErrorKind};
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "resume temp is not a regular file (symlink or directory?)",
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

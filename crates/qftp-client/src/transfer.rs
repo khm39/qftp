@@ -93,6 +93,7 @@ pub fn do_get(
     let mut tmp = [0u8; CHUNK];
 
     let want_trailer = if checksum_follows { 32 } else { 0 };
+    let mut stream_finished = false;
 
     while received < size || trailer.len() < want_trailer {
         poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
@@ -101,7 +102,7 @@ pub fn do_get(
 
         loop {
             match conn.stream_recv(stream_id, &mut tmp) {
-                Ok((len, _fin)) => {
+                Ok((len, fin)) => {
                     if received < size {
                         let body_room = (size - received) as usize;
                         let body_take = body_room.min(len);
@@ -117,12 +118,29 @@ pub fn do_get(
                     } else {
                         trailer.extend_from_slice(&tmp[..len]);
                     }
+                    if fin {
+                        stream_finished = true;
+                    }
                 }
                 Err(quiche::Error::Done) => break,
                 Err(e) => bail!("stream_recv: {e}"),
             }
         }
         flush_egress(conn, socket)?;
+
+        // If the server FIN'd the stream early without delivering the
+        // full body + trailer, don't sit and spin waiting for bytes
+        // that will never come.
+        if stream_finished && (received < size || trailer.len() < want_trailer) {
+            let _ = std::fs::remove_file(local);
+            bail!(
+                "server closed stream early: got {}/{} body bytes and {}/{} trailer bytes",
+                received,
+                size,
+                trailer.len(),
+                want_trailer
+            );
+        }
 
         if conn.is_closed() && (received < size || trailer.len() < want_trailer) {
             bail!("connection closed during download");

@@ -62,7 +62,7 @@ server -> client : Response::Ok | Response::Err(...)
 ```
 
 - `size` is the number of body bytes the client is about to send (post-offset).
-- `offset` enables append-style resume. When `offset > 0` the server validates that an existing `.qftp.partial.<pid>.<stream>` file already has exactly that many bytes; if not, it returns `ErrorCode::InvalidRange`.
+- `offset` enables append-style resume. When `offset > 0` the server validates that an existing temp file already has exactly that many bytes; if not, it returns `ErrorCode::InvalidRange`. The temp lives next to the eventual destination so the final `rename` is atomic, and is named `<final-filename>.qftp.partial.<server-pid>.<stream-id>` (e.g. uploading `dump.bin` from stream 4 of server pid 17654 lands at `dump.bin.qftp.partial.17654.4` first).
 - `checksum` (BLAKE3 of the full file, not just the bytes being sent this round) is verified after the last byte. On mismatch the temp is left for the Drop cleanup and the response carries `ErrorCode::ChecksumMismatch`.
 
 Upon success, the server `rename`s the temp into place atomically and applies `mode` (Unix only).
