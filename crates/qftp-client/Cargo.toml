@@ -1,7 +1,13 @@
 [package]
 name = "qftp-client"
-version = "0.1.0"
-edition = "2021"
+description = "QUIC File Transfer Protocol -- client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 qftp-common = { path = "../qftp-common" }
@@ -13,3 +19,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 rustyline = "15"
 ring = "0.17"
+blake3 = "1"
+indicatif = "0.18"
+glob = "0.3"

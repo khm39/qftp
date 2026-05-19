@@ -4,6 +4,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use qftp_common::protocol::{DirEntry, ErrorCode, ErrorResponse, FileStat, Request, Response};
+
+use crate::user::{Op, User};
+
 /// Read a file's mode where the OS exposes one (Unix), and synthesize a
 /// generous default elsewhere so listings still round-trip.
 #[cfg(unix)]
@@ -22,33 +26,40 @@ fn set_mode(target: &Path, mode: u32) -> Response {
     let perms = fs::Permissions::from_mode(mode);
     match fs::set_permissions(target, perms) {
         Ok(()) => Response::Ok,
-        Err(e) => Response::Err(format!("chmod failed: {e}")),
+        Err(e) => err(ErrorCode::Internal, format!("chmod failed: {e}")),
     }
 }
 #[cfg(not(unix))]
 fn set_mode(_target: &Path, _mode: u32) -> Response {
-    Response::Err("chmod is not supported on this platform".into())
+    err(
+        ErrorCode::Unsupported,
+        "chmod is not supported on this platform",
+    )
 }
 
-use qftp_common::protocol::{DirEntry, FileStat, Request, Response};
+/// Shorthand for constructing an `Err` response with a code + message.
+pub fn err(code: ErrorCode, msg: impl Into<String>) -> Response {
+    Response::Err(ErrorResponse::new(code, msg))
+}
 
-use crate::user::{Op, User};
+/// Map a std::io::Error to the closest ErrorCode.
+pub fn io_code(e: &std::io::Error) -> ErrorCode {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        NotFound => ErrorCode::NotFound,
+        PermissionDenied => ErrorCode::PermissionDenied,
+        AlreadyExists => ErrorCode::AlreadyExists,
+        _ => ErrorCode::Internal,
+    }
+}
 
 /// Walk a user-supplied path from `cwd` (or `root` when absolute) one
 /// component at a time, manually handling `.` and `..` and rejecting any
 /// component that would either escape `root` or follow a symbolic link.
 ///
-/// This is a conservative substitute for `openat2(RESOLVE_BENEATH)`: it
-/// forecloses both the "symlink under root points outside root" leak and
-/// the TOCTOU window where a symlink could be swapped between
-/// canonicalize() and the subsequent open(). The trade-off is that
-/// legitimate symlinks anywhere in the path are also refused, which is
-/// acceptable for Phase 1.
-///
-/// Returns the absolute, symlink-free path. Nonexistent leaves are not
-/// rejected -- callers (`resolve` vs `resolve_parent`) decide whether the
-/// final component must already exist.
-fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String> {
+/// See the docs in Phase 1 for the rationale. Returns the resolved path
+/// or a structured ErrorResponse with the right code.
+fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, ErrorResponse> {
     let p = Path::new(user_path);
     let mut current = if p.is_absolute() {
         root.to_path_buf()
@@ -64,13 +75,22 @@ fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String
             Component::CurDir => {}
             Component::ParentDir => {
                 if current == *root {
-                    return Err("Permission denied: path outside root".into());
+                    return Err(ErrorResponse::new(
+                        ErrorCode::PermissionDenied,
+                        "path outside root",
+                    ));
                 }
                 if !current.pop() {
-                    return Err("Permission denied: path outside root".into());
+                    return Err(ErrorResponse::new(
+                        ErrorCode::PermissionDenied,
+                        "path outside root",
+                    ));
                 }
                 if !current.starts_with(root) {
-                    return Err("Permission denied: path outside root".into());
+                    return Err(ErrorResponse::new(
+                        ErrorCode::PermissionDenied,
+                        "path outside root",
+                    ));
                 }
             }
             Component::Normal(name) => {
@@ -78,58 +98,70 @@ fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String
                 match std::fs::symlink_metadata(&current) {
                     Ok(meta) => {
                         if meta.file_type().is_symlink() {
-                            return Err(format!(
-                                "Permission denied: symlink not allowed in path ({})",
-                                current.display()
+                            return Err(ErrorResponse::new(
+                                ErrorCode::PermissionDenied,
+                                format!("symlink not allowed in path ({})", current.display()),
                             ));
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // OK: the leaf may not exist yet (resolve_parent
-                        // relies on this). Keep walking so we still reject
-                        // subsequent symlink components above the missing
-                        // leaf, if any.
+                        // OK: the leaf may not exist yet.
                     }
-                    Err(e) => return Err(format!("Failed to stat path component: {e}")),
+                    Err(e) => {
+                        return Err(ErrorResponse::new(
+                            ErrorCode::Internal,
+                            format!("Failed to stat path component: {e}"),
+                        ));
+                    }
                 }
             }
             Component::Prefix(_) => {
-                return Err("Permission denied: invalid path prefix".into());
+                return Err(ErrorResponse::new(
+                    ErrorCode::Malformed,
+                    "invalid path prefix",
+                ));
             }
         }
     }
 
     if !current.starts_with(root) {
-        return Err("Permission denied: path outside root".into());
+        return Err(ErrorResponse::new(
+            ErrorCode::PermissionDenied,
+            "path outside root",
+        ));
     }
 
     Ok(current)
 }
 
-/// Resolve a user-supplied path that must already exist. The returned path
-/// is absolute, contained in `root`, and free of symlink components.
-pub fn resolve(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String> {
+/// Resolve a user-supplied path that must already exist.
+pub fn resolve(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, ErrorResponse> {
     let path = walk_safe(cwd, root, user_path)?;
     if !path.exists() {
-        return Err(format!("No such file or directory: {}", path.display()));
+        return Err(ErrorResponse::new(
+            ErrorCode::NotFound,
+            format!("No such file or directory: {}", path.display()),
+        ));
     }
     Ok(path)
 }
 
-/// Resolve a path whose final component may not exist yet (mkdir target,
-/// rename destination, Put target). The parent directory must exist.
-pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, String> {
+/// Resolve a path whose final component may not exist yet.
+pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, ErrorResponse> {
     let path = walk_safe(cwd, root, user_path)?;
-    let parent = path.parent().ok_or_else(|| "Invalid path".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ErrorResponse::new(ErrorCode::Malformed, "invalid path: no parent"))?;
     if !parent.is_dir() {
-        return Err(format!("Parent directory not found: {}", parent.display()));
+        return Err(ErrorResponse::new(
+            ErrorCode::NotFound,
+            format!("Parent directory not found: {}", parent.display()),
+        ));
     }
     Ok(path)
 }
 
-/// Required permission for a given request. Returns None for requests
-/// that don't need an ACL check (Pwd, Cd, Quit) -- Cd is a navigation,
-/// not a read of file contents, so we don't gate it on `read`.
+/// Required permission for a given request.
 fn required_op(req: &Request) -> Option<Op> {
     match req {
         Request::Pwd | Request::Cd { .. } | Request::Quit => None,
@@ -140,26 +172,23 @@ fn required_op(req: &Request) -> Option<Op> {
         Request::Rm { .. } => Some(Op::Delete),
         Request::Rename { .. } => Some(Op::Rename),
         Request::Chmod { .. } => Some(Op::Chmod),
+        _ => Some(Op::Read),
     }
 }
 
-/// Returns Some(err response) when the user doesn't have the permission
-/// the request needs. Callers should short-circuit on Some.
 pub fn acl_reject(user: &User, req: &Request) -> Option<Response> {
     let op = required_op(req)?;
     if user.permissions.allows(op) {
         None
     } else {
-        Some(Response::Err(format!(
-            "Permission denied: user '{}' is not allowed to {:?}",
-            user.name, op
-        )))
+        Some(err(
+            ErrorCode::PermissionDenied,
+            format!("user '{}' is not allowed to {:?}", user.name, op),
+        ))
     }
 }
 
 /// Handle a single FTP request, returning the appropriate response.
-/// Mutates `cwd` when a Cd command succeeds. `root` is the per-user home
-/// (not the global server root): a user can never `cd` above it.
 pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response {
     match req {
         Request::Pwd => {
@@ -171,7 +200,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         Request::Cd { path } => match resolve(cwd, root, path) {
             Ok(target) => {
                 if !target.is_dir() {
-                    Response::Err(format!("Not a directory: {path}"))
+                    err(ErrorCode::NotADirectory, format!("Not a directory: {path}"))
                 } else {
                     *cwd = target;
                     Response::Ok
@@ -194,11 +223,11 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                         for entry in entries {
                             let entry = match entry {
                                 Ok(e) => e,
-                                Err(e) => return Response::Err(format!("Read dir error: {e}")),
+                                Err(e) => return err(io_code(&e), format!("Read dir error: {e}")),
                             };
                             let meta = match entry.metadata() {
                                 Ok(m) => m,
-                                Err(e) => return Response::Err(format!("Metadata error: {e}")),
+                                Err(e) => return err(io_code(&e), format!("Metadata error: {e}")),
                             };
                             let modified = meta
                                 .modified()
@@ -217,7 +246,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                         listing.sort_by(|a, b| a.name.cmp(&b.name));
                         Response::DirListing(listing)
                     }
-                    Err(e) => Response::Err(format!("Cannot list directory: {e}")),
+                    Err(e) => err(io_code(&e), format!("Cannot list directory: {e}")),
                 },
                 Err(e) => Response::Err(e),
             }
@@ -226,7 +255,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         Request::Mkdir { path } => match resolve_parent(cwd, root, path) {
             Ok(target) => match fs::create_dir(&target) {
                 Ok(()) => Response::Ok,
-                Err(e) => Response::Err(format!("mkdir failed: {e}")),
+                Err(e) => err(io_code(&e), format!("mkdir failed: {e}")),
             },
             Err(e) => Response::Err(e),
         },
@@ -234,7 +263,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         Request::Rmdir { path } => match resolve(cwd, root, path) {
             Ok(target) => match fs::remove_dir(&target) {
                 Ok(()) => Response::Ok,
-                Err(e) => Response::Err(format!("rmdir failed: {e}")),
+                Err(e) => err(io_code(&e), format!("rmdir failed: {e}")),
             },
             Err(e) => Response::Err(e),
         },
@@ -242,7 +271,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         Request::Rm { path } => match resolve(cwd, root, path) {
             Ok(target) => match fs::remove_file(&target) {
                 Ok(()) => Response::Ok,
-                Err(e) => Response::Err(format!("rm failed: {e}")),
+                Err(e) => err(io_code(&e), format!("rm failed: {e}")),
             },
             Err(e) => Response::Err(e),
         },
@@ -258,7 +287,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             };
             match fs::rename(&src, &dst) {
                 Ok(()) => Response::Ok,
-                Err(e) => Response::Err(format!("rename failed: {e}")),
+                Err(e) => err(io_code(&e), format!("rename failed: {e}")),
             }
         }
 
@@ -283,14 +312,16 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                         mode: mode_of(&meta),
                     })
                 }
-                Err(e) => Response::Err(format!("stat failed: {e}")),
+                Err(e) => err(io_code(&e), format!("stat failed: {e}")),
             },
             Err(e) => Response::Err(e),
         },
 
-        Request::Get { .. } | Request::Put { .. } | Request::Quit => {
-            Response::Err("Unexpected command".into())
-        }
+        Request::Get { .. } | Request::Put { .. } | Request::Quit => err(
+            ErrorCode::Malformed,
+            "unexpected command on simple-handler path",
+        ),
+        _ => err(ErrorCode::Unsupported, "request variant not understood"),
     }
 }
 
@@ -303,7 +334,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Build a temporary root with one regular file and one nested dir.
     fn setup_root() -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -330,39 +360,28 @@ mod tests {
     #[test]
     fn resolve_rejects_parent_escape() {
         let (_dir, root) = setup_root();
-        // walk_safe processes `..` manually -- with cwd == root it refuses
-        // to pop above root rather than ever touching the filesystem.
-        let err = resolve(&root, &root, "../etc/passwd").unwrap_err();
-        assert!(
-            err.contains("outside root"),
-            "expected outside-root rejection, got: {err}"
-        );
+        let e = resolve(&root, &root, "../etc/passwd").unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert!(e.message.contains("outside root"));
     }
 
     #[test]
     fn resolve_rejects_existing_path_outside_root() {
         let (_dir, root) = setup_root();
-        // Absolute path starting with `/` is reinterpreted as relative to
-        // root; the first `..` then tries to escape root and is refused.
-        let err = resolve(&root, &root, "/../../../../../../tmp").unwrap_err();
-        assert!(
-            err.contains("outside root"),
-            "expected outside-root rejection, got: {err}"
-        );
+        let e = resolve(&root, &root, "/../../../../../../tmp").unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
     }
 
     #[test]
-    fn resolve_missing_file_errors() {
+    fn resolve_missing_file_errors_with_not_found() {
         let (_dir, root) = setup_root();
-        let err = resolve(&root, &root, "does-not-exist").unwrap_err();
-        assert!(err.contains("No such"));
+        let e = resolve(&root, &root, "does-not-exist").unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
     }
 
     #[test]
     fn resolve_parent_allows_nonexistent_leaf() {
         let (_dir, root) = setup_root();
-        // The parent (root) exists, the leaf does not -- resolve_parent should
-        // still succeed because mkdir/put need to create the leaf.
         let resolved = resolve_parent(&root, &root, "new-file.txt").unwrap();
         assert_eq!(resolved, root.join("new-file.txt"));
     }
@@ -370,8 +389,25 @@ mod tests {
     #[test]
     fn resolve_parent_rejects_missing_parent_dir() {
         let (_dir, root) = setup_root();
-        let err = resolve_parent(&root, &root, "no/such/parent/leaf").unwrap_err();
-        assert!(err.contains("Parent directory not found"));
+        let e = resolve_parent(&root, &root, "no/such/parent/leaf").unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn resolve_rejects_symlink_pointing_outside_root() {
+        let (_dir, root) = setup_root();
+        std::os::unix::fs::symlink("/tmp", root.join("escape")).unwrap();
+        let e = resolve(&root, &root, "escape").unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert!(e.message.contains("symlink"));
+    }
+
+    #[test]
+    fn resolve_rejects_symlink_pointing_inside_root() {
+        let (_dir, root) = setup_root();
+        std::os::unix::fs::symlink(root.join("file.txt"), root.join("link.txt")).unwrap();
+        let e = resolve(&root, &root, "link.txt").unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
     }
 
     #[test]
@@ -384,36 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_symlink_pointing_outside_root() {
-        let (_dir, root) = setup_root();
-        // Create symlink root/escape -> /tmp (outside root)
-        std::os::unix::fs::symlink("/tmp", root.join("escape")).unwrap();
-        let err = resolve(&root, &root, "escape").unwrap_err();
-        // walk_safe walks the user path component-wise and uses
-        // symlink_metadata, so it rejects the symlink itself before any
-        // dereference happens -- expect the explicit symlink message.
-        assert!(
-            err.contains("symlink not allowed"),
-            "expected symlink rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_rejects_symlink_pointing_inside_root() {
-        let (_dir, root) = setup_root();
-        // Create a symlink under root that points to another path under
-        // root. canonicalize succeeds and stays inside root, but the
-        // symlink-component check must still reject it to avoid TOCTOU.
-        std::os::unix::fs::symlink(root.join("file.txt"), root.join("link.txt")).unwrap();
-        let err = resolve(&root, &root, "link.txt").unwrap_err();
-        assert!(
-            err.contains("symlink not allowed"),
-            "expected symlink rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn cd_into_file_is_rejected() {
+    fn cd_into_file_is_rejected_with_not_a_directory() {
         let (_dir, root) = setup_root();
         let mut cwd = root.clone();
         let resp = handle_request(
@@ -423,7 +430,10 @@ mod tests {
             &mut cwd,
             &root,
         );
-        assert!(matches!(resp, Response::Err(_)));
+        match resp {
+            Response::Err(e) => assert_eq!(e.code, ErrorCode::NotADirectory),
+            other => panic!("expected NotADirectory error, got {other:?}"),
+        }
         assert_eq!(cwd, root);
     }
 }

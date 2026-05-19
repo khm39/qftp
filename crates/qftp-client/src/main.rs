@@ -1,7 +1,6 @@
-use std::fs;
+use std::io::{BufRead, IsTerminal};
 use std::net::UdpSocket;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -11,6 +10,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 mod repl;
+mod transfer;
 
 const CLIENT: Token = Token(0);
 
@@ -19,89 +19,27 @@ const CLIENT: Token = Token(0);
 struct Args {
     #[arg(long, default_value = "127.0.0.1:4433")]
     host: String,
-    /// SNI name expected on the server certificate. Defaults to "localhost"
-    /// to match the server's self-signed development cert.
     #[arg(long, default_value = "localhost")]
     server_name: String,
-    /// Path to a PEM CA bundle used to verify the server certificate.
-    /// When omitted the system trust store is used.
     #[arg(long)]
     ca: Option<String>,
-    /// Disable server certificate verification. Required when talking to
-    /// the dev server (self-signed cert). Refuse to run in production.
     #[arg(long, default_value_t = false)]
     insecure: bool,
-    /// Path to a PEM client certificate. Required by servers that enforce
-    /// mTLS (`qftp-server --client-ca <ca>`).
     #[arg(long, requires = "client_key")]
     client_cert: Option<String>,
-    /// Path to the PEM private key matching --client-cert.
     #[arg(long, requires = "client_cert")]
     client_key: Option<String>,
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    loop {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
-
-        match recv_message::<Response>(conn, stream_id, &mut buf)? {
-            Some(resp) => {
-                flush_egress(conn, socket)?;
-                return Ok(resp);
-            }
-            None => {
-                flush_egress(conn, socket)?;
-            }
-        }
-
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed");
-        }
-    }
-}
-
-fn poll_file_data(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-    size: u64,
-) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    loop {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
-
-        let mut tmp = [0u8; STREAM_BUF_SIZE];
-        loop {
-            match conn.stream_recv(stream_id, &mut tmp) {
-                Ok((len, _fin)) => data.extend_from_slice(&tmp[..len]),
-                Err(quiche::Error::Done) => break,
-                Err(e) => anyhow::bail!("Stream recv error: {}", e),
-            }
-        }
-
-        flush_egress(conn, socket)?;
-
-        if data.len() as u64 >= size {
-            data.truncate(size as usize);
-            return Ok(data);
-        }
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed during file transfer");
-        }
-    }
+    /// Run a single command non-interactively and exit. Repeatable.
+    #[arg(long = "execute", short = 'e')]
+    execute: Vec<String>,
+    /// Read commands from stdin (one per line) instead of opening an
+    /// interactive REPL. Useful for scripted batch transfers.
+    #[arg(long, default_value_t = false)]
+    batch: bool,
+    /// Path to the command history file. Defaults to
+    /// `~/.qftp_history`.
+    #[arg(long)]
+    history: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -129,16 +67,12 @@ fn main() -> Result<()> {
     })?;
 
     let peer_addr = args.host.parse().context("failed to parse host address")?;
-
     let std_socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
     std_socket.set_nonblocking(true)?;
     std_socket.connect(peer_addr)?;
-
     let local_addr = std_socket.local_addr()?;
-
     let mut socket = mio::net::UdpSocket::from_std(std_socket);
 
-    // Generate connection ID
     let rng = ring::rand::SystemRandom::new();
     let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
     use ring::rand::SecureRandom;
@@ -155,11 +89,9 @@ fn main() -> Result<()> {
 
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
-
     poll.registry()
         .register(&mut socket, CLIENT, Interest::READABLE)?;
 
-    // Perform handshake
     flush_egress(&mut conn, &socket)?;
     loop {
         poll.poll(
@@ -178,112 +110,400 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("Connected to {}", args.host);
+    eprintln!("Connected to {}", args.host);
 
-    let mut rl = rustyline::DefaultEditor::new()?;
-    // QUIC client-initiated bidirectional streams use IDs 0, 4, 8, ...
-    // (stream_id % 4 == 0). Each command uses a fresh stream.
+    // Determine the source of commands: --execute > --batch/stdin
+    // pipeline > interactive TTY.
     let mut next_stream_id: u64 = 0;
+    let mut quit_requested = false;
 
+    if !args.execute.is_empty() {
+        for line in &args.execute {
+            if quit_requested {
+                break;
+            }
+            run_one_line(
+                line,
+                &mut conn,
+                &socket,
+                &mut poll,
+                &mut events,
+                &mut next_stream_id,
+                &mut quit_requested,
+            )?;
+        }
+    } else if args.batch || !std::io::stdin().is_terminal() {
+        let stdin = std::io::stdin();
+        let handle = stdin.lock();
+        for line in handle.lines() {
+            if quit_requested {
+                break;
+            }
+            let line = line.context("reading stdin")?;
+            run_one_line(
+                &line,
+                &mut conn,
+                &socket,
+                &mut poll,
+                &mut events,
+                &mut next_stream_id,
+                &mut quit_requested,
+            )?;
+        }
+    } else {
+        run_interactive(
+            &args,
+            &mut conn,
+            &socket,
+            &mut poll,
+            &mut events,
+            &mut next_stream_id,
+        )?;
+    }
+
+    if !quit_requested {
+        // Try a polite Quit so the server logs a clean close.
+        let stream_id = take_stream(&mut next_stream_id);
+        let _ = send_message(&mut conn, stream_id, &Request::Quit);
+        let _ = stream_send_all(&mut conn, stream_id, &[], true);
+        let _ = flush_egress(&mut conn, &socket);
+    }
+
+    eprintln!("Goodbye.");
+    Ok(())
+}
+
+fn run_interactive(
+    args: &Args,
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next_stream_id: &mut u64,
+) -> Result<()> {
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let hist_path = history_path(args);
+    if let Some(p) = &hist_path {
+        let _ = rl.load_history(p);
+    }
+    let mut quit = false;
     loop {
+        if quit {
+            break;
+        }
         let line = match rl.readline("qftp> ") {
             Ok(l) => l,
             Err(
                 rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
             ) => break,
             Err(e) => {
-                println!("Error: {}", e);
+                println!("readline error: {e}");
                 break;
             }
         };
         let _ = rl.add_history_entry(&line);
+        run_one_line(&line, conn, socket, poll, events, next_stream_id, &mut quit)?;
+    }
+    if let Some(p) = hist_path {
+        let _ = rl.save_history(&p);
+    }
+    Ok(())
+}
 
-        let cmd = match repl::parse_command(&line) {
-            Some(c) => c,
-            None => continue,
-        };
+fn history_path(args: &Args) -> Option<PathBuf> {
+    if let Some(p) = &args.history {
+        return Some(p.clone());
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".qftp_history"))
+}
 
-        let stream_id = next_stream_id;
-        next_stream_id += 4;
+fn run_one_line(
+    line: &str,
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next_stream_id: &mut u64,
+    quit_out: &mut bool,
+) -> Result<()> {
+    let cmd = match repl::parse_command(line) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
 
-        match cmd {
-            repl::Command::Remote(ref req) => {
-                let is_quit = matches!(req, Request::Quit);
-                send_message(&mut conn, stream_id, req)?;
-                stream_send_all(&mut conn, stream_id, &[], true)?;
-                flush_egress(&mut conn, &socket)?;
-                let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
-                repl::display_response(&resp);
-                if is_quit {
-                    break;
-                }
+    match cmd {
+        repl::Command::Remote(req) => {
+            let is_quit = matches!(req, Request::Quit);
+            let stream_id = take_stream(next_stream_id);
+            send_message(conn, stream_id, &req)?;
+            stream_send_all(conn, stream_id, &[], true)?;
+            flush_egress(conn, socket)?;
+            let resp = poll_response(conn, socket, poll, events, stream_id)?;
+            repl::display_response(&resp);
+            if is_quit {
+                *quit_out = true;
             }
-            repl::Command::Get { remote, local } => {
-                let req = Request::Get {
-                    path: remote.clone(),
-                };
-                send_message(&mut conn, stream_id, &req)?;
-                stream_send_all(&mut conn, stream_id, &[], true)?;
-                flush_egress(&mut conn, &socket)?;
-
-                let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
-                match resp {
-                    Response::FileReady { size } => {
-                        let local_path = local.unwrap_or_else(|| {
-                            Path::new(&remote)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string()
-                        });
-                        println!("Downloading {} ({} bytes)...", local_path, size);
-                        let data = poll_file_data(
-                            &mut conn,
-                            &socket,
-                            &mut poll,
-                            &mut events,
-                            stream_id,
-                            size,
-                        )?;
-                        fs::write(&local_path, &data)?;
-                        println!("Downloaded {} bytes to {}", data.len(), local_path);
-                    }
-                    Response::Err(e) => println!("Error: {}", e),
-                    other => println!("Unexpected response: {:?}", other),
-                }
-            }
-            repl::Command::Put { local, remote } => {
-                let file_data = match fs::read(&local) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        println!("Error reading {}: {}", local, e);
-                        continue;
-                    }
-                };
-                let meta = fs::metadata(&local)?;
-                let mode = meta.permissions().mode();
-                let remote_path = remote.unwrap_or_else(|| {
-                    Path::new(&local)
+        }
+        repl::Command::Get {
+            remote,
+            local,
+            recursive,
+        } => {
+            if recursive {
+                do_recursive_get(conn, socket, poll, events, next_stream_id, &remote, local)?;
+            } else {
+                let stream_id = take_stream(next_stream_id);
+                let local_path = local.map(PathBuf::from).unwrap_or_else(|| {
+                    Path::new(&remote)
                         .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(remote.clone()))
                 });
-                let req = Request::Put {
-                    path: remote_path.clone(),
-                    size: file_data.len() as u64,
-                    mode,
-                };
-                send_message(&mut conn, stream_id, &req)?;
-                stream_send_all(&mut conn, stream_id, &file_data, true)?;
-                flush_egress(&mut conn, &socket)?;
-                println!("Uploading {} ({} bytes)...", remote_path, file_data.len());
-                let resp = poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)?;
-                repl::display_response(&resp);
+                if let Err(e) =
+                    transfer::do_get(conn, socket, poll, events, stream_id, &remote, &local_path)
+                {
+                    println!("get failed: {e}");
+                }
+            }
+        }
+        repl::Command::Put {
+            local,
+            remote,
+            recursive,
+        } => {
+            // Expand local glob first (recursive or not).
+            let locals = expand_glob(&local);
+            if locals.is_empty() {
+                println!("no local files match {local}");
+                return Ok(());
+            }
+            if recursive {
+                for path in locals {
+                    let remote_root = remote.clone().unwrap_or_else(|| {
+                        path.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| ".".to_string())
+                    });
+                    if let Err(e) = do_recursive_put(
+                        conn,
+                        socket,
+                        poll,
+                        events,
+                        next_stream_id,
+                        &path,
+                        &remote_root,
+                    ) {
+                        println!("put -r {} failed: {e}", path.display());
+                    }
+                }
+            } else {
+                for path in locals {
+                    let stream_id = take_stream(next_stream_id);
+                    let target = remote.clone().unwrap_or_else(|| {
+                        path.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "uploaded".to_string())
+                    });
+                    if let Err(e) =
+                        transfer::do_put(conn, socket, poll, events, stream_id, &path, &target, 0)
+                    {
+                        println!("put {} failed: {e}", path.display());
+                    }
+                }
             }
         }
     }
+    Ok(())
+}
 
-    println!("Goodbye.");
+fn take_stream(next: &mut u64) -> u64 {
+    let cur = *next;
+    *next += 4;
+    cur
+}
+
+fn expand_glob(pattern: &str) -> Vec<PathBuf> {
+    match glob::glob(pattern) {
+        Ok(paths) => paths.filter_map(|p| p.ok()).collect(),
+        Err(_) => vec![PathBuf::from(pattern)],
+    }
+}
+
+fn poll_response(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    stream_id: u64,
+) -> Result<Response> {
+    let mut buf = Vec::new();
+    loop {
+        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
+        conn.on_timeout();
+        handle_ingress(conn, socket, &mut [0u8; 65535])?;
+
+        match recv_message::<Response>(conn, stream_id, &mut buf)? {
+            Some(resp) => {
+                flush_egress(conn, socket)?;
+                return Ok(resp);
+            }
+            None => {
+                flush_egress(conn, socket)?;
+            }
+        }
+        if conn.is_closed() {
+            anyhow::bail!("Connection closed");
+        }
+    }
+}
+
+/// Walk the remote directory tree, downloading every file under `remote`
+/// into `local_root`. The remote layout is preserved relative to
+/// `remote`.
+fn do_recursive_get(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next_stream_id: &mut u64,
+    remote: &str,
+    local_root: Option<String>,
+) -> Result<()> {
+    let local_root = local_root.map(PathBuf::from).unwrap_or_else(|| {
+        Path::new(remote)
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(remote))
+    });
+    std::fs::create_dir_all(&local_root).ok();
+
+    // BFS via Ls.
+    let mut queue: Vec<(String, PathBuf)> = vec![(remote.to_string(), local_root.clone())];
+    while let Some((rdir, ldir)) = queue.pop() {
+        let stream_id = take_stream(next_stream_id);
+        let req = Request::Ls { path: rdir.clone() };
+        send_message(conn, stream_id, &req)?;
+        stream_send_all(conn, stream_id, &[], true)?;
+        flush_egress(conn, socket)?;
+        let resp = poll_response(conn, socket, poll, events, stream_id)?;
+        let entries = match resp {
+            Response::DirListing(e) => e,
+            Response::Err(e) => {
+                repl::display_error(&e);
+                continue;
+            }
+            other => {
+                println!("unexpected response listing {rdir}: {other:?}");
+                continue;
+            }
+        };
+        std::fs::create_dir_all(&ldir).ok();
+        for entry in entries {
+            let remote_child = if rdir.ends_with('/') {
+                format!("{rdir}{}", entry.name)
+            } else {
+                format!("{rdir}/{}", entry.name)
+            };
+            let local_child = ldir.join(&entry.name);
+            if entry.is_dir {
+                queue.push((remote_child, local_child));
+            } else {
+                let stream_id = take_stream(next_stream_id);
+                if let Err(e) = transfer::do_get(
+                    conn,
+                    socket,
+                    poll,
+                    events,
+                    stream_id,
+                    &remote_child,
+                    &local_child,
+                ) {
+                    println!("get {} failed: {e}", remote_child);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk a local directory and upload every regular file under it,
+/// mirroring its structure under `remote_root`.
+fn do_recursive_put(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next_stream_id: &mut u64,
+    local: &Path,
+    remote_root: &str,
+) -> Result<()> {
+    if !local.is_dir() {
+        // -r on a file degrades to a normal put.
+        let stream_id = take_stream(next_stream_id);
+        return transfer::do_put(conn, socket, poll, events, stream_id, local, remote_root, 0);
+    }
+    // Ensure top-level mkdir.
+    let stream_id = take_stream(next_stream_id);
+    send_message(
+        conn,
+        stream_id,
+        &Request::Mkdir {
+            path: remote_root.to_string(),
+        },
+    )?;
+    stream_send_all(conn, stream_id, &[], true)?;
+    flush_egress(conn, socket)?;
+    let _ = poll_response(conn, socket, poll, events, stream_id)?;
+
+    // BFS local.
+    let mut queue: Vec<(PathBuf, String)> = vec![(local.to_path_buf(), remote_root.to_string())];
+    while let Some((dir, rremote)) = queue.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("read_dir {} failed: {e}", dir.display());
+                continue;
+            }
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().into_owned();
+            let remote_child = if rremote.ends_with('/') {
+                format!("{rremote}{name_str}")
+            } else {
+                format!("{rremote}/{name_str}")
+            };
+            if path.is_dir() {
+                let stream_id = take_stream(next_stream_id);
+                send_message(
+                    conn,
+                    stream_id,
+                    &Request::Mkdir {
+                        path: remote_child.clone(),
+                    },
+                )?;
+                stream_send_all(conn, stream_id, &[], true)?;
+                flush_egress(conn, socket)?;
+                let _ = poll_response(conn, socket, poll, events, stream_id)?;
+                queue.push((path, remote_child));
+            } else {
+                let stream_id = take_stream(next_stream_id);
+                if let Err(e) = transfer::do_put(
+                    conn,
+                    socket,
+                    poll,
+                    events,
+                    stream_id,
+                    &path,
+                    &remote_child,
+                    0,
+                ) {
+                    println!("put {} failed: {e}", path.display());
+                }
+            }
+        }
+    }
     Ok(())
 }

@@ -28,6 +28,9 @@ pub enum StreamState {
     /// Reading a protocol request from the stream.
     ReadingRequest { buf: Vec<u8> },
     /// Receiving file bytes (Put) and streaming them straight to disk.
+    /// `hasher` accumulates BLAKE3 over the received bytes; on the last
+    /// byte we compare it to the client's declared `expected_checksum`,
+    /// if any.
     ReadingFileData {
         final_path: PathBuf,
         temp_path: PathBuf,
@@ -35,17 +38,24 @@ pub enum StreamState {
         remaining: u64,
         mode: u32,
         completed: bool,
+        hasher: blake3::Hasher,
+        expected_checksum: Option<[u8; 32]>,
     },
     /// Streaming a file to the peer (Get). Driven from the main loop on
     /// every iteration so a single big transfer can't monopolize CPU at
-    /// the cost of other connections.
+    /// the cost of other connections. `hasher` accumulates BLAKE3 over
+    /// the sent bytes; when the body is complete we emit a 32-byte
+    /// trailer with the finalized hash + FIN.
     SendingFileData {
         reader: std::io::BufReader<File>,
         total_size: u64,
         sent: u64,
-        /// True once we've successfully called stream_send with fin=true
-        /// for the last byte. We keep the entry around for one more sweep
-        /// so the main loop sees completion.
+        hasher: blake3::Hasher,
+        /// After body is fully sent, the 32-byte checksum trailer is
+        /// queued onto the stream. `trailer_offset` advances as bytes
+        /// of the trailer are accepted by quiche.
+        trailer: Option<[u8; 32]>,
+        trailer_offset: usize,
         finished: bool,
     },
     /// Terminal state. The retain() sweep removes streams in this state.
