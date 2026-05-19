@@ -20,6 +20,16 @@ use qftp_common::transport::*;
 
 const CHUNK: usize = 64 * 1024;
 
+/// Outer-loop buffer for the upload body. Sized much larger than the
+/// generic `CHUNK` so a 64 MiB put runs the outer event-loop step ~64
+/// times instead of ~1024: each extra trip costs a `read_exact`,
+/// stream_send call, ingress drain, and flush_egress, and at small
+/// chunk sizes the fixed overhead — not flow-control — was capping
+/// loopback put at ~65 MiB/s (#150). quiche handles partial accepts
+/// via the inner stream_send loop, so a larger buffer is purely a
+/// win when cwnd is open and degrades gracefully when it isn't.
+const UPLOAD_CHUNK: usize = 1024 * 1024;
+
 /// Process-wide flag set from `--quiet`. When true, `make_bar`
 /// returns a hidden ProgressBar so callers don't have to thread the
 /// flag through every transfer entry point.
@@ -479,7 +489,7 @@ fn do_put_inner(
     bar.set_position(offset);
 
     let mut sent: u64 = 0;
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; UPLOAD_CHUNK];
     let mut pacer = Pacer::new();
     let mut recv_buf = [0u8; 65535];
     while sent < bytes_to_send {
@@ -492,7 +502,7 @@ fn do_put_inner(
         // Bandwidth throttle (`--bwlimit`). No-op when unlimited.
         pacer.consume(want);
 
-        // Drive a single CHUNK to the wire. quiche's stream_send will
+        // Drive a single chunk to the wire. quiche's stream_send will
         // truncate or refuse the write when the connection's send
         // capacity (flow-control + congestion window) is exhausted —
         // in both cases we have to flush egress and pull ACKs in
@@ -523,9 +533,12 @@ fn do_put_inner(
         sent += want as u64;
         bar.set_position(offset + sent);
 
-        // Pump any incoming acks so flow-control opens up.
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
-        conn.on_timeout();
+        // Non-blocking ingress drain so ACKs keep cwnd opening, but
+        // do NOT block in poll.poll here: back-pressure is already
+        // handled by the inner `Done -> poll.poll` path, and a
+        // mandatory per-chunk poll capped loopback put at ~65 MiB/s
+        // (#150) by sleeping on `conn.timeout()` between chunks even
+        // when send capacity was fine.
         handle_ingress(conn, socket, &mut recv_buf)?;
         flush_egress(conn, socket)?;
     }
