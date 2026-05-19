@@ -304,6 +304,11 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
         }),
         OneShot::Rename { from, to } => run_rename(&from, &to, &overrides),
         OneShot::Stat { remote } => run_stat(&remote, &overrides),
+        OneShot::Watch {
+            local,
+            remote,
+            debounce_ms,
+        } => crate::watch::run(&local, &remote, debounce_ms, &overrides),
     }
 }
 
