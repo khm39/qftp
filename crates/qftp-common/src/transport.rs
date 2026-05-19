@@ -7,6 +7,21 @@ pub const STREAM_BUF_SIZE: usize = 65536;
 /// sending an enormous length prefix that causes unbounded memory allocation.
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// QUIC flow-control window advertised for a single bidirectional
+/// stream. Sized to comfortably cover BDP on a gigabit link with
+/// ~100ms RTT (~12.5 MB), with headroom so `send_file_streaming`
+/// doesn't have to spin-wait on the peer's ACK. The actual user-space
+/// buffer is `FILE_CHUNK_SIZE` (64 KiB); this window only bounds
+/// quiche's internal bookkeeping and kernel UDP buffers (#139).
+pub const INITIAL_MAX_STREAM_DATA: u64 = 16 * 1024 * 1024;
+
+/// Per-connection flow-control window. `initial_max_streams_bidi` is
+/// 4, so this is sized as `4 * INITIAL_MAX_STREAM_DATA` -- enough for
+/// every concurrent stream to be at its individual cap with no extra
+/// slack (#139). Previous value was 2 GiB which was vastly over-sized
+/// for the BDP this protocol actually sees.
+pub const INITIAL_MAX_CONNECTION_DATA: u64 = 4 * INITIAL_MAX_STREAM_DATA;
+
 /// Flush pending outgoing packets from the QUIC connection to the UDP socket.
 pub fn flush_egress(conn: &mut quiche::Connection, socket: &mio::net::UdpSocket) -> Result<()> {
     let mut out = [0u8; MAX_DATAGRAM_SIZE];
@@ -191,17 +206,16 @@ fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> R
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     // Phase 1 sends and receives files in chunks (qftp-server's
     // send_file_streaming and drive_put), so peak memory no longer scales
-    // with the flow-control window. We still keep the windows generous to
-    // minimize how often send_file_streaming has to spin-wait for a peer
-    // ACK; the per-stream RAM upper bound is now the BufReader/BufWriter
-    // capacity (64 KiB) rather than the window itself. initial_max_streams_bidi
-    // stays low because the server is still single-connection (Phase 2,
-    // issue #36): the current client only opens one bidi stream at a time.
-    // Phase 2's multi-connection rewrite is the right place to revisit
-    // both dimensions in concert with a real egress-driven sender.
-    config.set_initial_max_data(2 * 1024 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_local(1024 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_remote(1024 * 1024 * 1024);
+    // with the flow-control window. The per-stream RAM upper bound is the
+    // BufReader/BufWriter capacity (64 KiB) -- this window only bounds
+    // quiche's internal bookkeeping and kernel UDP buffers. initial_max_streams_bidi
+    // stays low because the current client only opens one bidi stream at
+    // a time. #139: previous values were 2 GiB total / 1 GiB per stream,
+    // vastly over-sized for the gigabit BDP this protocol actually sees;
+    // shrunk so quiche state + UDP buffers don't bloat per peer.
+    config.set_initial_max_data(INITIAL_MAX_CONNECTION_DATA);
+    config.set_initial_max_stream_data_bidi_local(INITIAL_MAX_STREAM_DATA);
+    config.set_initial_max_stream_data_bidi_remote(INITIAL_MAX_STREAM_DATA);
     config.set_initial_max_streams_bidi(4);
     config.set_disable_active_migration(true);
 
