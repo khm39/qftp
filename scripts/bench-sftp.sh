@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-SIZES="${QFTP_BENCH_SIZES:-1M,16M,64M}"
+SIZES="${QFTP_BENCH_SIZES:-1M,16M,64M,256M,1G}"
 ITERS="${QFTP_BENCH_ITERS:-10}"
 
 if ! command -v sshd >/dev/null || ! command -v sftp >/dev/null; then
