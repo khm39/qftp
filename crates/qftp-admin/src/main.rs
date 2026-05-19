@@ -366,28 +366,34 @@ fn find_user_index(users: &toml_edit::ArrayOfTables, name: &str) -> Option<usize
 }
 
 fn write_atomic(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-    }
-    let tmp = path.with_extension("toml.tmp");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    // #125: previously this used a deterministic `users.toml.tmp`
+    // name, which raced under concurrent admin invocations and
+    // could leave the temp at relaxed permissions if it already
+    // existed (`OpenOptionsExt::mode` is only honored at create).
+    // tempfile::NamedTempFile gives us a random suffix, 0o600 by
+    // default on Unix, and atomic `persist` over the destination.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut tf = tempfile::NamedTempFile::new_in(&parent)
+        .with_context(|| format!("failed to create temp file in {}", parent.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = tf.as_file().metadata()?.permissions();
+        perms.set_mode(0o600);
+        tf.as_file().set_permissions(perms)?;
     }
-    let mut f = opts
-        .open(&tmp)
-        .with_context(|| format!("failed to open {}", tmp.display()))?;
-    f.write_all(body.as_bytes())
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    f.sync_all().ok();
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+    tf.as_file_mut()
+        .write_all(body.as_bytes())
+        .with_context(|| format!("failed to write temp file under {}", parent.display()))?;
+    tf.as_file().sync_all().ok();
+    tf.persist(path)
+        .with_context(|| format!("failed to persist tmp to {}", path.display()))?;
     Ok(())
 }
 

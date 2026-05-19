@@ -374,7 +374,7 @@ fn connect(
     // 0-RTT resume if we have a ticket — fast reconnect after a
     // network blip is exactly what watch mode needs.
     if let Some(dir) = session_store::default_dir() {
-        if let Some(ticket) = session_store::load(&dir, &spec.host) {
+        if let Some(ticket) = session_store::load(&dir, &spec.host, None) {
             let _ = conn.set_session(&ticket);
         }
     }

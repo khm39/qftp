@@ -49,6 +49,13 @@ use crate::user::{self, UserDirectory};
 /// refused so a captured 0-RTT flight cannot be replayed to put the
 /// server into a different state.
 fn request_is_replay_safe(req: &Request) -> bool {
+    // #127: Quota is intentionally NOT in this set. Even though
+    // #111 caches the usage so the reply is cheap, treating it as
+    // replay-safe means a captured 0-RTT Quota request can be
+    // re-fired indefinitely as a "ping" against the user record —
+    // useful primarily as an amplification primitive. The latency
+    // cost of forcing 1-RTT for Quota is negligible since it runs
+    // once per session.
     matches!(
         req,
         Request::Ls { .. }
@@ -56,7 +63,6 @@ fn request_is_replay_safe(req: &Request) -> bool {
             | Request::Pwd
             | Request::Stat { .. }
             | Request::Get { .. }
-            | Request::Quota
             | Request::Quit,
     )
 }

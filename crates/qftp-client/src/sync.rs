@@ -212,7 +212,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     let _ = flush_egress(&mut conn, &socket);
 
     if let Some(dir) = session_store::default_dir() {
-        let _ = session_store::save(&dir, &spec.host, conn.session());
+        let _ = session_store::save_from_conn(&dir, &spec.host, &conn);
     }
 
     Ok(0)
@@ -435,7 +435,7 @@ fn connect(
     )?;
 
     if let Some(dir) = session_store::default_dir() {
-        if let Some(ticket) = session_store::load(&dir, &spec.host) {
+        if let Some(ticket) = session_store::load(&dir, &spec.host, None) {
             let _ = conn.set_session(&ticket);
         }
     }

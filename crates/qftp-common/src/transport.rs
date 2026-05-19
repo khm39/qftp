@@ -276,9 +276,17 @@ pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
     } else if tls.verify_peer {
         // Fall back to the platform trust store. quiche delegates to
         // BoringSSL; without an explicit bundle the OS roots are used.
-        config
-            .load_verify_locations_from_directory("/etc/ssl/certs")
-            .ok();
+        // #124: log on failure so an operator on a minimal image
+        // (Alpine without ca-certificates, scratch container) gets a
+        // concrete diagnostic instead of "TLS broken with no
+        // explanation" later in the handshake.
+        if let Err(e) = config.load_verify_locations_from_directory("/etc/ssl/certs") {
+            tracing::warn!(
+                error = ?e,
+                "no system trust store at /etc/ssl/certs; \
+                 pass --ca, --insecure, or --trust-on-first-use"
+            );
+        }
     }
 
     if let Some(cc) = &tls.client_cert {

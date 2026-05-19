@@ -350,7 +350,7 @@ fn main() -> Result<()> {
     let mut resumed = false;
     if !args.no_zero_rtt {
         if let Some(dir) = &ticket_dir {
-            if let Some(ticket) = session_store::load(dir, &spec.host) {
+            if let Some(ticket) = session_store::load(dir, &spec.host, None) {
                 match conn.set_session(&ticket) {
                     Ok(()) => {
                         resumed = true;
@@ -513,7 +513,7 @@ fn main() -> Result<()> {
     // means we keep the post-handshake-rotated ticket too.
     if !args.no_zero_rtt {
         if let Some(dir) = &ticket_dir {
-            if let Err(e) = session_store::save(dir, &spec.host, conn.session()) {
+            if let Err(e) = session_store::save_from_conn(dir, &spec.host, &conn) {
                 tracing::warn!(error = ?e, "failed to persist session ticket");
             }
         }

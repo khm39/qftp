@@ -138,7 +138,7 @@ where
     // skip the TLS handshake after the first iteration.
     let ticket_dir = session_store::default_dir();
     if let Some(dir) = &ticket_dir {
-        if let Some(ticket) = session_store::load(dir, &spec.host) {
+        if let Some(ticket) = session_store::load(dir, &spec.host, None) {
             match conn.set_session(&ticket) {
                 Ok(()) => {
                     tracing::info!(host = %spec.host, "one-shot: 0-RTT resuming");
@@ -193,7 +193,7 @@ where
     // 0-RTT-resume. Best-effort: a write failure means the next
     // invocation pays the 1-RTT cost, nothing worse.
     if let Some(dir) = &ticket_dir {
-        if let Err(e) = session_store::save(dir, &spec.host, conn.session()) {
+        if let Err(e) = session_store::save_from_conn(dir, &spec.host, &conn) {
             tracing::warn!(error = ?e, "failed to persist session ticket");
         }
     }
