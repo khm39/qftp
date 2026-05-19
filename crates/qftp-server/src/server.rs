@@ -522,6 +522,24 @@ fn process_readable_streams(
                 };
                 if let Some(req) = req {
                     metrics.inc_requests_total();
+                    // #140: per-field length caps on top of the
+                    // frame-wide MAX_MESSAGE_SIZE so a peer can't ship
+                    // a 16 MiB single path field that survives
+                    // recv_message's frame check.
+                    if let Err(msg) = req.validate_field_lengths() {
+                        warn!(
+                            peer = %ctx.peer_addr,
+                            stream_id,
+                            error = msg,
+                            "request field exceeded cap; closing stream"
+                        );
+                        actions.push(PendingAction::AclReject {
+                            stream_id,
+                            resp: err(ErrorCode::Malformed, msg),
+                        });
+                        *state = StreamState::Done;
+                        continue;
+                    }
                     debug!(
                         peer = %ctx.peer_addr,
                         user = %ctx.user.name,

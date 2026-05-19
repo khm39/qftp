@@ -166,6 +166,47 @@ pub enum Request {
     Quit,
 }
 
+/// #140: per-field length caps applied on top of the frame-wide
+/// `MAX_MESSAGE_SIZE` (16 MiB) limit in `recv_message`. The frame cap
+/// alone lets a single `path` String be up to 16 MiB, which is two
+/// orders of magnitude beyond POSIX `PATH_MAX`. Refusing absurdly long
+/// fields up front is defense in depth — it shrinks worst-case memory
+/// per accepted request and avoids surprising downstream paths that
+/// were never designed for multi-MiB strings.
+pub const MAX_PATH_FIELD_LEN: usize = 4096;
+pub const MAX_ERROR_MESSAGE_LEN: usize = 1024;
+pub const MAX_DIR_LISTING_ENTRIES: usize = 100_000;
+
+impl Request {
+    /// Reject Requests whose String fields exceed per-field caps.
+    /// Returns an error code suitable for sending back to the peer.
+    pub fn validate_field_lengths(&self) -> Result<(), &'static str> {
+        let check_path = |s: &str| -> Result<(), &'static str> {
+            if s.len() > MAX_PATH_FIELD_LEN {
+                Err("path field exceeds MAX_PATH_FIELD_LEN")
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            Request::Ls { path }
+            | Request::Cd { path }
+            | Request::Get { path, .. }
+            | Request::Put { path, .. }
+            | Request::Mkdir { path }
+            | Request::Rmdir { path }
+            | Request::Rm { path }
+            | Request::Chmod { path, .. }
+            | Request::Stat { path } => check_path(path),
+            Request::Rename { from, to } => {
+                check_path(from)?;
+                check_path(to)
+            }
+            Request::Pwd | Request::Quota | Request::Quit => Ok(()),
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -197,6 +238,40 @@ pub enum Response {
         #[serde(default)]
         limit_bytes: Option<u64>,
     },
+}
+
+impl Response {
+    /// Reject Responses whose variable-size fields exceed per-field
+    /// caps. Mirrors `Request::validate_field_lengths` on the client
+    /// side: a hostile server could otherwise hand the client a
+    /// multi-MiB ErrorResponse.message or a DirListing with millions
+    /// of entries. See #140.
+    pub fn validate_field_lengths(&self) -> Result<(), &'static str> {
+        match self {
+            Response::Err(e) => {
+                if e.message.len() > MAX_ERROR_MESSAGE_LEN {
+                    Err("ErrorResponse message exceeds MAX_ERROR_MESSAGE_LEN")
+                } else {
+                    Ok(())
+                }
+            }
+            Response::DirListing(entries) => {
+                if entries.len() > MAX_DIR_LISTING_ENTRIES {
+                    Err("DirListing exceeds MAX_DIR_LISTING_ENTRIES")
+                } else {
+                    Ok(())
+                }
+            }
+            Response::Path(p) => {
+                if p.len() > MAX_PATH_FIELD_LEN {
+                    Err("Path response exceeds MAX_PATH_FIELD_LEN")
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -349,5 +424,39 @@ mod tests {
     fn alpn_carries_major() {
         assert_eq!(ALPN, b"qftp/1");
         assert_eq!(PROTOCOL_MAJOR, 1);
+    }
+
+    #[test]
+    fn request_field_caps_accept_reasonable_paths() {
+        let r = Request::Ls {
+            path: "a".repeat(MAX_PATH_FIELD_LEN),
+        };
+        assert!(r.validate_field_lengths().is_ok());
+    }
+
+    #[test]
+    fn request_field_caps_reject_oversized_path() {
+        let r = Request::Ls {
+            path: "a".repeat(MAX_PATH_FIELD_LEN + 1),
+        };
+        assert!(r.validate_field_lengths().is_err());
+    }
+
+    #[test]
+    fn request_field_caps_reject_oversized_rename_to() {
+        let r = Request::Rename {
+            from: "ok".into(),
+            to: "z".repeat(MAX_PATH_FIELD_LEN + 1),
+        };
+        assert!(r.validate_field_lengths().is_err());
+    }
+
+    #[test]
+    fn response_field_caps_reject_oversized_err_message() {
+        let r = Response::Err(ErrorResponse::new(
+            ErrorCode::Internal,
+            "x".repeat(MAX_ERROR_MESSAGE_LEN + 1),
+        ));
+        assert!(r.validate_field_lengths().is_err());
     }
 }
