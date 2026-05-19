@@ -199,11 +199,7 @@ pub fn do_get(
     // via a planted symlink in the destination directory.
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(resume_offset == 0);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
+    qftp_common::fs_safe::apply_no_follow(&mut opts);
     let mut file = opts
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;
@@ -554,6 +550,11 @@ fn poll_response_with_buf(
 
         match recv_message::<Response>(conn, stream_id, buf)? {
             Some(resp) => {
+                // #140: per-field cap defense in depth against a
+                // malicious server packing a multi-MiB string / huge
+                // listing into a single field.
+                qftp_common::protocol::validate_response(&resp)
+                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
                 flush_egress(conn, socket)?;
                 return Ok(resp);
             }

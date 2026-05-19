@@ -53,6 +53,58 @@ impl Kind {
 }
 
 impl Metrics {
+    /// Thin wrappers over the underlying atomics. Callers should
+    /// reach for these semantic helpers rather than poking the
+    /// `AtomicU64` fields directly — that keeps the `Ordering::Relaxed`
+    /// choice and the bump-vs-decrement direction in one place.
+    pub fn inc_connections_open(&self) {
+        self.connections_open.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn dec_connections_open(&self) {
+        self.connections_open.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub fn inc_connections_total(&self) {
+        self.connections_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_retries_issued(&self) {
+        self.retries_issued.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_requests_total(&self) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_requests_failed(&self) {
+        self.requests_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_zero_rtt_accepted(&self) {
+        self.zero_rtt_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_zero_rtt_rejected(&self) {
+        self.zero_rtt_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_uploads_completed(&self) {
+        self.uploads_completed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_downloads_completed(&self) {
+        self.downloads_completed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn add_bytes_sent(&self, n: u64) {
+        self.bytes_sent.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn add_bytes_received(&self, n: u64) {
+        self.bytes_received.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn inc_connections_rejected_rate(&self) {
+        self.connections_rejected_rate
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_connections_rejected_caps(&self) {
+        self.connections_rejected_caps
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_requests_rate_limited(&self) {
+        self.requests_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::new();
         let g = |out: &mut String, name: &str, help: &str, kind: Kind, v: u64| {
@@ -177,6 +229,27 @@ pub fn spawn(metrics: Arc<Metrics>, bind: &str, shutdown: Arc<AtomicBool>) -> Re
     listener
         .set_nonblocking(true)
         .context("failed to set metrics listener nonblocking")?;
+    // #143: the /metrics and /healthz endpoints are unauthenticated.
+    // Surface a loud warning when the operator bound them to a
+    // non-loopback address so this isn't silently exposed to the
+    // internet. We log via the resolved local_addr rather than the
+    // input string so `--metrics-bind localhost:9090` still resolves
+    // to the loopback and stays quiet.
+    if let Ok(addr) = listener.local_addr() {
+        let is_loopback = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+        if !is_loopback {
+            warn!(
+                bind = %addr,
+                "metrics endpoint bound to a non-loopback address; \
+                 /metrics and /healthz are UNAUTHENTICATED. Bind to \
+                 127.0.0.1 / [::1] or a management VLAN and scrape via \
+                 reverse proxy / SSH tunnel (#143)"
+            );
+        }
+    }
     info!(%bind, "metrics endpoint listening");
 
     thread::Builder::new()

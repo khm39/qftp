@@ -44,6 +44,110 @@ pub fn safe_entry_name(name: &str) -> bool {
     !name.contains(['/', '\\', '\0'])
 }
 
+/// #140: per-field upper bounds enforced after `recv_message` returns
+/// a decoded message but before any further processing. The frame as
+/// a whole is already capped at `MAX_MESSAGE_SIZE` (16 MiB) by
+/// `decode_framed_message`, but bincode's `with_limit` does not cap
+/// any single `String`/`Vec` field below the frame size: a peer can
+/// pack the entire 16 MiB into one `path` and the decoder will
+/// happily allocate it. Defense in depth against that.
+///
+/// Limits chosen to be comfortably above any realistic legitimate
+/// input but well below the frame cap:
+///   * paths: 4 KiB (POSIX PATH_MAX is 4096; longer values would
+///     never resolve on a real filesystem anyway)
+///   * error messages: 1 KiB (human-readable diagnostics)
+///   * directory listings: 100 000 entries (a single Ls response
+///     larger than this is itself an abuse vector and should be
+///     refused at the source).
+pub const MAX_PATH_LEN: usize = 4 * 1024;
+pub const MAX_ERROR_MESSAGE_LEN: usize = 1024;
+pub const MAX_DIR_ENTRIES: usize = 100_000;
+
+/// Errors surfaced by [`validate_request`] / [`validate_response`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError(pub String);
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+fn check_path(field: &str, value: &str) -> Result<(), ValidationError> {
+    if value.len() > MAX_PATH_LEN {
+        return Err(ValidationError(format!(
+            "{field} field is {} bytes, exceeds MAX_PATH_LEN ({MAX_PATH_LEN}) (#140)",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Apply [`MAX_PATH_LEN`] / [`MAX_ERROR_MESSAGE_LEN`] sanity caps to
+/// a decoded [`Request`]. Call this immediately after `recv_message`
+/// on the server before dispatching. Variants without bounded string
+/// fields are no-ops.
+pub fn validate_request(req: &Request) -> Result<(), ValidationError> {
+    match req {
+        Request::Ls { path }
+        | Request::Cd { path }
+        | Request::Get { path, .. }
+        | Request::Put { path, .. }
+        | Request::Mkdir { path }
+        | Request::Rmdir { path }
+        | Request::Rm { path }
+        | Request::Chmod { path, .. }
+        | Request::Stat { path } => check_path("path", path),
+        Request::Rename { from, to } => {
+            check_path("from", from)?;
+            check_path("to", to)
+        }
+        Request::Pwd | Request::Quit | Request::Quota => Ok(()),
+    }
+}
+
+/// Apply [`MAX_PATH_LEN`] / [`MAX_ERROR_MESSAGE_LEN`] / [`MAX_DIR_ENTRIES`]
+/// caps to a decoded [`Response`]. Call this immediately after
+/// `recv_message` on the client before dispatching.
+pub fn validate_response(resp: &Response) -> Result<(), ValidationError> {
+    match resp {
+        Response::Err(e) => {
+            if e.message.len() > MAX_ERROR_MESSAGE_LEN {
+                return Err(ValidationError(format!(
+                    "ErrorResponse.message is {} bytes, exceeds MAX_ERROR_MESSAGE_LEN ({MAX_ERROR_MESSAGE_LEN}) (#140)",
+                    e.message.len()
+                )));
+            }
+            Ok(())
+        }
+        Response::DirListing(entries) => {
+            if entries.len() > MAX_DIR_ENTRIES {
+                return Err(ValidationError(format!(
+                    "DirListing has {} entries, exceeds MAX_DIR_ENTRIES ({MAX_DIR_ENTRIES}) (#140)",
+                    entries.len()
+                )));
+            }
+            for entry in entries {
+                if entry.name.len() > MAX_PATH_LEN {
+                    return Err(ValidationError(format!(
+                        "DirEntry.name is {} bytes, exceeds MAX_PATH_LEN ({MAX_PATH_LEN}) (#140)",
+                        entry.name.len()
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Response::Path(p) => check_path("Path", p),
+        Response::Ok
+        | Response::FileStat(_)
+        | Response::FileReady { .. }
+        | Response::QuotaInfo { .. } => Ok(()),
+    }
+}
+
 /// ALPN value advertised over QUIC. The trailing major version lets us
 /// retire wire-incompatible revisions cleanly.
 pub const ALPN: &[u8] = b"qftp/1";
@@ -199,7 +303,7 @@ pub enum Response {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
@@ -349,5 +453,65 @@ mod tests {
     fn alpn_carries_major() {
         assert_eq!(ALPN, b"qftp/1");
         assert_eq!(PROTOCOL_MAJOR, 1);
+    }
+
+    // #140 ------------------------------------------------------------
+
+    #[test]
+    fn validate_request_rejects_oversized_path() {
+        let req = Request::Ls {
+            path: "a".repeat(MAX_PATH_LEN + 1),
+        };
+        let e = validate_request(&req).unwrap_err();
+        assert!(e.0.contains("#140"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn validate_request_accepts_borderline_path() {
+        let req = Request::Get {
+            path: "a".repeat(MAX_PATH_LEN),
+            offset: 0,
+            length: None,
+        };
+        validate_request(&req).expect("MAX_PATH_LEN exactly should pass");
+    }
+
+    #[test]
+    fn validate_request_checks_both_rename_fields() {
+        let req = Request::Rename {
+            from: "a".into(),
+            to: "z".repeat(MAX_PATH_LEN + 1),
+        };
+        let e = validate_request(&req).unwrap_err();
+        assert!(e.0.contains("to"), "expected `to` field cited, got: {e}");
+    }
+
+    #[test]
+    fn validate_response_rejects_oversized_error_message() {
+        let resp = Response::Err(ErrorResponse::new(
+            ErrorCode::Internal,
+            "x".repeat(MAX_ERROR_MESSAGE_LEN + 1),
+        ));
+        let e = validate_response(&resp).unwrap_err();
+        assert!(e.0.contains("#140"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn validate_response_rejects_huge_listing() {
+        let entry = DirEntry {
+            name: "x".into(),
+            is_dir: false,
+            size: 0,
+            modified: 0,
+            mode: 0o644,
+        };
+        // Build a listing one entry over the cap. Using zero-cost
+        // clones because DirEntry's String is tiny.
+        let entries = (0..MAX_DIR_ENTRIES + 1)
+            .map(|_| DirEntry { ..entry.clone() })
+            .collect();
+        let resp = Response::DirListing(entries);
+        let e = validate_response(&resp).unwrap_err();
+        assert!(e.0.contains("MAX_DIR_ENTRIES"), "unexpected error: {e}");
     }
 }
