@@ -967,6 +967,7 @@ dependencies = [
  "ring",
  "rustyline",
  "serde",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",
