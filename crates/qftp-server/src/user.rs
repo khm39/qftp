@@ -32,6 +32,7 @@ pub enum Op {
 /// user; the implicit anonymous fallback (no `--users` file) defaults to
 /// read-only.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Permissions {
     #[serde(default)]
     pub read: bool,
@@ -93,6 +94,7 @@ impl Permissions {
 
 /// A single user entry in the config file.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserSpec {
     pub name: String,
     /// Home directory. If relative, it's resolved against the global root.
@@ -119,6 +121,7 @@ pub struct User {
 
 /// Top-level user config, loaded from a TOML file.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserConfig {
     #[serde(default)]
     pub anonymous: Option<UserSpec>,
@@ -159,6 +162,24 @@ impl UserDirectory {
                 global_root.display()
             )
         })?;
+
+        // #126: `quota_bytes = 0` is ambiguous. Operators familiar
+        // with traditional disk-quota systems often expect 0 to mean
+        // "unlimited"; the natural reading of this field is "zero
+        // bytes allowed" (every Put fails with QuotaExceeded).
+        // Refuse the value at parse time and direct the operator to
+        // omit the key for unlimited, or use `permissions.write =
+        // false` to forbid writes.
+        for spec in cfg.users.iter().chain(cfg.anonymous.iter()) {
+            if spec.quota_bytes == Some(0) {
+                anyhow::bail!(
+                    "user {}: quota_bytes = 0 is ambiguous (#126); \
+                     omit the field for unlimited, or set \
+                     `permissions.write = false` to forbid writes",
+                    spec.name
+                );
+            }
+        }
 
         let resolve_home = |spec: &UserSpec| -> Result<PathBuf> {
             let raw = match &spec.home {
@@ -402,6 +423,56 @@ mod tests {
             err.to_string().contains("..") || err.to_string().contains("#112"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn config_rejects_typoed_field_name() {
+        // #113: with deny_unknown_fields, a misspelled key like
+        // `quota` (instead of `quota_bytes`) must produce an error
+        // rather than silently disabling the quota.
+        let toml = r#"
+            [[users]]
+            name = "alice"
+            permissions = { read = true, write = true }
+            quota = 1000
+        "#;
+        let err = toml::from_str::<UserConfig>(toml).expect_err("expected parse to fail on typo");
+        assert!(
+            err.to_string().contains("unknown field") || err.to_string().contains("quota"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_typoed_permissions_field() {
+        // #113: a misspelled `permision` (singular) inside a per-user
+        // table must be flagged at parse time.
+        let toml = r#"
+            [[users]]
+            name = "alice"
+            permision = { read = true, write = true }
+        "#;
+        let err = toml::from_str::<UserConfig>(toml).expect_err("expected parse to fail on typo");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn from_config_rejects_zero_quota() {
+        // #126: explicit 0 is ambiguous; require omission for unlimited.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![UserSpec {
+                name: "alice".to_string(),
+                home: None,
+                permissions: Permissions::read_only(),
+                quota_bytes: Some(0),
+            }],
+        };
+        let err = UserDirectory::from_config(tmp.path(), cfg)
+            .err()
+            .expect("expected quota_bytes = 0 to be refused");
+        assert!(err.to_string().contains("#126"));
     }
 
     #[test]

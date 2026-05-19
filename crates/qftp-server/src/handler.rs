@@ -40,7 +40,10 @@ fn set_mode(target: &Path, mode: u32) -> Response {
         Ok(_) => {}
         Err(e) => return err(io_code(&e), format!("re-stat failed: {e}")),
     }
-    let perms = fs::Permissions::from_mode(mode);
+    // #120: strip suid/sgid/sticky from the requested mode. See
+    // server::apply_mode for the rationale.
+    let masked = mode & 0o0777;
+    let perms = fs::Permissions::from_mode(masked);
     match fs::set_permissions(target, perms) {
         Ok(()) => Response::Ok,
         Err(e) => err(ErrorCode::Internal, format!("chmod failed: {e}")),

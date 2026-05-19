@@ -146,7 +146,18 @@ pub fn recv_message<T: DeserializeOwned>(
         return Ok(None);
     }
 
-    let msg: T = bincode::deserialize(&stream_buf[4..4 + msg_len])
+    // #117: bound per-field allocations during deserialization. The
+    // 4-byte frame length is already bounded by MAX_MESSAGE_SIZE, but
+    // bincode's defaults will happily allocate a 16 MiB `String` for
+    // a single field within that frame. with_limit caps individual
+    // String/Vec allocations during decode at the same MAX_MESSAGE_SIZE.
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_MESSAGE_SIZE as u64);
+    use bincode::Options as _;
+    let msg: T = opts
+        .deserialize(&stream_buf[4..4 + msg_len])
         .context("failed to deserialize message")?;
 
     // Drain the consumed bytes.
