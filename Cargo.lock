@@ -1243,6 +1243,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "blake3",
+ "libc",
  "mio",
  "quiche",
  "serde",

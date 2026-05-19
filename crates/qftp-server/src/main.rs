@@ -139,6 +139,7 @@ fn main() -> Result<()> {
     std_socket
         .set_nonblocking(true)
         .context("failed to set nonblocking")?;
+    qftp_common::transport::tune_udp_buffers(&std_socket);
     let socket = mio::net::UdpSocket::from_std(std_socket);
 
     info!(

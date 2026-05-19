@@ -269,13 +269,22 @@ pub fn do_get(
     }
 
     while received < size || trailer.len() < want_trailer {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
+        // Three-step pump: always drain the socket and stream first,
+        // and only block in poll.poll when both came up empty. The
+        // previous "poll first" arrangement would sleep on the QUIC
+        // idle timer when the last few packets had already been
+        // delivered to quiche by an earlier ingress call (e.g. the
+        // one in `poll_response_with_buf`); the response was sitting
+        // on the stream and the kernel UDP buffer was empty, so
+        // epoll had no edge event to fire.
+        let mut recv_buf = [0u8; 65535];
+        handle_ingress(conn, socket, &mut recv_buf)?;
 
+        let mut drained_any = false;
         loop {
             match conn.stream_recv(stream_id, &mut tmp) {
                 Ok((len, fin)) => {
+                    drained_any = true;
                     if received < size {
                         let body_room = (size - received) as usize;
                         let body_take = body_room.min(len);
@@ -329,6 +338,13 @@ pub fn do_get(
 
         if conn.is_closed() && (received < size || trailer.len() < want_trailer) {
             bail!("connection closed during download");
+        }
+
+        // If neither the socket nor the stream had anything ready,
+        // sleep until the next event or the quiche timer fires.
+        if !drained_any {
+            poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
+            conn.on_timeout();
         }
     }
 
@@ -518,6 +534,20 @@ fn poll_response_with_buf(
     buf: &mut Vec<u8>,
 ) -> Result<Response> {
     loop {
+        // Try to deserialize a response from anything quiche already
+        // has buffered on this stream BEFORE blocking in poll.poll.
+        // The body-send loop in `do_put` runs a final ingress pump
+        // after the last chunk goes out, and the server's response
+        // packet often arrives during that pump -- so by the time we
+        // get here the response bytes are already sitting in the
+        // stream's recv buffer. Without this pre-poll drain we would
+        // call poll.poll(timeout=30s) and sleep on the QUIC idle
+        // timeout even though the message has been delivered.
+        if let Some(resp) = recv_message::<Response>(conn, stream_id, buf)? {
+            flush_egress(conn, socket)?;
+            return Ok(resp);
+        }
+
         poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
         conn.on_timeout();
         handle_ingress(conn, socket, &mut [0u8; 65535])?;
