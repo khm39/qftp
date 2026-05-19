@@ -63,7 +63,9 @@ pub fn parse_url(input: &str) -> Result<UrlTarget> {
     let parsed = url::Url::parse(input).with_context(|| format!("invalid URL: {input}"))?;
     let scheme = parsed.scheme();
     if scheme != "qftp" && scheme != "qftps" {
-        return Err(anyhow!("unsupported scheme: {scheme} (expected qftp or qftps)"));
+        return Err(anyhow!(
+            "unsupported scheme: {scheme} (expected qftp or qftps)"
+        ));
     }
     let host = parsed
         .host_str()
@@ -141,8 +143,9 @@ impl ConfigFile {
     /// user can fix syntax.
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s)
-                .with_context(|| format!("failed to parse {}", path.display())),
+            Ok(s) => {
+                toml::from_str(&s).with_context(|| format!("failed to parse {}", path.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
         }
@@ -251,7 +254,11 @@ pub fn resolve(
             insecure = b;
         }
         ca = alias.ca.as_deref().map(expand_tilde).or(ca);
-        client_cert = alias.client_cert.as_deref().map(expand_tilde).or(client_cert);
+        client_cert = alias
+            .client_cert
+            .as_deref()
+            .map(expand_tilde)
+            .or(client_cert);
         client_key = alias.client_key.as_deref().map(expand_tilde).or(client_key);
         initial_path.clone_from(&alias.initial_path);
     }
@@ -394,8 +401,12 @@ mod tests {
     #[test]
     fn resolve_pure_url() {
         let cfg = ConfigFile::default();
-        let spec = resolve(Some("qftp://example.com:5555/data"), &cfg, &Overrides::default())
-            .unwrap();
+        let spec = resolve(
+            Some("qftp://example.com:5555/data"),
+            &cfg,
+            &Overrides::default(),
+        )
+        .unwrap();
         assert_eq!(spec.host, "example.com:5555");
         assert_eq!(spec.server_name, "example.com");
         assert_eq!(spec.initial_path.as_deref(), Some("/data"));
