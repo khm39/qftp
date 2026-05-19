@@ -1,0 +1,284 @@
+//! TOFU (Trust On First Use) server-cert pinning, modelled on SSH's
+//! `known_hosts`.
+//!
+//! ## File format
+//!
+//! One entry per line. Comments (`#`) and blank lines are ignored.
+//! Each entry pairs a `host:port` with the SHA-256 fingerprint of the
+//! server's leaf certificate (DER-encoded):
+//!
+//! ```text
+//! # ~/.qftp/known_hosts -- managed by qftp-client --trust-on-first-use
+//! files.example:4433 sha256:9c8f5d...
+//! 127.0.0.1:4433 sha256:0123ab...
+//! ```
+//!
+//! ## Security model
+//!
+//! TOFU shifts trust to the **first** connection: whoever is on the
+//! wire when you first connect becomes your trusted server. Subsequent
+//! connections are pinned. This is exactly the SSH `known_hosts`
+//! model, with the same limitation.
+//!
+//! Because quiche does not (yet) expose a custom-verifier hook for
+//! TLS 1.3, we run TOFU *after* the handshake completes: we ask quiche
+//! to skip its own peer verification (`verify_peer(false)`) and then
+//! compare the leaf cert fingerprint to the pinned value. On mismatch
+//! we close the connection immediately. The MitM window is the same
+//! as SSH's: the attacker can complete the handshake but cannot
+//! retain trust once the fingerprint check runs.
+
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
+
+/// A single pinned `(host:port, sha256-fingerprint)` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub host_port: String,
+    /// Lowercase hex SHA-256 of the leaf cert's DER bytes, 64 chars.
+    pub fingerprint_hex: String,
+}
+
+/// In-memory view of the known_hosts file.
+#[derive(Debug, Default)]
+pub struct KnownHosts {
+    entries: Vec<Entry>,
+}
+
+/// Outcome of looking up a `(host:port, fingerprint)` pair.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// No prior entry for this host. Caller should pin it.
+    New,
+    /// Prior entry matches. Connect silently.
+    Match,
+    /// Prior entry exists but the fingerprint differs. Caller MUST
+    /// abort the connection. The pinned value is returned for the
+    /// diagnostic.
+    Mismatch { pinned: String },
+}
+
+impl KnownHosts {
+    /// Read `path`. A missing file is not an error — we return an
+    /// empty file the caller can append to.
+    pub fn load(path: &Path) -> Result<Self> {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to open {}", path.display()));
+            }
+        };
+        Self::from_reader(BufReader::new(f))
+    }
+
+    pub fn from_reader<R: BufRead>(reader: R) -> Result<Self> {
+        let mut entries = Vec::new();
+        for (lineno, line) in reader.lines().enumerate() {
+            let line = line.context("read known_hosts line")?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Lenient parse: malformed lines are skipped with a
+            // warning rather than aborting the whole load. A typo'd
+            // entry should not lock the user out of every host.
+            let mut it = trimmed.split_whitespace();
+            let host_port = match it.next() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let fp = match it.next() {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(line = lineno + 1, "known_hosts: skipping malformed entry");
+                    continue;
+                }
+            };
+            let Some(hex) = fp.strip_prefix("sha256:") else {
+                tracing::warn!(
+                    line = lineno + 1,
+                    "known_hosts: skipping entry with unsupported algorithm"
+                );
+                continue;
+            };
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                tracing::warn!(
+                    line = lineno + 1,
+                    "known_hosts: skipping entry with malformed fingerprint"
+                );
+                continue;
+            }
+            entries.push(Entry {
+                host_port,
+                fingerprint_hex: hex.to_ascii_lowercase(),
+            });
+        }
+        Ok(KnownHosts { entries })
+    }
+
+    pub fn lookup(&self, host_port: &str, fingerprint_hex: &str) -> Verdict {
+        let want = fingerprint_hex.to_ascii_lowercase();
+        for e in &self.entries {
+            if e.host_port == host_port {
+                return if e.fingerprint_hex == want {
+                    Verdict::Match
+                } else {
+                    Verdict::Mismatch {
+                        pinned: e.fingerprint_hex.clone(),
+                    }
+                };
+            }
+        }
+        Verdict::New
+    }
+
+    /// Append a new entry to `path`. Creates the file (and parent
+    /// directory) if needed. Mode is set to 0600 on Unix so a
+    /// fingerprint database isn't world-readable.
+    pub fn append_to_file(path: &Path, host_port: &str, fingerprint_hex: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(path)
+            .with_context(|| format!("failed to open {} for append", path.display()))?;
+        writeln!(f, "{host_port} sha256:{fingerprint_hex}")
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Compute the lowercase-hex SHA-256 of a DER-encoded leaf cert.
+pub fn fingerprint_hex(der: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, der);
+    let mut s = String::with_capacity(64);
+    for b in digest.as_ref() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Default path for the known_hosts file: `~/.qftp/known_hosts`.
+/// Returns `None` if `$HOME` is unset (CI matrices, daemons).
+pub fn default_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".qftp/known_hosts"))
+}
+
+/// Error builder for the "server cert changed" case. SSH-style banner
+/// so the operator immediately knows what happened.
+pub fn mismatch_error(host_port: &str, pinned: &str, seen: &str) -> anyhow::Error {
+    anyhow!(
+        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+         @    WARNING: SERVER CERTIFICATE HAS CHANGED!             @\n\
+         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+         IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n\
+         Someone could be eavesdropping on you right now (man-in-the-middle attack)!\n\
+         It is also possible that the server certificate has just been changed.\n\
+         The SHA-256 fingerprint for the certificate sent by the remote host is\n\
+           sha256:{seen}\n\
+         Please contact your administrator. To get rid of this message, remove\n\
+         the {host_port} entry from ~/.qftp/known_hosts.\n\
+         Pinned fingerprint was sha256:{pinned}",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use tempfile::TempDir;
+
+    #[test]
+    fn parse_comments_and_blank_lines() {
+        let src = b"# header comment\n\n  \nfoo:1 sha256:aa\n";
+        // Last line malformed (fingerprint too short) -- skipped.
+        let kh = KnownHosts::from_reader(Cursor::new(&src[..])).unwrap();
+        assert!(kh.entries.is_empty());
+    }
+
+    #[test]
+    fn parse_valid_entry() {
+        let fp = "0".repeat(64);
+        let src = format!("host:4433 sha256:{fp}\n");
+        let kh = KnownHosts::from_reader(Cursor::new(src.as_bytes())).unwrap();
+        assert_eq!(kh.entries.len(), 1);
+        assert_eq!(kh.entries[0].host_port, "host:4433");
+        assert_eq!(kh.entries[0].fingerprint_hex, fp);
+    }
+
+    #[test]
+    fn lookup_match_mismatch_new() {
+        let fp = "a".repeat(64);
+        let other = "b".repeat(64);
+        let src = format!("host:4433 sha256:{fp}\n");
+        let kh = KnownHosts::from_reader(Cursor::new(src.as_bytes())).unwrap();
+        assert_eq!(kh.lookup("host:4433", &fp), Verdict::Match);
+        assert_eq!(
+            kh.lookup("host:4433", &other),
+            Verdict::Mismatch { pinned: fp.clone() }
+        );
+        assert_eq!(kh.lookup("unknown:4433", &fp), Verdict::New);
+    }
+
+    #[test]
+    fn case_insensitive_fingerprint() {
+        let fp_low = "abcdef".repeat(10) + "abcd";
+        let fp_up = fp_low.to_ascii_uppercase();
+        let src = format!("host:4433 sha256:{fp_up}\n");
+        let kh = KnownHosts::from_reader(Cursor::new(src.as_bytes())).unwrap();
+        assert_eq!(kh.lookup("host:4433", &fp_low), Verdict::Match);
+    }
+
+    #[test]
+    fn skip_unsupported_algorithm() {
+        let fp = "0".repeat(40);
+        let src = format!("host:4433 sha1:{fp}\n");
+        let kh = KnownHosts::from_reader(Cursor::new(src.as_bytes())).unwrap();
+        assert!(kh.entries.is_empty());
+    }
+
+    #[test]
+    fn append_creates_file_and_directory() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("nested/known_hosts");
+        let fp = "f".repeat(64);
+        KnownHosts::append_to_file(&path, "h:4433", &fp).unwrap();
+        let kh = KnownHosts::load(&path).unwrap();
+        assert_eq!(kh.entries.len(), 1);
+        assert_eq!(kh.lookup("h:4433", &fp), Verdict::Match);
+    }
+
+    #[test]
+    fn fingerprint_hex_is_deterministic_lowercase() {
+        let fp = fingerprint_hex(b"abc");
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            fp,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn append_then_match_in_same_session() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("known_hosts");
+        let fp = fingerprint_hex(b"server-cert-der");
+        KnownHosts::append_to_file(&path, "srv:4433", &fp).unwrap();
+        let kh = KnownHosts::load(&path).unwrap();
+        assert_eq!(kh.lookup("srv:4433", &fp), Verdict::Match);
+    }
+}

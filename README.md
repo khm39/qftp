@@ -44,8 +44,11 @@ Pre-1.0, but functionally complete for the supported feature set:
 # Server (development cert; do not use --self-signed in production)
 qftp-server --self-signed --bind 127.0.0.1:4433 --root ./srv
 
-# Client (development: trust the self-signed cert)
-qftp-client --insecure qftp://localhost:4433
+# Client. Two ways to handle the server identity:
+#   --insecure         skip all verification (dev only, MitM-prone)
+#   --trust-on-first-use   SSH-style: pin the cert on first connect
+#   --ca <file>        full PKI verification against a CA bundle
+qftp-client --trust-on-first-use qftp://localhost:4433
 qftp> ls
 qftp> get -r remote-dir local-dir
 qftp> put -r local-dir remote-dir
@@ -66,7 +69,7 @@ client_key = "~/.qftp/work-key.pem"
 
 [host.home]
 endpoint = "qftp://home.lan:4433"
-insecure = true   # dev only -- TOFU planned in #61
+tofu = false      # set true for SSH-style pinning at the alias level
 ```
 
 ```sh
@@ -150,6 +153,8 @@ legacy flags / defaults.
 | `--server-name <name>` | Override SNI / cert CN expected. |
 | `--ca <pem>` | PEM CA bundle to verify the server cert. Falls back to system trust store. |
 | `--insecure` | Skip server cert verification. Dev only. |
+| `--trust-on-first-use` (`-T`) | SSH-style cert pinning. First connect saves the SHA-256 fingerprint to `~/.qftp/known_hosts`; later connects verify against it. Ignored when `--ca` is set. |
+| `--known-hosts <path>` | Override the default `~/.qftp/known_hosts`. |
 | `--client-cert <pem>` / `--client-key <pem>` | mTLS client certificate. |
 | `--execute "<cmd>"` (`-e`) | Run a single command and exit. Repeatable. |
 | `--batch` | Read commands from stdin, one per line, instead of opening a REPL. Also implicit when stdin is not a TTY. |
