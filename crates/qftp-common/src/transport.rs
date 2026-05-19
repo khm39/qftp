@@ -127,7 +127,21 @@ pub fn recv_message<T: DeserializeOwned>(
         }
     }
 
-    // Check if we have enough data to parse a complete message.
+    decode_framed_message(stream_buf)
+}
+
+/// Decode one length-prefixed bincode message from `stream_buf` using
+/// the exact same length cap and bincode options the production
+/// `recv_message` path applies. On success the consumed prefix +
+/// payload bytes are drained from `stream_buf`. Returns `Ok(None)`
+/// when the buffer doesn't yet contain a complete frame.
+///
+/// This is split out from `recv_message` (#141) so the fuzz targets
+/// in `fuzz/` can drive the same decode path that runs in production.
+/// Decoding bincode bytes directly (without the 4-byte prefix and
+/// `with_limit(MAX_MESSAGE_SIZE)`) leaves the actual code path
+/// uncovered.
+pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> Result<Option<T>> {
     if stream_buf.len() < 4 {
         return Ok(None);
     }
