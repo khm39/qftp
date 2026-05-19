@@ -267,6 +267,7 @@ fn run_session(
                         &path,
                         &remote_path,
                         0,
+                        false,
                     ) {
                         tracing::warn!(error = %e, path = %path.display(), "watch: put failed");
                     } else {

@@ -180,6 +180,7 @@ fn do_put_once(
         local,
         remote_path,
         0,
+        false,
     )?;
 
     // Polite close.

@@ -27,6 +27,10 @@ pub enum Command {
     /// `!cmd …` — pass the rest of the line to `$SHELL -c`. The
     /// empty `!` form spawns an interactive `$SHELL`.
     Shell(String),
+    /// `stats` (#80) — print process-wide transfer counters
+    /// (uptime, bytes up/down, success rate). Local; no protocol
+    /// round-trip.
+    Stats,
 }
 
 /// Pull `-r` / `--recursive` out of a token slice. Returns the flag and
@@ -166,6 +170,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
             }
             Some(Command::Lmkdir(args[0].to_string()))
         }
+        "stats" => Some(Command::Stats),
         "quit" | "exit" => Some(Command::Remote(Request::Quit)),
         "help" | "?" => {
             print_help();
@@ -353,6 +358,7 @@ fn print_help() {
     println!("  lmkdir <path>                Create a local directory");
     println!("  !cmd ...                     Run `cmd` via $SHELL -c");
     println!("  !                            Spawn an interactive $SHELL");
+    println!("  stats                        Show session transfer counters");
     println!("  help                         Show this help message");
     println!("  quit                         Disconnect and exit");
     println!();

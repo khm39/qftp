@@ -11,9 +11,17 @@
 //! after the transfer batch completes (rsync's `--delete-after`
 //! semantics).
 //!
+//! `.qftpignore` (#65): if a file with that name exists at the
+//! local root, each non-empty, non-`#` line is treated as a glob
+//! pattern matched against relative paths. A trailing `/` restricts
+//! the match to directories; a leading `/` anchors to the local
+//! root. Full gitignore semantics (negation, per-subdir files) are
+//! deliberately not implemented yet -- a pragmatic subset that
+//! covers the common cases (`*.log`, `target/`, `/build/`).
+//!
 //! Out of scope (filed as a follow-up of #71):
 //!   - Download direction (remote → local).
-//!   - `.qftpignore` (gitignore syntax with `globset`).
+//!   - Negation (`!pattern`) and nested `.qftpignore` files.
 //!   - Parallel streams. Sync currently issues one Put / Rm at a
 //!     time. Multi-stream parallelism is a natural extension; the
 //!     event-driven server side (Phase 2) already supports it.
@@ -64,8 +72,13 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
         opts.dry_run
     );
 
+    // .qftpignore: read once at the local root. Missing file =
+    // empty matcher (no exclusions). Parse failures fall back to
+    // empty + warn so the sync isn't blocked by a malformed file.
+    let ignore = IgnoreMatcher::load(&local_root.join(".qftpignore"));
+
     // Local index: relative-path -> (size, mtime).
-    let local_files = walk_local(&local_root)?;
+    let local_files = walk_local(&local_root, &ignore)?;
     tracing::info!(count = local_files.len(), "sync: local files");
 
     let (mut conn, socket, mut poll, mut events) = connect(&spec)?;
@@ -173,6 +186,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
             &local_path,
             &remote_path,
             0,
+            false,
         ) {
             Ok(()) => tracing::info!(file = %remote_path, "sync: uploaded"),
             Err(e) => tracing::warn!(error = %e, file = %remote_path, "sync: upload failed"),
@@ -221,7 +235,7 @@ struct Meta {
     modified: u64,
 }
 
-fn walk_local(root: &Path) -> Result<HashMap<PathBuf, Meta>> {
+fn walk_local(root: &Path, ignore: &IgnoreMatcher) -> Result<HashMap<PathBuf, Meta>> {
     let mut out: HashMap<PathBuf, Meta> = HashMap::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -238,17 +252,31 @@ fn walk_local(root: &Path) -> Result<HashMap<PathBuf, Meta>> {
                 Ok(t) => t,
                 Err(_) => continue,
             };
+            let rel = match path.strip_prefix(root) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => continue,
+            };
             if ft.is_dir() {
+                // Pruning at the directory level avoids descending
+                // into giant target/ trees when the user ignored
+                // them.
+                if ignore.is_dir_ignored(&rel) {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
             if !ft.is_file() {
                 continue; // skip symlinks, sockets, etc.
             }
-            let rel = match path.strip_prefix(root) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => continue,
-            };
+            // Skip the .qftpignore file itself -- syncing it to
+            // every remote would be surprising.
+            if rel.as_os_str() == ".qftpignore" {
+                continue;
+            }
+            if ignore.is_file_ignored(&rel) {
+                continue;
+            }
             let meta = entry.metadata().ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = meta
@@ -261,6 +289,106 @@ fn walk_local(root: &Path) -> Result<HashMap<PathBuf, Meta>> {
         }
     }
     Ok(out)
+}
+
+/// `.qftpignore` matcher (#65). One entry per non-empty non-comment
+/// line. The matcher is intentionally simpler than gitignore:
+///
+///   - Trailing `/` -> directory-only.
+///   - Leading `/` -> anchored to the local sync root.
+///   - Otherwise the pattern matches against (a) the full relative
+///     path and (b) any individual component along the way. This is
+///     why `*.log` correctly matches `deep/nested/foo.log` even
+///     though `glob::Pattern` itself doesn't span `/`.
+#[derive(Debug, Default)]
+pub struct IgnoreMatcher {
+    rules: Vec<Rule>,
+}
+
+#[derive(Debug)]
+struct Rule {
+    pattern: glob::Pattern,
+    /// `/foo` -> only matches against the path rooted at the sync
+    /// root, not nested occurrences.
+    anchored: bool,
+    /// `foo/` -> only applies when the candidate is a directory.
+    dir_only: bool,
+}
+
+impl IgnoreMatcher {
+    pub fn load(path: &Path) -> Self {
+        let content = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return Self::default(),
+        };
+        let mut rules = Vec::new();
+        for raw in content.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let dir_only = line.ends_with('/');
+            let mut pat = line.trim_end_matches('/');
+            let anchored = pat.starts_with('/');
+            if anchored {
+                pat = pat.trim_start_matches('/');
+            }
+            match glob::Pattern::new(pat) {
+                Ok(p) => rules.push(Rule {
+                    pattern: p,
+                    anchored,
+                    dir_only,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        pattern = %raw,
+                        error = %e,
+                        "sync: ignoring malformed .qftpignore line"
+                    );
+                }
+            }
+        }
+        Self { rules }
+    }
+
+    pub fn is_file_ignored(&self, rel: &Path) -> bool {
+        self.matches(rel, false)
+    }
+
+    pub fn is_dir_ignored(&self, rel: &Path) -> bool {
+        self.matches(rel, true)
+    }
+
+    fn matches(&self, rel: &Path, is_dir: bool) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        for rule in &self.rules {
+            if rule.dir_only && !is_dir {
+                continue;
+            }
+            if rule.anchored {
+                if rule.pattern.matches(&rel_str) {
+                    return true;
+                }
+            } else {
+                if rule.pattern.matches(&rel_str) {
+                    return true;
+                }
+                // Non-anchored patterns also match any individual
+                // component along the path so `target/` excludes
+                // `a/b/target/c.bin`.
+                for comp in rel.components() {
+                    let c = comp.as_os_str().to_string_lossy();
+                    if rule.pattern.matches(&c) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 fn walk_remote(
@@ -427,5 +555,49 @@ mod tests {
     fn join_remote_prefix() {
         assert_eq!(join_remote("/dst", Path::new("a/b.txt")), "/dst/a/b.txt");
         assert_eq!(join_remote("/dst/", Path::new("a/b.txt")), "/dst/a/b.txt");
+    }
+
+    fn matcher_from(lines: &[&str]) -> IgnoreMatcher {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), lines.join("\n")).unwrap();
+        IgnoreMatcher::load(tmp.path())
+    }
+
+    #[test]
+    fn ignore_matches_suffix_in_nested_dir() {
+        let m = matcher_from(&["*.log"]);
+        assert!(m.is_file_ignored(Path::new("a/b/c.log")));
+        assert!(m.is_file_ignored(Path::new("c.log")));
+        assert!(!m.is_file_ignored(Path::new("c.txt")));
+    }
+
+    #[test]
+    fn ignore_dir_only_pattern() {
+        let m = matcher_from(&["target/"]);
+        assert!(m.is_dir_ignored(Path::new("target")));
+        assert!(m.is_dir_ignored(Path::new("a/target")));
+        // Pure file named `target` is not excluded by the dir-only
+        // form -- gitignore-compatible.
+        assert!(!m.is_file_ignored(Path::new("target")));
+    }
+
+    #[test]
+    fn ignore_anchored_pattern_only_at_root() {
+        let m = matcher_from(&["/build/"]);
+        assert!(m.is_dir_ignored(Path::new("build")));
+        // Nested `build` survives because the rule is anchored.
+        assert!(!m.is_dir_ignored(Path::new("a/build")));
+    }
+
+    #[test]
+    fn ignore_skips_comments_and_blank_lines() {
+        let m = matcher_from(&["# comment", "", "*.tmp"]);
+        assert!(m.is_file_ignored(Path::new("x.tmp")));
+    }
+
+    #[test]
+    fn ignore_default_has_no_rules() {
+        let m = IgnoreMatcher::default();
+        assert!(!m.is_file_ignored(Path::new("anything")));
     }
 }

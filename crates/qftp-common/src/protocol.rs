@@ -233,6 +233,10 @@ pub enum Request {
     /// from where they left off; the server validates that the existing
     /// temp matches that offset before accepting more bytes. `checksum`
     /// (BLAKE3) is verified after the last byte is written.
+    /// `no_clobber` (#70): when true, the server refuses the upload
+    /// with `AlreadyExists` if `path` already exists. Pre-existing
+    /// behavior (silent overwrite) is preserved by the `#[serde(default)]`
+    /// `false`.
     Put {
         path: String,
         size: u64,
@@ -241,6 +245,8 @@ pub enum Request {
         offset: u64,
         #[serde(default)]
         checksum: Option<[u8; 32]>,
+        #[serde(default)]
+        no_clobber: bool,
     },
     Mkdir {
         path: String,
@@ -342,6 +348,7 @@ mod tests {
             mode: 0o644,
             offset: 4096,
             checksum: Some([7u8; 32]),
+            no_clobber: true,
         };
         match round_trip_request(&req) {
             Request::Put {
@@ -350,12 +357,14 @@ mod tests {
                 mode,
                 offset,
                 checksum,
+                no_clobber,
             } => {
                 assert_eq!(path, "dir/file.bin");
                 assert_eq!(size, 12345);
                 assert_eq!(mode, 0o644);
                 assert_eq!(offset, 4096);
                 assert_eq!(checksum, Some([7u8; 32]));
+                assert!(no_clobber);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

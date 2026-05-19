@@ -475,6 +475,7 @@ enum PendingAction {
         mode: u32,
         offset: u64,
         expected_checksum: Option<[u8; 32]>,
+        no_clobber: bool,
         leftover: Vec<u8>,
     },
     HandleSimple {
@@ -633,6 +634,7 @@ fn process_readable_streams(
                             mode,
                             offset,
                             checksum,
+                            no_clobber,
                         } => {
                             let leftover = std::mem::take(stream_buf);
                             actions.push(PendingAction::StartPut {
@@ -642,6 +644,7 @@ fn process_readable_streams(
                                 mode,
                                 offset,
                                 expected_checksum: checksum,
+                                no_clobber,
                                 leftover,
                             });
                             *state = StreamState::Done;
@@ -702,6 +705,7 @@ fn process_readable_streams(
                 mode,
                 offset,
                 expected_checksum,
+                no_clobber,
                 leftover,
             } => {
                 start_put(
@@ -712,6 +716,7 @@ fn process_readable_streams(
                     mode,
                     offset,
                     expected_checksum,
+                    no_clobber,
                     leftover,
                     metrics,
                 )?;
@@ -1064,6 +1069,7 @@ fn start_put(
     mode: u32,
     offset: u64,
     expected_checksum: Option<[u8; 32]>,
+    no_clobber: bool,
     leftover: Vec<u8>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
@@ -1128,6 +1134,20 @@ fn start_put(
         metrics.inc_requests_failed();
         ctx.streams.insert(stream_id, StreamState::Done);
         return Ok(());
+    }
+    // #70: enforce client-requested overwrite refusal. lstat (not
+    // stat) so a planted symlink at `final_path` counts as
+    // "exists" -- otherwise an attacker who could plant a dangling
+    // symlink could bypass --no-clobber by aiming it at /nonexistent.
+    if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
+        ctx.user
+            .in_flight_bytes
+            .fetch_sub(new_bytes, Ordering::Relaxed);
+        return send_err(
+            ctx,
+            ErrorCode::AlreadyExists,
+            format!("path already exists (no_clobber): {path}"),
+        );
     }
     let temp_path = temp_path_for(&final_path, stream_id);
 
@@ -1485,6 +1505,7 @@ mod tests {
             mode: 0o644,
             offset: 0,
             checksum: Some([0u8; 32]),
+            no_clobber: false,
         }));
         assert!(!request_is_replay_safe(&Request::Rm { path: "x".into() }));
         assert!(!request_is_replay_safe(&Request::Mkdir {
