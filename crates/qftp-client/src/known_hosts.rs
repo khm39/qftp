@@ -167,9 +167,51 @@ impl KnownHosts {
         let mut f = opts
             .open(path)
             .with_context(|| format!("failed to open {} for append", path.display()))?;
+        // #123: serialize concurrent `qftp-client -T` invocations so
+        // we don't get duplicate or interleaved entries. flock is
+        // released automatically when the File drops.
+        let _guard = ExclusiveLock::acquire(&f)
+            .with_context(|| format!("failed to flock {}", path.display()))?;
         writeln!(f, "{host_port} sha256:{fingerprint_hex}")
             .with_context(|| format!("failed to write {}", path.display()))?;
+        f.sync_all().ok();
         Ok(())
+    }
+}
+
+/// RAII guard that wraps `flock(LOCK_EX)`. Lock is dropped when the
+/// guard goes out of scope. The caller must keep the underlying
+/// `File` alive at least as long as the guard.
+#[cfg(unix)]
+struct ExclusiveLock(std::os::unix::io::RawFd);
+
+#[cfg(not(unix))]
+struct ExclusiveLock;
+
+#[cfg(unix)]
+impl ExclusiveLock {
+    fn acquire(f: &File) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let fd = f.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(fd))
+    }
+}
+
+#[cfg(not(unix))]
+impl ExclusiveLock {
+    fn acquire(_f: &File) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0, libc::LOCK_UN) };
     }
 }
 
@@ -190,12 +232,20 @@ fn is_valid_fingerprint_hex(s: &str) -> bool {
 
 /// Compute the lowercase-hex SHA-256 of a DER-encoded leaf cert.
 pub fn fingerprint_hex(der: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, der);
     let mut s = String::with_capacity(64);
-    for b in digest.as_ref() {
+    for b in fingerprint_sha256(der).iter() {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Raw 32-byte SHA-256 of a DER-encoded leaf cert. Used for binary
+/// binding fields like the session-ticket file header (#122).
+pub fn fingerprint_sha256(der: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, der);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
 }
 
 /// Default path for the known_hosts file: `~/.qftp/known_hosts`.
