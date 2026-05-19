@@ -353,7 +353,7 @@ pub fn resolve(
 /// Format a host + port for the `SocketAddr` parser. IPv6 literals
 /// must be wrapped in brackets so `[::1]:4433` parses; IPv4 and
 /// hostnames pass through plain.
-fn format_host_port(host: &str, port: u16) -> String {
+pub(crate) fn format_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
     } else {
