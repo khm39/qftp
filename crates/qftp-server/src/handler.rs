@@ -32,6 +32,8 @@ fn set_mode(_target: &Path, _mode: u32) -> Response {
 
 use qftp_common::protocol::{DirEntry, FileStat, Request, Response};
 
+use crate::user::{Op, User};
+
 /// Walk a user-supplied path from `cwd` (or `root` when absolute) one
 /// component at a time, manually handling `.` and `..` and rejecting any
 /// component that would either escape `root` or follow a symbolic link.
@@ -125,8 +127,39 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
     Ok(path)
 }
 
+/// Required permission for a given request. Returns None for requests
+/// that don't need an ACL check (Pwd, Cd, Quit) -- Cd is a navigation,
+/// not a read of file contents, so we don't gate it on `read`.
+fn required_op(req: &Request) -> Option<Op> {
+    match req {
+        Request::Pwd | Request::Cd { .. } | Request::Quit => None,
+        Request::Ls { .. } | Request::Stat { .. } | Request::Get { .. } => Some(Op::Read),
+        Request::Put { .. } => Some(Op::Write),
+        Request::Mkdir { .. } => Some(Op::Mkdir),
+        Request::Rmdir { .. } => Some(Op::Rmdir),
+        Request::Rm { .. } => Some(Op::Delete),
+        Request::Rename { .. } => Some(Op::Rename),
+        Request::Chmod { .. } => Some(Op::Chmod),
+    }
+}
+
+/// Returns Some(err response) when the user doesn't have the permission
+/// the request needs. Callers should short-circuit on Some.
+pub fn acl_reject(user: &User, req: &Request) -> Option<Response> {
+    let op = required_op(req)?;
+    if user.permissions.allows(op) {
+        None
+    } else {
+        Some(Response::Err(format!(
+            "Permission denied: user '{}' is not allowed to {:?}",
+            user.name, op
+        )))
+    }
+}
+
 /// Handle a single FTP request, returning the appropriate response.
-/// Mutates `cwd` when a Cd command succeeds.
+/// Mutates `cwd` when a Cd command succeeds. `root` is the per-user home
+/// (not the global server root): a user can never `cd` above it.
 pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response {
     match req {
         Request::Pwd => {

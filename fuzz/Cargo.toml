@@ -1,0 +1,27 @@
+[package]
+name = "qftp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bincode = "1"
+qftp-common = { path = "../crates/qftp-common" }
+
+[[bin]]
+name = "request_deser"
+path = "fuzz_targets/request_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response_deser"
+path = "fuzz_targets/response_deser.rs"
+test = false
+doc = false
+bench = false

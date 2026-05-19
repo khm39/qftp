@@ -14,6 +14,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 ring = "0.17"
 signal-hook = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+x509-parser = "0.16"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
