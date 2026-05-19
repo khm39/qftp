@@ -81,5 +81,8 @@ style banner. Use `--ca` whenever a real CA chain is available.
   `examples/systemd/qftp-server.service` does this with `DynamicUser=`.
 - Restrict `--root` to its own directory. Don't point it at `/`.
 - Scrape `--metrics-bind` on a private interface; the endpoint serves
-  Prometheus text and is not authenticated.
+  Prometheus text and is not authenticated. Recommended bind is
+  `127.0.0.1:<port>` (or `[::1]:<port>`); for cluster scrapers, bind to
+  a management VLAN or a UNIX-domain-socket fronted proxy. The server
+  logs a loud warning if it sees a non-loopback bind (#143).
 - Set `--log-format json` and forward to your central log pipeline.

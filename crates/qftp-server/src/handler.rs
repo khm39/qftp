@@ -181,6 +181,75 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
     Ok(path)
 }
 
+/// #137: re-walk the ancestors of `target` between `root` (exclusive)
+/// and `target` itself (exclusive) and assert every component lstat's
+/// as a non-symlink. Used as a defense-in-depth re-check just before
+/// `fs::create_dir / remove_dir / remove_file / rename` so a parent
+/// component that was swapped to a symlink between `resolve_parent`
+/// and the syscall can be detected and refused, rather than having
+/// the operation silently target the symlink's destination.
+///
+/// This is the same TOCTOU pattern that handler::set_mode and the
+/// `Stat` arm already guard (#106) but applied to mutating
+/// operations whose parents (not just the leaf) need to stay rooted.
+/// True closure would require openat2(RESOLVE_BENEATH); this re-lstat
+/// only narrows the window.
+pub fn recheck_ancestors_no_symlinks(target: &Path, root: &Path) -> Result<(), ErrorResponse> {
+    // Collect ancestors strictly between `target` (exclusive) and
+    // `root` (inclusive), then walk them root-first so a swap at any
+    // depth is caught.
+    let mut ancestors: Vec<&Path> = Vec::new();
+    let mut cur = target.parent();
+    while let Some(p) = cur {
+        if p == root {
+            ancestors.push(p);
+            break;
+        }
+        if !p.starts_with(root) {
+            return Err(ErrorResponse::new(
+                ErrorCode::PermissionDenied,
+                "path outside root",
+            ));
+        }
+        ancestors.push(p);
+        cur = p.parent();
+    }
+    for ancestor in ancestors.iter().rev() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) => {
+                // `root` itself is allowed to be the canonical
+                // directory the operator pointed us at. Any ancestor
+                // below root must not be a symlink.
+                if meta.file_type().is_symlink() && *ancestor != root {
+                    return Err(ErrorResponse::new(
+                        ErrorCode::PermissionDenied,
+                        format!(
+                            "parent became a symlink between resolve and op ({}, #137)",
+                            ancestor.display()
+                        ),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ErrorResponse::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "parent disappeared between resolve and op: {}",
+                        ancestor.display()
+                    ),
+                ));
+            }
+            Err(e) => {
+                return Err(ErrorResponse::new(
+                    ErrorCode::Internal,
+                    format!("failed to re-stat parent {}: {e}", ancestor.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Required permission for a given request.
 fn required_op(req: &Request) -> Option<Op> {
     match req {
@@ -273,26 +342,41 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         }
 
         Request::Mkdir { path } => match resolve_parent(cwd, root, path) {
-            Ok(target) => match fs::create_dir(&target) {
-                Ok(()) => Response::Ok,
-                Err(e) => err(io_code(&e), format!("mkdir failed: {e}")),
-            },
+            Ok(target) => {
+                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
+                    return Response::Err(e);
+                }
+                match fs::create_dir(&target) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => err(io_code(&e), format!("mkdir failed: {e}")),
+                }
+            }
             Err(e) => Response::Err(e),
         },
 
         Request::Rmdir { path } => match resolve(cwd, root, path) {
-            Ok(target) => match fs::remove_dir(&target) {
-                Ok(()) => Response::Ok,
-                Err(e) => err(io_code(&e), format!("rmdir failed: {e}")),
-            },
+            Ok(target) => {
+                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
+                    return Response::Err(e);
+                }
+                match fs::remove_dir(&target) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => err(io_code(&e), format!("rmdir failed: {e}")),
+                }
+            }
             Err(e) => Response::Err(e),
         },
 
         Request::Rm { path } => match resolve(cwd, root, path) {
-            Ok(target) => match fs::remove_file(&target) {
-                Ok(()) => Response::Ok,
-                Err(e) => err(io_code(&e), format!("rm failed: {e}")),
-            },
+            Ok(target) => {
+                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
+                    return Response::Err(e);
+                }
+                match fs::remove_file(&target) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => err(io_code(&e), format!("rm failed: {e}")),
+                }
+            }
             Err(e) => Response::Err(e),
         },
 
@@ -305,6 +389,12 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                 Ok(p) => p,
                 Err(e) => return Response::Err(e),
             };
+            if let Err(e) = recheck_ancestors_no_symlinks(&src, root) {
+                return Response::Err(e);
+            }
+            if let Err(e) = recheck_ancestors_no_symlinks(&dst, root) {
+                return Response::Err(e);
+            }
             match fs::rename(&src, &dst) {
                 Ok(()) => Response::Ok,
                 Err(e) => err(io_code(&e), format!("rename failed: {e}")),
@@ -466,5 +556,65 @@ mod tests {
             other => panic!("expected NotADirectory error, got {other:?}"),
         }
         assert_eq!(cwd, root);
+    }
+
+    /// #137: simulate the parent-dir TOCTOU. We build `root/sub/leaf`
+    /// at resolve time, then swap `sub` for a symlink (the same
+    /// primitive an attacker would have if they could win the race
+    /// after `walk_safe` returns) and call `recheck_ancestors_no_symlinks`
+    /// directly. The re-check must refuse the operation so Mkdir /
+    /// Rmdir / Rm / Rename never land in the symlink target.
+    #[test]
+    fn recheck_ancestors_catches_parent_swap() {
+        let (_dir, root) = setup_root();
+        let outside = TempDir::new().unwrap();
+        // Compose the path "root/sub/something" with `sub` still being
+        // the real directory walk_safe verified.
+        let target = root.join("sub").join("new-dir");
+        // The first check on the unswapped tree passes.
+        recheck_ancestors_no_symlinks(&target, &root).expect("clean parent should pass");
+        // Now swap `sub` for a symlink to a directory outside the
+        // root, the same shape as a TOCTOU exploit.
+        fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+        let e = recheck_ancestors_no_symlinks(&target, &root)
+            .expect_err("swapped parent must be refused");
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert!(
+            e.message.contains("#137"),
+            "expected error to cite #137, got: {}",
+            e.message
+        );
+    }
+
+    /// #137: end-to-end check against the public handle_request entry
+    /// point. Mkdir on a path whose parent is a symlink must be refused
+    /// even though walk_safe would have validated the (pre-swap) tree.
+    #[test]
+    fn mkdir_refuses_when_parent_is_symlink() {
+        let (_dir, root) = setup_root();
+        let outside = TempDir::new().unwrap();
+        // Replace `sub` with a symlink pointing outside the root.
+        fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+        let mut cwd = root.clone();
+        let resp = handle_request(
+            &Request::Mkdir {
+                path: "sub/new".into(),
+            },
+            &mut cwd,
+            &root,
+        );
+        match resp {
+            Response::Err(e) => {
+                assert_eq!(e.code, ErrorCode::PermissionDenied);
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+        // And the operation must NOT have leaked outside the root.
+        assert!(
+            !outside.path().join("new").exists(),
+            "mkdir leaked into symlink target -- TOCTOU still open"
+        );
     }
 }

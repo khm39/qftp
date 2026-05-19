@@ -377,6 +377,9 @@ fn poll_response(
         handle_ingress(conn, socket, &mut [0u8; 65535])?;
         match recv_message::<Response>(conn, stream_id, &mut buf)? {
             Some(r) => {
+                // #140: per-field cap defense in depth.
+                qftp_common::protocol::validate_response(&r)
+                    .map_err(|e| anyhow!("server sent invalid response: {e}"))?;
                 flush_egress(conn, socket)?;
                 return Ok(r);
             }
