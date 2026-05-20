@@ -370,8 +370,7 @@ pub fn send_message<T: Serialize>(
     // Serialize straight into one length-prefixed buffer: the 4-byte
     // BE prefix up front, then bincode appends the payload after it.
     // Avoids the separate payload Vec + copy the two-step form needed.
-    let payload_len =
-        bincode::serialized_size(msg).context("failed to size message")? as usize;
+    let payload_len = bincode::serialized_size(msg).context("failed to size message")? as usize;
     anyhow::ensure!(
         payload_len <= MAX_MESSAGE_SIZE,
         "message too large: {} bytes (max {})",

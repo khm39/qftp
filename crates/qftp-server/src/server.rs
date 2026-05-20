@@ -318,9 +318,8 @@ pub fn run(
 
     // Handler worker pool, plus the Waker it uses to interrupt poll()
     // as soon as an offloaded request has a response ready (#154, H-1).
-    let waker = Arc::new(
-        Waker::new(poll.registry(), WAKER_TOKEN).context("failed to create mio Waker")?,
-    );
+    let waker =
+        Arc::new(Waker::new(poll.registry(), WAKER_TOKEN).context("failed to create mio Waker")?);
     let handler_pool = spawn_handler_pool(waker);
 
     let rng = ring::rand::SystemRandom::new();
