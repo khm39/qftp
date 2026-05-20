@@ -22,25 +22,29 @@
 //! the loop.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 use tracing::{debug, info, warn};
 
-use crate::connection::{ConnectionContext, StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE};
+use crate::connection::{
+    ConnectionContext, StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+};
 use crate::handler::{self, err, io_code};
 use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
 use crate::retry::RetryKey;
-use crate::user::{self, UserDirectory};
+use crate::user::{self, User, UserDirectory};
 
 /// Which Request variants are safe to serve while the connection is
 /// still in the 0-RTT phase. The rule is "read-only / no
@@ -79,6 +83,15 @@ fn request_is_replay_safe(req: &Request) -> bool {
 }
 
 const SERVER_TOKEN: Token = Token(0);
+/// Token for the mio `Waker` the handler worker pool uses to wake the
+/// event loop as soon as an offloaded request has a response ready.
+const WAKER_TOKEN: Token = Token(1);
+
+/// Number of background threads that run blocking filesystem requests
+/// (Ls/Stat/Mkdir/Rename/Chmod/Rm/...) off the event-loop thread, so a
+/// slow directory walk on one connection can't stall every other
+/// connection (#154, H-1).
+const HANDLER_WORKERS: usize = 4;
 
 /// Static knobs the loop reads on every iteration.
 pub struct ServerConfig {
@@ -88,6 +101,204 @@ pub struct ServerConfig {
     pub rate_limit_rps: f64,
     /// Per-IP request token bucket burst capacity.
     pub rate_limit_burst: f64,
+}
+
+/// A generic request handed to a handler worker thread for off-loop
+/// execution (#154, H-1).
+struct HandlerJob {
+    conn_key: quiche::ConnectionId<'static>,
+    stream_id: u64,
+    req: Request,
+    cwd: PathBuf,
+    user: Arc<User>,
+}
+
+/// The result of a `HandlerJob`, routed back to the event loop.
+struct HandlerResult {
+    conn_key: quiche::ConnectionId<'static>,
+    stream_id: u64,
+    response: Response,
+    /// `cwd` after running the request -- changed only by `Cd`.
+    new_cwd: PathBuf,
+    /// The user the job ran as. Used to detect a mid-flight auth
+    /// upgrade so a stale `cwd` doesn't clobber the upgraded one.
+    user: Arc<User>,
+}
+
+/// Pool of worker threads that execute blocking filesystem requests
+/// off the event-loop thread.
+struct HandlerPool {
+    job_tx: mpsc::Sender<HandlerJob>,
+    result_rx: mpsc::Receiver<HandlerResult>,
+    _workers: Vec<thread::JoinHandle<()>>,
+}
+
+fn spawn_handler_pool(waker: Arc<Waker>) -> HandlerPool {
+    let (job_tx, job_rx) = mpsc::channel::<HandlerJob>();
+    let (result_tx, result_rx) = mpsc::channel::<HandlerResult>();
+    // std mpsc is single-consumer; share the receiver behind a mutex so
+    // every worker pulls from the same queue. The lock is held only for
+    // the brief `recv`, so jobs still fan out across idle workers.
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let mut workers = Vec::with_capacity(HANDLER_WORKERS);
+    for i in 0..HANDLER_WORKERS {
+        let job_rx = Arc::clone(&job_rx);
+        let result_tx = result_tx.clone();
+        let waker = Arc::clone(&waker);
+        let handle = thread::Builder::new()
+            .name(format!("qftp-handler-{i}"))
+            .spawn(move || handler_worker(&job_rx, &result_tx, &waker))
+            .expect("failed to spawn handler worker");
+        workers.push(handle);
+    }
+    HandlerPool {
+        job_tx,
+        result_rx,
+        _workers: workers,
+    }
+}
+
+fn handler_worker(
+    job_rx: &Mutex<mpsc::Receiver<HandlerJob>>,
+    result_tx: &mpsc::Sender<HandlerResult>,
+    waker: &Waker,
+) {
+    loop {
+        // Hold the lock only across `recv`; release it before running
+        // the (potentially slow) filesystem work.
+        let job = {
+            let rx = job_rx.lock().unwrap_or_else(|e| e.into_inner());
+            match rx.recv() {
+                Ok(job) => job,
+                // job_tx dropped: the server is shutting down.
+                Err(_) => return,
+            }
+        };
+        let mut cwd = job.cwd;
+        let response = run_handler(&job.req, &mut cwd, &job.user);
+        let result = HandlerResult {
+            conn_key: job.conn_key,
+            stream_id: job.stream_id,
+            response,
+            new_cwd: cwd,
+            user: job.user,
+        };
+        if result_tx.send(result).is_err() {
+            return; // event loop gone
+        }
+        // Wake the loop so the response goes out without waiting for
+        // the next timeout or inbound packet.
+        let _ = waker.wake();
+    }
+}
+
+/// Run a generic (non-Get/Put/Quota/Quit) protocol request to a
+/// `Response`. This is the blocking-fs body the worker pool executes
+/// off the event-loop thread. `cwd` is updated in place for `Cd`.
+fn run_handler(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
+    // #111: Rm also decrements the per-user used-bytes cache, so it
+    // can't go through the generic handler (which never sees the
+    // deleted file's size). Everything else is plain handle_request.
+    if let Request::Rm { path } = req {
+        match handler::resolve(cwd, &user.home, path) {
+            Ok(target) => {
+                // #137: parent-dir symlink TOCTOU re-check.
+                if let Err(e) = handler::recheck_ancestors_no_symlinks(&target, &user.home) {
+                    Response::Err(e)
+                } else {
+                    let pre_size = std::fs::symlink_metadata(&target)
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    match std::fs::remove_file(&target) {
+                        Ok(()) => {
+                            if pre_size > 0 {
+                                let prev = user.used_bytes.load(Ordering::Relaxed);
+                                user.used_bytes
+                                    .store(prev.saturating_sub(pre_size), Ordering::Relaxed);
+                            }
+                            Response::Ok
+                        }
+                        Err(e) => err(io_code(&e), format!("rm failed: {e}")),
+                    }
+                }
+            }
+            Err(e) => Response::Err(e),
+        }
+    } else {
+        handler::handle_request(req, cwd, &user.home)
+    }
+}
+
+/// Offload a generic handler request to the worker pool. Falls back to
+/// running it inline if the pool channel is somehow closed, so the
+/// client always gets a response. On success the connection is marked
+/// `handler_in_flight`.
+fn dispatch_handler_job(
+    pool: &HandlerPool,
+    ctx: &mut ConnectionContext,
+    metrics: &Metrics,
+    stream_id: u64,
+    req: Request,
+) {
+    let job = HandlerJob {
+        conn_key: ctx.scid.clone(),
+        stream_id,
+        req,
+        cwd: ctx.cwd.clone(),
+        user: Arc::clone(&ctx.user),
+    };
+    match pool.job_tx.send(job) {
+        Ok(()) => ctx.handler_in_flight = true,
+        Err(mpsc::SendError(job)) => {
+            let mut cwd = job.cwd;
+            let response = run_handler(&job.req, &mut cwd, &job.user);
+            ctx.cwd = cwd;
+            if matches!(response, Response::Err(_)) {
+                metrics.inc_requests_failed();
+            }
+            if let Err(e) = send_message(&mut ctx.conn, stream_id, &response) {
+                warn!(stream_id, error = %e, "failed to send handler response");
+            }
+        }
+    }
+}
+
+/// Apply a completed handler job: send the response on its stream,
+/// commit the `cwd` change, and dispatch the next queued request for
+/// that connection (if any).
+fn apply_handler_result(
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+    pool: &HandlerPool,
+    metrics: &Metrics,
+    result: HandlerResult,
+) {
+    let Some(ctx) = connections.get_mut(&result.conn_key) else {
+        // Connection was reaped while the job ran; drop the response.
+        return;
+    };
+    // Commit the cwd only if the connection still belongs to the same
+    // user. A handshake completing mid-flight can upgrade the user (and
+    // reset cwd to the authenticated home); a stale anonymous cwd must
+    // not overwrite that.
+    if Arc::ptr_eq(&ctx.user, &result.user) {
+        ctx.cwd = result.new_cwd;
+    }
+    if matches!(result.response, Response::Err(_)) {
+        metrics.inc_requests_failed();
+    }
+    if let Err(e) = send_message(&mut ctx.conn, result.stream_id, &result.response) {
+        warn!(
+            stream_id = result.stream_id,
+            error = %e,
+            "failed to send handler response"
+        );
+    }
+    ctx.handler_in_flight = false;
+    if let Some((stream_id, req)) = ctx.pending_handler_jobs.pop_front() {
+        dispatch_handler_job(pool, ctx, metrics, stream_id, req);
+    }
 }
 
 pub fn run(
@@ -104,6 +315,12 @@ pub fn run(
         .register(&mut socket, SERVER_TOKEN, Interest::READABLE)
         .context("failed to register socket")?;
     let mut events = Events::with_capacity(1024);
+
+    // Handler worker pool, plus the Waker it uses to interrupt poll()
+    // as soon as an offloaded request has a response ready (#154, H-1).
+    let waker =
+        Arc::new(Waker::new(poll.registry(), WAKER_TOKEN).context("failed to create mio Waker")?);
+    let handler_pool = spawn_handler_pool(waker);
 
     let rng = ring::rand::SystemRandom::new();
     let mut rate_limiter =
@@ -123,6 +340,12 @@ pub fn run(
 
     let mut buf = [0u8; 65536];
     let mut out_pkt = [0u8; 1350];
+    // Reused scratch for the Get send path; allocated once so the
+    // larger SEND_CHUNK_SIZE costs nothing per loop iteration.
+    let mut send_buf = vec![0u8; SEND_CHUNK_SIZE];
+    // Reused scratch for the per-iteration list of streams that are
+    // actively sending, so the collect() doesn't allocate each pass.
+    let mut sender_ids: Vec<u64> = Vec::new();
     let mut closing = false;
 
     info!(
@@ -171,26 +394,26 @@ pub fn run(
             };
 
             // Route to existing connection. For established connections
-            // the peer's DCID is the SCID we issued. For Initial
-            // retransmits during handshake the peer is still using their
-            // original DCID, so also try its derived alias.
-            let alias = derive_scid(&conn_id_seed, &hdr.dcid);
-            let key = if connections.contains_key(&hdr.dcid) {
-                Some(hdr.dcid.clone().into_owned())
-            } else if connections.contains_key(&alias) {
-                Some(alias.clone())
-            } else {
-                None
+            // the peer's DCID is the SCID we issued, so this lookup hits
+            // first and is the only one we pay for on the hot path. The
+            // borrowed DCID is used as the key directly -- no owned
+            // clone -- and the derived alias is only computed on a miss.
+            let recv_info = quiche::RecvInfo {
+                from,
+                to: local_addr,
             };
-            if let Some(k) = key {
-                let recv_info = quiche::RecvInfo {
-                    from,
-                    to: local_addr,
-                };
-                if let Some(ctx) = connections.get_mut(&k) {
-                    if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
-                        warn!(peer = %from, error = ?e, "QUIC recv error");
-                    }
+            if let Some(ctx) = connections.get_mut(&hdr.dcid) {
+                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                    warn!(peer = %from, error = ?e, "QUIC recv error");
+                }
+                continue;
+            }
+            // Miss: Initial retransmits during the handshake still carry
+            // the peer's original DCID, so try its derived alias too.
+            let alias = derive_scid(&conn_id_seed, &hdr.dcid);
+            if let Some(ctx) = connections.get_mut(&alias) {
+                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                    warn!(peer = %from, error = ?e, "QUIC recv error");
                 }
                 continue;
             }
@@ -225,6 +448,11 @@ pub fn run(
             )?;
         }
 
+        // 1.5. Drain completed handler jobs and send their responses.
+        while let Ok(result) = handler_pool.result_rx.try_recv() {
+            apply_handler_result(&mut connections, &handler_pool, &metrics, result);
+        }
+
         // 2. on_timeout.
         for ctx in connections.values_mut() {
             ctx.conn.on_timeout();
@@ -232,8 +460,16 @@ pub fn run(
 
         // 3-5. Per-connection work: streams + sending + egress.
         for ctx in connections.values_mut() {
-            process_readable_streams(ctx, &socket, &users, &metrics, &mut rate_limiter, &mut buf)?;
-            drive_sending_streams(ctx, &socket, &metrics)?;
+            process_readable_streams(
+                ctx,
+                &socket,
+                &users,
+                &metrics,
+                &mut rate_limiter,
+                &mut buf,
+                &handler_pool,
+            )?;
+            drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)?;
             flush_egress(&mut ctx.conn, &socket)?;
         }
 
@@ -348,7 +584,7 @@ fn try_accept(
 
     // mTLS identity isn't ready until the handshake completes; start the
     // connection as the anonymous user and upgrade later if we can.
-    let ctx = ConnectionContext::new(conn, from, users.anonymous());
+    let ctx = ConnectionContext::new(conn, from, users.anonymous(), scid.clone());
     info!(peer = %from, "connection accepted");
     metrics.inc_connections_total();
     metrics.inc_connections_open();
@@ -503,6 +739,7 @@ fn process_readable_streams(
     metrics: &Arc<Metrics>,
     rate_limiter: &mut RateLimiter,
     tmp: &mut [u8],
+    pool: &HandlerPool,
 ) -> Result<()> {
     upgrade_user_from_cert(ctx, users);
     let readable: Vec<u64> = ctx.conn.readable().collect();
@@ -723,6 +960,7 @@ fn process_readable_streams(
                     no_clobber,
                     checksum_trailer,
                     leftover,
+                    tmp,
                     metrics,
                 )?;
             }
@@ -748,52 +986,17 @@ fn process_readable_streams(
                 send_message(&mut ctx.conn, stream_id, &resp)?;
             }
             PendingAction::HandleSimple { stream_id, req } => {
-                // #111: for Rm we want to decrement the per-user
-                // used-bytes cache by the deleted file's size on
-                // success. The plain handler path doesn't return the
-                // size, so we stat-then-delete here and only invoke
-                // the generic handler for non-Rm variants.
-                let response = if let Request::Rm { path } = &req {
-                    match handler::resolve(&ctx.cwd, &ctx.user.home, path) {
-                        Ok(target) => {
-                            // #137: parent-dir symlink TOCTOU re-check
-                            // mirrors handler::handle_request's
-                            // Mkdir/Rmdir/Rm/Rename guard. This Rm path
-                            // is here (rather than in the generic
-                            // handler) only because it also has to
-                            // decrement the per-user used-bytes cache.
-                            if let Err(e) =
-                                handler::recheck_ancestors_no_symlinks(&target, &ctx.user.home)
-                            {
-                                Response::Err(e)
-                            } else {
-                                let pre_size = std::fs::symlink_metadata(&target)
-                                    .ok()
-                                    .filter(|m| m.is_file())
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
-                                match std::fs::remove_file(&target) {
-                                    Ok(()) => {
-                                        if pre_size > 0 {
-                                            let prev = ctx.user.used_bytes.load(Ordering::Relaxed);
-                                            let next = prev.saturating_sub(pre_size);
-                                            ctx.user.used_bytes.store(next, Ordering::Relaxed);
-                                        }
-                                        Response::Ok
-                                    }
-                                    Err(e) => err(io_code(&e), format!("rm failed: {e}")),
-                                }
-                            }
-                        }
-                        Err(e) => Response::Err(e),
-                    }
+                // H-1 (#154): generic requests run blocking filesystem
+                // syscalls, so they're offloaded to the worker pool
+                // rather than stalling the event loop. One job at a
+                // time per connection keeps `cwd` updates from `Cd`
+                // correctly ordered; extra requests queue until the
+                // in-flight job completes.
+                if ctx.handler_in_flight {
+                    ctx.pending_handler_jobs.push_back((stream_id, req));
                 } else {
-                    handler::handle_request(&req, &mut ctx.cwd, &ctx.user.home)
-                };
-                if matches!(response, Response::Err(_)) {
-                    metrics.inc_requests_failed();
+                    dispatch_handler_job(pool, ctx, metrics, stream_id, req);
                 }
-                send_message(&mut ctx.conn, stream_id, &response)?;
             }
         }
     }
@@ -905,7 +1108,7 @@ fn start_get(
     ctx.streams.insert(
         stream_id,
         StreamState::SendingFileData {
-            reader: std::io::BufReader::with_capacity(FILE_CHUNK_SIZE, file),
+            reader: std::io::BufReader::with_capacity(SEND_CHUNK_SIZE, file),
             total_size: bytes_to_send,
             sent: 0,
             hasher: blake3::Hasher::new(),
@@ -921,19 +1124,21 @@ fn drive_sending_streams(
     ctx: &mut ConnectionContext,
     _socket: &mio::net::UdpSocket,
     metrics: &Arc<Metrics>,
+    send_buf: &mut [u8],
+    sender_ids: &mut Vec<u64>,
 ) -> Result<()> {
-    let stream_ids: Vec<u64> = ctx
-        .streams
-        .iter()
-        .filter(|(_, s)| matches!(s, StreamState::SendingFileData { .. }))
-        .map(|(id, _)| *id)
-        .collect();
+    sender_ids.clear();
+    sender_ids.extend(
+        ctx.streams
+            .iter()
+            .filter(|(_, s)| matches!(s, StreamState::SendingFileData { .. }))
+            .map(|(id, _)| *id),
+    );
 
-    let mut chunk = [0u8; FILE_CHUNK_SIZE];
-    for stream_id in stream_ids {
+    for &stream_id in sender_ids.iter() {
         // After this call we either mark the stream Done, or we leave a
         // SendingFileData with updated counters for the next iteration.
-        let outcome = drive_one_sender(ctx, stream_id, &mut chunk, metrics);
+        let outcome = drive_one_sender(ctx, stream_id, send_buf, metrics);
         if outcome == SendOutcome::Finished {
             if let Some(state) = ctx.streams.get_mut(&stream_id) {
                 *state = StreamState::Done;
@@ -1077,6 +1282,7 @@ fn start_put(
     no_clobber: bool,
     checksum_trailer: bool,
     leftover: Vec<u8>,
+    scratch: &mut [u8],
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
@@ -1210,12 +1416,11 @@ fn start_put(
                 );
             }
         };
-        let mut copy_buf = [0u8; FILE_CHUNK_SIZE];
         loop {
-            match std::io::Read::read(&mut existing, &mut copy_buf) {
+            match std::io::Read::read(&mut existing, scratch) {
                 Ok(0) => break,
                 Ok(n) => {
-                    hasher.update(&copy_buf[..n]);
+                    hasher.update(&scratch[..n]);
                 }
                 Err(e) => {
                     return send_err(
@@ -1289,9 +1494,8 @@ fn start_put(
     ctx.streams.insert(stream_id, new_state);
 
     // Drain anything already buffered for this stream.
-    let mut tmp = [0u8; FILE_CHUNK_SIZE];
     if let Some(state) = ctx.streams.get_mut(&stream_id) {
-        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, &mut tmp, metrics)? {
+        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, scratch, metrics)? {
             if matches!(resp, Response::Err(_)) {
                 metrics.inc_requests_failed();
             }
@@ -1525,7 +1729,7 @@ fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
     let _ = ring::rand::SystemRandom::new().fill(&mut rand_bytes);
     let mut suffix = String::with_capacity(16);
     for b in rand_bytes {
-        suffix.push_str(&format!("{b:02x}"));
+        let _ = write!(suffix, "{b:02x}");
     }
 
     let mut name = final_path

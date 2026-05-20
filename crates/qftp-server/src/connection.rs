@@ -4,7 +4,7 @@
 //! quiche connection itself, the user it authenticated as, that user's
 //! current working directory, and a per-stream state machine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::BufWriter;
 use std::net::SocketAddr;
@@ -13,13 +13,22 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use qftp_common::protocol::Request;
+
 use crate::user::User;
 
 /// Maximum file size accepted by Get/Put.
 pub const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
-/// Chunk size used for streaming file reads and stream sends.
+/// Chunk size used for streaming file reads and Put receive buffers.
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Chunk size used for the Get send path. Larger than `FILE_CHUNK_SIZE`
+/// so each main-loop iteration hands quiche a bigger batch and the
+/// outer per-stream loop runs fewer times per transfer. The buffer is
+/// heap-allocated once in `run()` and reused, so the size does not add
+/// stack or per-iteration zeroing cost.
+pub const SEND_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Incremental buffer for the streaming BLAKE3 trailer that arrives
 /// after a Put body (#152). The trailer is always exactly 32 bytes;
@@ -167,10 +176,27 @@ pub struct ConnectionContext {
     /// When the connection was accepted. Used for soak-test diagnostics.
     #[allow(dead_code)]
     pub created_at: Instant,
+    /// The SCID the server issued for this connection -- the key it is
+    /// stored under in the connection table. Held here so an offloaded
+    /// handler job can be routed back to this connection (#154, H-1).
+    pub scid: quiche::ConnectionId<'static>,
+    /// True while a generic handler request for this connection is
+    /// running on a worker thread. Generic requests are processed one
+    /// at a time per connection so `cwd` updates from `Cd` stay
+    /// correctly ordered (#154, H-1).
+    pub handler_in_flight: bool,
+    /// Generic handler requests received while `handler_in_flight` was
+    /// set. Dispatched FIFO as each in-flight job completes.
+    pub pending_handler_jobs: VecDeque<(u64, Request)>,
 }
 
 impl ConnectionContext {
-    pub fn new(conn: quiche::Connection, peer_addr: SocketAddr, user: Arc<User>) -> Self {
+    pub fn new(
+        conn: quiche::Connection,
+        peer_addr: SocketAddr,
+        user: Arc<User>,
+        scid: quiche::ConnectionId<'static>,
+    ) -> Self {
         let cwd = user.home.clone();
         Self {
             conn,
@@ -179,6 +205,9 @@ impl ConnectionContext {
             cwd,
             streams: HashMap::new(),
             created_at: Instant::now(),
+            scid,
+            handler_in_flight: false,
+            pending_handler_jobs: VecDeque::new(),
         }
     }
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -299,16 +300,16 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         },
 
         Request::Ls { path } => {
-            let dir = if path.is_empty() {
-                Ok(cwd.clone())
+            let dir: Result<Cow<Path>, ErrorResponse> = if path.is_empty() {
+                Ok(Cow::Borrowed(cwd.as_path()))
             } else {
-                resolve(cwd, root, path)
+                resolve(cwd, root, path).map(Cow::Owned)
             };
 
             match dir {
-                Ok(dir) => match fs::read_dir(&dir) {
+                Ok(dir) => match fs::read_dir(&*dir) {
                     Ok(entries) => {
-                        let mut listing: Vec<DirEntry> = Vec::new();
+                        let mut listing: Vec<DirEntry> = Vec::with_capacity(64);
                         for entry in entries {
                             let entry = match entry {
                                 Ok(e) => e,
@@ -325,7 +326,13 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
                             listing.push(DirEntry {
-                                name: entry.file_name().to_string_lossy().into_owned(),
+                                // into_string() is a zero-copy OsString ->
+                                // String move for the UTF-8 common case;
+                                // fall back to lossy only for non-UTF-8.
+                                name: entry
+                                    .file_name()
+                                    .into_string()
+                                    .unwrap_or_else(|os| os.to_string_lossy().into_owned()),
                                 is_dir: meta.is_dir(),
                                 size: meta.len(),
                                 modified,
