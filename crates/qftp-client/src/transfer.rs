@@ -18,6 +18,8 @@ use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
+use crate::proto::{poll_response, poll_response_with_buf};
+
 const CHUNK: usize = 64 * 1024;
 
 /// Outer-loop buffer for the upload body. Sized much larger than the
@@ -598,72 +600,6 @@ fn unix_mode(meta: &std::fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn unix_mode(_meta: &std::fs::Metadata) -> u32 {
     0o644
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    poll_response_with_buf(conn, socket, poll, events, stream_id, &mut buf)
-}
-
-/// Same as [`poll_response`] but lets the caller observe whatever
-/// trailing bytes recv_message pulled off the stream beyond the
-/// response frame. For `Get`, the FileReady response and the first
-/// chunk of body bytes can arrive together; without this the body
-/// bytes that were already drained from quiche would be lost when the
-/// caller's body-read loop took over.
-fn poll_response_with_buf(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-    buf: &mut Vec<u8>,
-) -> Result<Response> {
-    let mut recv_buf = [0u8; 65535];
-    loop {
-        // Try to deserialize a response from anything quiche already
-        // has buffered on this stream BEFORE blocking in poll.poll.
-        // The body-send loop in `do_put` runs a final ingress pump
-        // after the last chunk goes out, and the server's response
-        // packet often arrives during that pump -- so by the time we
-        // get here the response bytes are already sitting in the
-        // stream's recv buffer. Without this pre-poll drain we would
-        // call poll.poll(timeout=30s) and sleep on the QUIC idle
-        // timeout even though the message has been delivered.
-        if let Some(resp) = recv_message::<Response>(conn, stream_id, buf)? {
-            flush_egress(conn, socket)?;
-            return Ok(resp);
-        }
-
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut recv_buf)?;
-
-        match recv_message::<Response>(conn, stream_id, buf)? {
-            Some(resp) => {
-                // #140: per-field cap defense in depth against a
-                // malicious server packing a multi-MiB string / huge
-                // listing into a single field.
-                qftp_common::protocol::validate_response(&resp)
-                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
-                flush_egress(conn, socket)?;
-                return Ok(resp);
-            }
-            None => {
-                flush_egress(conn, socket)?;
-            }
-        }
-
-        if conn.is_closed() {
-            bail!("Connection closed");
-        }
-    }
 }
 
 #[cfg(test)]

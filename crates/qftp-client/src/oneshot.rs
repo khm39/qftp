@@ -9,7 +9,6 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use mio::{Events, Poll};
@@ -17,6 +16,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, ConnectionSpec, Overrides};
+use crate::proto::{request_response, take_stream};
 use crate::session_store;
 use crate::transfer;
 use crate::OneShot;
@@ -110,60 +110,6 @@ where
     }
 
     Ok(code)
-}
-
-fn take_stream(next: &mut u64) -> u64 {
-    let cur = *next;
-    *next += 4;
-    cur
-}
-
-/// Single round-trip request that expects a single `Response`.
-fn one_request(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
-    req: &Request,
-) -> Result<Response> {
-    let stream_id = take_stream(next_stream_id);
-    send_message(conn, stream_id, req)?;
-    stream_send_all(conn, stream_id, &[], true)?;
-    flush_egress(conn, socket)?;
-    poll_response(conn, socket, poll, events, stream_id)
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    let mut recv_buf = [0u8; 65535];
-    loop {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut recv_buf)?;
-
-        match recv_message::<Response>(conn, stream_id, &mut buf)? {
-            Some(resp) => {
-                // #140: per-field cap defense in depth.
-                qftp_common::protocol::validate_response(&resp)
-                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
-                flush_egress(conn, socket)?;
-                return Ok(resp);
-            }
-            None => {
-                flush_egress(conn, socket)?;
-            }
-        }
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed");
-        }
-    }
 }
 
 /// Map a `Response::Err` ErrorCode to a sysexits-style exit code so a
@@ -313,7 +259,7 @@ fn run_remote_oneshot(
     let spec = spec_from_url(&r, overrides)?;
     let req = build(&r.path);
     with_connection(&spec, |conn, socket, poll, events, next| {
-        let resp = one_request(conn, socket, poll, events, next, &req)?;
+        let resp = request_response(conn, socket, poll, events, next, &req)?;
         // Special-case Response::Path for Pwd / Stat-like reads:
         // print the value so the user actually sees something.
         if let Response::Path(p) = &resp {
@@ -334,7 +280,7 @@ fn run_stat(url: &str, overrides: &Overrides) -> Result<i32> {
         path: r.path.clone(),
     };
     with_connection(&spec, |conn, socket, poll, events, next| {
-        let resp = one_request(conn, socket, poll, events, next, &req)?;
+        let resp = request_response(conn, socket, poll, events, next, &req)?;
         match &resp {
             Response::FileStat(s) => {
                 println!("size  {}", s.size);
@@ -364,7 +310,7 @@ fn run_rename(from_url: &str, to_url: &str, overrides: &Overrides) -> Result<i32
         to: to.path.clone(),
     };
     with_connection(&spec, |conn, socket, poll, events, next| {
-        let resp = one_request(conn, socket, poll, events, next, &req)?;
+        let resp = request_response(conn, socket, poll, events, next, &req)?;
         Ok(report_response_for_status(&resp))
     })
 }
@@ -592,7 +538,7 @@ fn remote_exists(
     next: &mut u64,
     path: &str,
 ) -> Result<Option<bool>> {
-    let resp = one_request(
+    let resp = request_response(
         conn,
         socket,
         poll,

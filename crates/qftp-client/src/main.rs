@@ -16,12 +16,15 @@ mod connect;
 mod fanout;
 mod known_hosts;
 mod oneshot;
+mod proto;
 mod repl;
 mod session_store;
 mod stats;
 mod sync;
 mod transfer;
 mod watch;
+
+use proto::{request_response, take_stream};
 
 const CLIENT: Token = Token(0);
 
@@ -466,11 +469,15 @@ fn main() -> Result<()> {
     let mut local_cwd: PathBuf = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if let Some(path) = &spec.initial_path {
-        let stream_id = take_stream(&mut next_stream_id);
-        send_message(&mut conn, stream_id, &Request::Cd { path: path.clone() })?;
-        stream_send_all(&mut conn, stream_id, &[], true)?;
-        flush_egress(&mut conn, &socket)?;
-        match poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)? {
+        let req = Request::Cd { path: path.clone() };
+        match request_response(
+            &mut conn,
+            &socket,
+            &mut poll,
+            &mut events,
+            &mut next_stream_id,
+            &req,
+        )? {
             Response::Ok => {}
             Response::Err(e) => {
                 eprintln!("initial cd {} failed: [{:?}] {}", path, e.code, e.message);
@@ -708,11 +715,7 @@ fn run_one_line(
         }
         repl::Command::Remote(req) => {
             let is_quit = matches!(req, Request::Quit);
-            let stream_id = take_stream(next_stream_id);
-            send_message(conn, stream_id, &req)?;
-            stream_send_all(conn, stream_id, &[], true)?;
-            flush_egress(conn, socket)?;
-            let resp = poll_response(conn, socket, poll, events, stream_id)?;
+            let resp = request_response(conn, socket, poll, events, next_stream_id, &req)?;
             repl::display_response(&resp);
             if is_quit {
                 *quit_out = true;
@@ -807,12 +810,6 @@ fn run_one_line(
     Ok(())
 }
 
-fn take_stream(next: &mut u64) -> u64 {
-    let cur = *next;
-    *next += 4;
-    cur
-}
-
 /// Resolve a user-supplied local path against the REPL's local cwd.
 /// Absolute paths and paths starting with `~/` pass through; relative
 /// paths are joined onto `local_cwd`.
@@ -830,38 +827,6 @@ fn expand_glob(pattern: &str) -> Vec<PathBuf> {
     match glob::glob(pattern) {
         Ok(paths) => paths.filter_map(|p| p.ok()).collect(),
         Err(_) => vec![PathBuf::from(pattern)],
-    }
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    let mut recv_buf = [0u8; 65535];
-    loop {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut recv_buf)?;
-
-        match recv_message::<Response>(conn, stream_id, &mut buf)? {
-            Some(resp) => {
-                // #140: per-field cap defense in depth.
-                qftp_common::protocol::validate_response(&resp)
-                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
-                flush_egress(conn, socket)?;
-                return Ok(resp);
-            }
-            None => {
-                flush_egress(conn, socket)?;
-            }
-        }
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed");
-        }
     }
 }
 
@@ -888,12 +853,8 @@ fn do_recursive_get(
     // BFS via Ls.
     let mut queue: Vec<(String, PathBuf)> = vec![(remote.to_string(), local_root.clone())];
     while let Some((rdir, ldir)) = queue.pop() {
-        let stream_id = take_stream(next_stream_id);
         let req = Request::Ls { path: rdir.clone() };
-        send_message(conn, stream_id, &req)?;
-        stream_send_all(conn, stream_id, &[], true)?;
-        flush_egress(conn, socket)?;
-        let resp = poll_response(conn, socket, poll, events, stream_id)?;
+        let resp = request_response(conn, socket, poll, events, next_stream_id, &req)?;
         let entries = match resp {
             Response::DirListing(e) => e,
             Response::Err(e) => {
@@ -972,17 +933,16 @@ fn do_recursive_put(
         );
     }
     // Ensure top-level mkdir.
-    let stream_id = take_stream(next_stream_id);
-    send_message(
+    let _ = request_response(
         conn,
-        stream_id,
+        socket,
+        poll,
+        events,
+        next_stream_id,
         &Request::Mkdir {
             path: remote_root.to_string(),
         },
     )?;
-    stream_send_all(conn, stream_id, &[], true)?;
-    flush_egress(conn, socket)?;
-    let _ = poll_response(conn, socket, poll, events, stream_id)?;
 
     // BFS local.
     let mut queue: Vec<(PathBuf, String)> = vec![(local.to_path_buf(), remote_root.to_string())];
@@ -1004,17 +964,16 @@ fn do_recursive_put(
                 format!("{rremote}/{name_str}")
             };
             if path.is_dir() {
-                let stream_id = take_stream(next_stream_id);
-                send_message(
+                let _ = request_response(
                     conn,
-                    stream_id,
+                    socket,
+                    poll,
+                    events,
+                    next_stream_id,
                     &Request::Mkdir {
                         path: remote_child.clone(),
                     },
                 )?;
-                stream_send_all(conn, stream_id, &[], true)?;
-                flush_egress(conn, socket)?;
-                let _ = poll_response(conn, socket, poll, events, stream_id)?;
                 queue.push((path, remote_child));
             } else {
                 let stream_id = take_stream(next_stream_id);
