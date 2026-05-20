@@ -182,7 +182,7 @@ pub fn expand_tilde(p: &str) -> String {
 
 /// CLI-level overrides; `None` means "leave whatever was resolved
 /// from URL/config alone".
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Overrides {
     pub host: Option<String>,
     pub server_name: Option<String>,

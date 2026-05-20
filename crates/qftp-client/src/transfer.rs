@@ -558,8 +558,9 @@ fn do_put_inner(
     let trailer = *hasher.finalize().as_bytes();
     let mut sub = 0usize;
     while sub < trailer.len() {
-        let chunk_fin = sub == 0 || sub + (trailer.len() - sub) == trailer.len();
-        match conn.stream_send(stream_id, &trailer[sub..], chunk_fin) {
+        // The trailer is the last data on the stream, so every write
+        // carries FIN; quiche keeps it pending across partial writes.
+        match conn.stream_send(stream_id, &trailer[sub..], true) {
             Ok(0) | Err(quiche::Error::Done) => {
                 flush_egress(conn, socket)?;
                 poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;

@@ -61,7 +61,7 @@ pub fn run(
         let host = host.clone();
         let local_path = local_path.clone();
         let remote_path = remote_path.to_string();
-        let overrides = clone_overrides(overrides);
+        let overrides = overrides.clone();
         let results = Arc::clone(&results);
         let h = thread::Builder::new()
             .name(format!("fanout-{host}"))
@@ -212,21 +212,10 @@ fn hash_blake3(path: &std::path::Path) -> Result<[u8; 32]> {
 }
 
 fn hex_short(b: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut s = String::with_capacity(16);
     for byte in b.iter().take(8) {
-        s.push_str(&format!("{byte:02x}"));
+        let _ = write!(s, "{byte:02x}");
     }
     s
-}
-
-/// Manual clone for `Overrides` since the struct isn't `Clone`.
-fn clone_overrides(o: &Overrides) -> Overrides {
-    Overrides {
-        host: o.host.clone(),
-        server_name: o.server_name.clone(),
-        insecure: o.insecure,
-        ca: o.ca.clone(),
-        client_cert: o.client_cert.clone(),
-        client_key: o.client_key.clone(),
-    }
 }

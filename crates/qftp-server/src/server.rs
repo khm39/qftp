@@ -514,8 +514,8 @@ fn try_accept(
     retry_key: &RetryKey,
     conn_id_seed: &[u8; 32],
     cfg: &ServerConfig,
-    users: &Arc<UserDirectory>,
-    metrics: &Arc<Metrics>,
+    users: &UserDirectory,
+    metrics: &Metrics,
     rng: &ring::rand::SystemRandom,
     socket: &mio::net::UdpSocket,
     quiche_config: &mut quiche::Config,
@@ -739,7 +739,7 @@ fn process_readable_streams(
     ctx: &mut ConnectionContext,
     socket: &mio::net::UdpSocket,
     users: &UserDirectory,
-    metrics: &Arc<Metrics>,
+    metrics: &Metrics,
     rate_limiter: &mut RateLimiter,
     tmp: &mut [u8],
     pool: &HandlerPool,
@@ -1030,7 +1030,7 @@ fn start_get(
     path: &str,
     offset: u64,
     length: Option<u64>,
-    metrics: &Arc<Metrics>,
+    metrics: &Metrics,
 ) -> Result<()> {
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
         fail_stream(ctx, stream_id, metrics, err(code, msg))
@@ -1128,7 +1128,7 @@ fn start_get(
 fn drive_sending_streams(
     ctx: &mut ConnectionContext,
     _socket: &mio::net::UdpSocket,
-    metrics: &Arc<Metrics>,
+    metrics: &Metrics,
     send_buf: &mut [u8],
     sender_ids: &mut Vec<u64>,
 ) -> Result<()> {
@@ -1164,7 +1164,7 @@ fn drive_one_sender(
     ctx: &mut ConnectionContext,
     stream_id: u64,
     chunk: &mut [u8],
-    metrics: &Arc<Metrics>,
+    metrics: &Metrics,
 ) -> SendOutcome {
     let Some(state) = ctx.streams.get_mut(&stream_id) else {
         return SendOutcome::Finished;
@@ -1288,7 +1288,7 @@ fn start_put(
     checksum_trailer: bool,
     leftover: Vec<u8>,
     scratch: &mut [u8],
-    metrics: &Arc<Metrics>,
+    metrics: &Metrics,
 ) -> Result<()> {
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
         fail_stream(ctx, stream_id, metrics, err(code, msg))
@@ -1516,7 +1516,7 @@ fn drive_put(
     stream_id: u64,
     state: &mut StreamState,
     tmp: &mut [u8],
-    metrics: &Arc<Metrics>,
+    metrics: &Metrics,
 ) -> Result<Option<Response>> {
     let StreamState::ReadingFileData {
         final_path,
