@@ -346,6 +346,8 @@ pub fn run(
     // Reused scratch for the per-iteration list of streams that are
     // actively sending, so the collect() doesn't allocate each pass.
     let mut sender_ids: Vec<u64> = Vec::new();
+    // Same idea for the readable-stream sweep.
+    let mut readable_ids: Vec<u64> = Vec::new();
     let mut closing = false;
 
     info!(
@@ -468,6 +470,7 @@ pub fn run(
                 &mut rate_limiter,
                 &mut buf,
                 &handler_pool,
+                &mut readable_ids,
             )?;
             drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)?;
             flush_egress(&mut ctx.conn, &socket)?;
@@ -740,14 +743,16 @@ fn process_readable_streams(
     rate_limiter: &mut RateLimiter,
     tmp: &mut [u8],
     pool: &HandlerPool,
+    readable_ids: &mut Vec<u64>,
 ) -> Result<()> {
     upgrade_user_from_cert(ctx, users);
-    let readable: Vec<u64> = ctx.conn.readable().collect();
+    readable_ids.clear();
+    readable_ids.extend(ctx.conn.readable());
     let peer_ip = ctx.peer_addr.ip();
 
     let mut actions: Vec<PendingAction> = Vec::new();
 
-    for stream_id in readable {
+    for &stream_id in readable_ids.iter() {
         let state = ctx
             .streams
             .entry(stream_id)

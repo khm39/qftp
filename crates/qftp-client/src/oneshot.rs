@@ -142,10 +142,11 @@ fn poll_response(
     stream_id: u64,
 ) -> Result<Response> {
     let mut buf = Vec::new();
+    let mut recv_buf = [0u8; 65535];
     loop {
         poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
         conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
+        handle_ingress(conn, socket, &mut recv_buf)?;
 
         match recv_message::<Response>(conn, stream_id, &mut buf)? {
             Some(resp) => {

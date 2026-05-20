@@ -271,6 +271,7 @@ fn do_get_inner(
     let mut received: u64 = 0;
     let mut trailer = Vec::<u8>::new();
     let mut tmp = [0u8; CHUNK];
+    let mut recv_buf = [0u8; 65535];
 
     let want_trailer = if checksum_follows { 32 } else { 0 };
     let mut stream_finished = false;
@@ -303,7 +304,6 @@ fn do_get_inner(
         // one in `poll_response_with_buf`); the response was sitting
         // on the stream and the kernel UDP buffer was empty, so
         // epoll had no edge event to fire.
-        let mut recv_buf = [0u8; 65535];
         handle_ingress(conn, socket, &mut recv_buf)?;
 
         let mut drained_any = false;
@@ -624,6 +624,7 @@ fn poll_response_with_buf(
     stream_id: u64,
     buf: &mut Vec<u8>,
 ) -> Result<Response> {
+    let mut recv_buf = [0u8; 65535];
     loop {
         // Try to deserialize a response from anything quiche already
         // has buffered on this stream BEFORE blocking in poll.poll.
@@ -641,7 +642,7 @@ fn poll_response_with_buf(
 
         poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
         conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
+        handle_ingress(conn, socket, &mut recv_buf)?;
 
         match recv_message::<Response>(conn, stream_id, buf)? {
             Some(resp) => {

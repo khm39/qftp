@@ -84,6 +84,17 @@ const GSO_BURST_PACKETS: usize = 32;
 #[cfg(target_os = "linux")]
 static GSO_USABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+// Reusable per-thread scratch for the GSO coalescing path. `flush_egress`
+// runs once per connection per event-loop iteration, so allocating this
+// buffer per call shows up on the hot path; a thread-local keeps one
+// buffer alive for the lifetime of each thread that flushes (the server
+// loop, each client, each fanout worker).
+#[cfg(target_os = "linux")]
+thread_local! {
+    static GSO_BUF: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(vec![0u8; MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS]);
+}
+
 /// Flush pending outgoing packets from the QUIC connection to the UDP
 /// socket. On Linux this coalesces up to `GSO_BURST_PACKETS` datagrams
 /// into a single `sendmsg(UDP_SEGMENT)` (#151); on other platforms,
@@ -134,8 +145,17 @@ fn flush_egress_linux(conn: &mut quiche::Connection, socket: &mio::net::UdpSocke
         return flush_egress_per_packet(conn, socket);
     }
 
-    let mut buf = vec![0u8; MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS];
+    GSO_BUF.with(|cell| flush_egress_gso(conn, socket, cell.borrow_mut().as_mut_slice()))
+}
 
+/// GSO-coalescing flush loop. `buf` is caller-provided reusable scratch
+/// (`GSO_BUF`), at least `MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS` bytes.
+#[cfg(target_os = "linux")]
+fn flush_egress_gso(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    buf: &mut [u8],
+) -> Result<()> {
     'outer: loop {
         let mut total = 0usize;
         let mut seg_size = 0usize;
