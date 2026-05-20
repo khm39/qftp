@@ -367,17 +367,20 @@ pub fn send_message<T: Serialize>(
     stream_id: u64,
     msg: &T,
 ) -> Result<()> {
-    let payload = bincode::serialize(msg).context("failed to serialize message")?;
+    // Serialize straight into one length-prefixed buffer: the 4-byte
+    // BE prefix up front, then bincode appends the payload after it.
+    // Avoids the separate payload Vec + copy the two-step form needed.
+    let payload_len =
+        bincode::serialized_size(msg).context("failed to size message")? as usize;
     anyhow::ensure!(
-        payload.len() <= MAX_MESSAGE_SIZE,
+        payload_len <= MAX_MESSAGE_SIZE,
         "message too large: {} bytes (max {})",
-        payload.len(),
+        payload_len,
         MAX_MESSAGE_SIZE
     );
-    let len = payload.len() as u32;
-    let mut data = Vec::with_capacity(4 + payload.len());
-    data.extend_from_slice(&len.to_be_bytes());
-    data.extend_from_slice(&payload);
+    let mut data = Vec::with_capacity(4 + payload_len);
+    data.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    bincode::serialize_into(&mut data, msg).context("failed to serialize message")?;
 
     stream_send_all(conn, stream_id, &data, false)?;
 

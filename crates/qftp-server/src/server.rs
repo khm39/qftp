@@ -957,6 +957,7 @@ fn process_readable_streams(
                     no_clobber,
                     checksum_trailer,
                     leftover,
+                    tmp,
                     metrics,
                 )?;
             }
@@ -1276,6 +1277,7 @@ fn start_put(
     no_clobber: bool,
     checksum_trailer: bool,
     leftover: Vec<u8>,
+    scratch: &mut [u8],
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
@@ -1409,12 +1411,11 @@ fn start_put(
                 );
             }
         };
-        let mut copy_buf = [0u8; FILE_CHUNK_SIZE];
         loop {
-            match std::io::Read::read(&mut existing, &mut copy_buf) {
+            match std::io::Read::read(&mut existing, scratch) {
                 Ok(0) => break,
                 Ok(n) => {
-                    hasher.update(&copy_buf[..n]);
+                    hasher.update(&scratch[..n]);
                 }
                 Err(e) => {
                     return send_err(
@@ -1488,9 +1489,8 @@ fn start_put(
     ctx.streams.insert(stream_id, new_state);
 
     // Drain anything already buffered for this stream.
-    let mut tmp = [0u8; FILE_CHUNK_SIZE];
     if let Some(state) = ctx.streams.get_mut(&stream_id) {
-        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, &mut tmp, metrics)? {
+        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, scratch, metrics)? {
             if matches!(resp, Response::Err(_)) {
                 metrics.inc_requests_failed();
             }
