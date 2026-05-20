@@ -19,12 +19,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use mio::{Events, Poll};
 use notify::{EventKind, RecursiveMode, Watcher};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, ConnectionSpec, Overrides};
+use crate::proto::{poll_response, take_stream};
 use crate::transfer;
 
 /// What we want done with one path after collapsing a burst of
@@ -148,7 +148,13 @@ fn run_session(
     debounce_ms: u64,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let (mut conn, socket, mut poll, mut events) = connect(spec)?;
+    let crate::connect::Established {
+        mut conn,
+        socket,
+        mut poll,
+        mut events,
+        ..
+    } = crate::connect::establish(spec, "watch", crate::connect::EstablishOpts::for_spec(spec))?;
     let mut next_stream_id: u64 = 0;
     let mut pending: HashMap<PathBuf, Action> = HashMap::new();
     let mut last_event_at: Option<Instant> = None;
@@ -313,48 +319,6 @@ fn join_remote(prefix: &str, rel: &Path) -> String {
         format!("{prefix}{rel_str}")
     } else {
         format!("{prefix}/{rel_str}")
-    }
-}
-
-fn take_stream(next: &mut u64) -> u64 {
-    let cur = *next;
-    *next += 4;
-    cur
-}
-
-fn connect(
-    spec: &ConnectionSpec,
-) -> Result<(quiche::Connection, mio::net::UdpSocket, Poll, Events)> {
-    crate::connect::establish(spec, "watch")
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    loop {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
-        match recv_message::<Response>(conn, stream_id, &mut buf)? {
-            Some(r) => {
-                // #140: per-field cap defense in depth.
-                qftp_common::protocol::validate_response(&r)
-                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
-                flush_egress(conn, socket)?;
-                return Ok(r);
-            }
-            None => {
-                flush_egress(conn, socket)?;
-            }
-        }
-        if conn.is_closed() {
-            return Err(anyhow!("watch: connection closed mid-request"));
-        }
     }
 }
 

@@ -82,7 +82,17 @@ where
         &mut u64,
     ) -> Result<i32>,
 {
-    let (mut conn, socket, mut poll, mut events) = crate::connect::establish(spec, "one-shot")?;
+    let crate::connect::Established {
+        mut conn,
+        socket,
+        mut poll,
+        mut events,
+        ..
+    } = crate::connect::establish(
+        spec,
+        "one-shot",
+        crate::connect::EstablishOpts::for_spec(spec),
+    )?;
     let ticket_dir = session_store::default_dir();
 
     let mut next_stream_id: u64 = 0;

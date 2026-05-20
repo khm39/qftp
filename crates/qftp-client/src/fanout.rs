@@ -156,7 +156,17 @@ fn do_put_once(
     use qftp_common::protocol::Request;
     use qftp_common::transport::*;
 
-    let (mut conn, socket, mut poll, mut events) = crate::connect::establish(spec, "fanout")?;
+    let crate::connect::Established {
+        mut conn,
+        socket,
+        mut poll,
+        mut events,
+        ..
+    } = crate::connect::establish(
+        spec,
+        "fanout",
+        crate::connect::EstablishOpts::for_spec(spec),
+    )?;
 
     let mut next_stream_id: u64 = 0;
     let put_stream = crate::proto::take_stream(&mut next_stream_id);

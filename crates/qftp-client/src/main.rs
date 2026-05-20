@@ -1,12 +1,10 @@
 use std::io::{BufRead, IsTerminal};
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
@@ -25,8 +23,6 @@ mod transfer;
 mod watch;
 
 use proto::{request_response, take_stream};
-
-const CLIENT: Token = Token(0);
 
 /// Long-form `--version` body. Built from the package version plus
 /// the build-time facts injected by `build.rs`.
@@ -318,8 +314,6 @@ fn main() -> Result<()> {
 
     let spec = config::resolve(args.target.as_deref(), &cfg_file, &overrides)?;
 
-    let client_cert = connect::client_cert_from_spec(&spec);
-
     // TOFU is only meaningful when the user has *not* supplied a CA
     // bundle. A `--ca` overrides it (we trust the PKI chain). When
     // TOFU is active we ask quiche to skip its own peer verification
@@ -338,87 +332,28 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
-        verify_peer: effective_verify_peer,
-        ca_path: spec.ca.clone(),
-        client_cert,
-    })?;
-
-    let peer_addr = spec
-        .host
-        .parse()
-        .with_context(|| format!("failed to parse host address: {}", spec.host))?;
-    let std_socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
-    std_socket.set_nonblocking(true)?;
-    std_socket.connect(peer_addr)?;
-    qftp_common::transport::tune_udp_buffers(&std_socket);
-    let local_addr = std_socket.local_addr()?;
-    let mut socket = mio::net::UdpSocket::from_std(std_socket);
-
-    let rng = ring::rand::SystemRandom::new();
-    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-    use ring::rand::SecureRandom;
-    rng.fill(&mut scid_bytes).unwrap();
-    let scid = quiche::ConnectionId::from_vec(scid_bytes.to_vec());
-
-    let mut conn = quiche::connect(
-        Some(&spec.server_name),
-        &scid,
-        local_addr,
-        peer_addr,
-        &mut config,
-    )?;
-
-    // 0-RTT session resumption. If a fresh ticket exists for this
-    // host:port, hand it to quiche before any I/O so the first
-    // outgoing Initial carries 0-RTT data. A rejected ticket is a
-    // silent fallback to 1-RTT; we delete it so we don't keep
-    // replaying a bad blob.
+    // Needed both to drive 0-RTT resumption inside `establish` and to
+    // persist the freshest ticket on a clean exit.
     let ticket_dir = args
         .session_ticket_dir
         .clone()
         .or_else(session_store::default_dir);
-    let mut resumed = false;
-    if !args.no_zero_rtt {
-        if let Some(dir) = &ticket_dir {
-            if let Some(ticket) = session_store::load(dir, &spec.host, None) {
-                match conn.set_session(&ticket) {
-                    Ok(()) => {
-                        resumed = true;
-                        tracing::info!(host = %spec.host, "0-RTT: resuming session");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "stale session ticket; falling back to 1-RTT");
-                        let _ = session_store::forget(dir, &spec.host);
-                    }
-                }
-            }
-        }
-    }
 
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(1024);
-    poll.registry()
-        .register(&mut socket, CLIENT, Interest::READABLE)?;
-
-    flush_egress(&mut conn, &socket)?;
-    let mut hs_buf = [0u8; 65535];
-    loop {
-        poll.poll(
-            &mut events,
-            conn.timeout().or(Some(Duration::from_millis(100))),
-        )?;
-        conn.on_timeout();
-        handle_ingress(&mut conn, &socket, &mut hs_buf)?;
-        flush_egress(&mut conn, &socket)?;
-
-        if conn.is_established() {
-            break;
-        }
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed during handshake");
-        }
-    }
+    let connect::Established {
+        mut conn,
+        socket,
+        mut poll,
+        mut events,
+        resumed,
+    } = connect::establish(
+        &spec,
+        "connect",
+        connect::EstablishOpts {
+            verify_peer: effective_verify_peer,
+            zero_rtt: !args.no_zero_rtt,
+            ticket_dir: ticket_dir.clone(),
+        },
+    )?;
 
     if tofu_active {
         let kh_path = args
