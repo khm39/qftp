@@ -35,7 +35,9 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 use tracing::{debug, info, warn};
 
-use crate::connection::{ConnectionContext, StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE};
+use crate::connection::{
+    ConnectionContext, StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+};
 use crate::handler::{self, err, io_code};
 use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
@@ -123,6 +125,9 @@ pub fn run(
 
     let mut buf = [0u8; 65536];
     let mut out_pkt = [0u8; 1350];
+    // Reused scratch for the Get send path; allocated once so the
+    // larger SEND_CHUNK_SIZE costs nothing per loop iteration.
+    let mut send_buf = vec![0u8; SEND_CHUNK_SIZE];
     let mut closing = false;
 
     info!(
@@ -171,26 +176,26 @@ pub fn run(
             };
 
             // Route to existing connection. For established connections
-            // the peer's DCID is the SCID we issued. For Initial
-            // retransmits during handshake the peer is still using their
-            // original DCID, so also try its derived alias.
-            let alias = derive_scid(&conn_id_seed, &hdr.dcid);
-            let key = if connections.contains_key(&hdr.dcid) {
-                Some(hdr.dcid.clone().into_owned())
-            } else if connections.contains_key(&alias) {
-                Some(alias.clone())
-            } else {
-                None
+            // the peer's DCID is the SCID we issued, so this lookup hits
+            // first and is the only one we pay for on the hot path. The
+            // borrowed DCID is used as the key directly -- no owned
+            // clone -- and the derived alias is only computed on a miss.
+            let recv_info = quiche::RecvInfo {
+                from,
+                to: local_addr,
             };
-            if let Some(k) = key {
-                let recv_info = quiche::RecvInfo {
-                    from,
-                    to: local_addr,
-                };
-                if let Some(ctx) = connections.get_mut(&k) {
-                    if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
-                        warn!(peer = %from, error = ?e, "QUIC recv error");
-                    }
+            if let Some(ctx) = connections.get_mut(&hdr.dcid) {
+                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                    warn!(peer = %from, error = ?e, "QUIC recv error");
+                }
+                continue;
+            }
+            // Miss: Initial retransmits during the handshake still carry
+            // the peer's original DCID, so try its derived alias too.
+            let alias = derive_scid(&conn_id_seed, &hdr.dcid);
+            if let Some(ctx) = connections.get_mut(&alias) {
+                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                    warn!(peer = %from, error = ?e, "QUIC recv error");
                 }
                 continue;
             }
@@ -233,7 +238,7 @@ pub fn run(
         // 3-5. Per-connection work: streams + sending + egress.
         for ctx in connections.values_mut() {
             process_readable_streams(ctx, &socket, &users, &metrics, &mut rate_limiter, &mut buf)?;
-            drive_sending_streams(ctx, &socket, &metrics)?;
+            drive_sending_streams(ctx, &socket, &metrics, &mut send_buf)?;
             flush_egress(&mut ctx.conn, &socket)?;
         }
 
@@ -905,7 +910,7 @@ fn start_get(
     ctx.streams.insert(
         stream_id,
         StreamState::SendingFileData {
-            reader: std::io::BufReader::with_capacity(FILE_CHUNK_SIZE, file),
+            reader: std::io::BufReader::with_capacity(SEND_CHUNK_SIZE, file),
             total_size: bytes_to_send,
             sent: 0,
             hasher: blake3::Hasher::new(),
@@ -921,6 +926,7 @@ fn drive_sending_streams(
     ctx: &mut ConnectionContext,
     _socket: &mio::net::UdpSocket,
     metrics: &Arc<Metrics>,
+    send_buf: &mut [u8],
 ) -> Result<()> {
     let stream_ids: Vec<u64> = ctx
         .streams
@@ -929,11 +935,10 @@ fn drive_sending_streams(
         .map(|(id, _)| *id)
         .collect();
 
-    let mut chunk = [0u8; FILE_CHUNK_SIZE];
     for stream_id in stream_ids {
         // After this call we either mark the stream Done, or we leave a
         // SendingFileData with updated counters for the next iteration.
-        let outcome = drive_one_sender(ctx, stream_id, &mut chunk, metrics);
+        let outcome = drive_one_sender(ctx, stream_id, send_buf, metrics);
         if outcome == SendOutcome::Finished {
             if let Some(state) = ctx.streams.get_mut(&stream_id) {
                 *state = StreamState::Done;

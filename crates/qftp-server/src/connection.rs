@@ -18,8 +18,15 @@ use crate::user::User;
 /// Maximum file size accepted by Get/Put.
 pub const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
-/// Chunk size used for streaming file reads and stream sends.
+/// Chunk size used for streaming file reads and Put receive buffers.
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Chunk size used for the Get send path. Larger than `FILE_CHUNK_SIZE`
+/// so each main-loop iteration hands quiche a bigger batch and the
+/// outer per-stream loop runs fewer times per transfer. The buffer is
+/// heap-allocated once in `run()` and reused, so the size does not add
+/// stack or per-iteration zeroing cost.
+pub const SEND_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Incremental buffer for the streaming BLAKE3 trailer that arrives
 /// after a Put body (#152). The trailer is always exactly 32 bytes;
