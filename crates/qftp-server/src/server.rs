@@ -22,6 +22,7 @@
 //! the loop.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -343,6 +344,9 @@ pub fn run(
     // Reused scratch for the Get send path; allocated once so the
     // larger SEND_CHUNK_SIZE costs nothing per loop iteration.
     let mut send_buf = vec![0u8; SEND_CHUNK_SIZE];
+    // Reused scratch for the per-iteration list of streams that are
+    // actively sending, so the collect() doesn't allocate each pass.
+    let mut sender_ids: Vec<u64> = Vec::new();
     let mut closing = false;
 
     info!(
@@ -466,7 +470,7 @@ pub fn run(
                 &mut buf,
                 &handler_pool,
             )?;
-            drive_sending_streams(ctx, &socket, &metrics, &mut send_buf)?;
+            drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)?;
             flush_egress(&mut ctx.conn, &socket)?;
         }
 
@@ -1122,15 +1126,17 @@ fn drive_sending_streams(
     _socket: &mio::net::UdpSocket,
     metrics: &Arc<Metrics>,
     send_buf: &mut [u8],
+    sender_ids: &mut Vec<u64>,
 ) -> Result<()> {
-    let stream_ids: Vec<u64> = ctx
-        .streams
-        .iter()
-        .filter(|(_, s)| matches!(s, StreamState::SendingFileData { .. }))
-        .map(|(id, _)| *id)
-        .collect();
+    sender_ids.clear();
+    sender_ids.extend(
+        ctx.streams
+            .iter()
+            .filter(|(_, s)| matches!(s, StreamState::SendingFileData { .. }))
+            .map(|(id, _)| *id),
+    );
 
-    for stream_id in stream_ids {
+    for &stream_id in sender_ids.iter() {
         // After this call we either mark the stream Done, or we leave a
         // SendingFileData with updated counters for the next iteration.
         let outcome = drive_one_sender(ctx, stream_id, send_buf, metrics);
@@ -1724,7 +1730,7 @@ fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
     let _ = ring::rand::SystemRandom::new().fill(&mut rand_bytes);
     let mut suffix = String::with_capacity(16);
     for b in rand_bytes {
-        suffix.push_str(&format!("{b:02x}"));
+        let _ = write!(suffix, "{b:02x}");
     }
 
     let mut name = final_path

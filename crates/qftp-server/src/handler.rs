@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -299,14 +300,14 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         },
 
         Request::Ls { path } => {
-            let dir = if path.is_empty() {
-                Ok(cwd.clone())
+            let dir: Result<Cow<Path>, ErrorResponse> = if path.is_empty() {
+                Ok(Cow::Borrowed(cwd.as_path()))
             } else {
-                resolve(cwd, root, path)
+                resolve(cwd, root, path).map(Cow::Owned)
             };
 
             match dir {
-                Ok(dir) => match fs::read_dir(&dir) {
+                Ok(dir) => match fs::read_dir(&*dir) {
                     Ok(entries) => {
                         let mut listing: Vec<DirEntry> = Vec::with_capacity(64);
                         for entry in entries {
