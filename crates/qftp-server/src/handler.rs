@@ -24,7 +24,7 @@ fn mode_of(_meta: &fs::Metadata) -> u32 {
 /// don't silently lose ACLs they thought they were setting.
 #[cfg(unix)]
 fn set_mode(target: &Path, mode: u32) -> Response {
-    // #106: re-lstat immediately before the chmod. `walk_safe` lstat'd
+    // Re-lstat immediately before the chmod. `walk_safe` lstat'd
     // every component, but a TOCTOU window exists between that check
     // and this syscall: a write-permitted attacker could swap the
     // leaf with a symlink to /etc and chmod the target. Re-checking
@@ -41,7 +41,7 @@ fn set_mode(target: &Path, mode: u32) -> Response {
         Ok(_) => {}
         Err(e) => return err(io_code(&e), format!("re-stat failed: {e}")),
     }
-    // #120: strip suid/sgid/sticky from the requested mode. See
+    // Strip suid/sgid/sticky from the requested mode. See
     // server::apply_mode for the rationale.
     let masked = mode & 0o0777;
     let perms = fs::Permissions::from_mode(masked);
@@ -182,7 +182,7 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
     Ok(path)
 }
 
-/// #137: re-walk the ancestors of `target` between `root` (exclusive)
+/// Re-walk the ancestors of `target` between `root` (exclusive)
 /// and `target` itself (exclusive) and assert every component lstat's
 /// as a non-symlink. Used as a defense-in-depth re-check just before
 /// `fs::create_dir / remove_dir / remove_file / rename` so a parent
@@ -191,7 +191,7 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
 /// the operation silently target the symlink's destination.
 ///
 /// This is the same TOCTOU pattern that handler::set_mode and the
-/// `Stat` arm already guard (#106) but applied to mutating
+/// `Stat` arm already guard but applied to mutating
 /// operations whose parents (not just the leaf) need to stay rooted.
 /// True closure would require openat2(RESOLVE_BENEATH); this re-lstat
 /// only narrows the window.
@@ -414,7 +414,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         },
 
         Request::Stat { path } => match resolve(cwd, root, path) {
-            // #106: use symlink_metadata so a TOCTOU-swapped symlink at
+            // Use symlink_metadata so a TOCTOU-swapped symlink at
             // the leaf doesn't leak information about an external
             // target's size/mode/mtime. If the leaf turned into a
             // symlink between resolve() and here, refuse instead of
@@ -455,7 +455,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
 
 // The tests below exercise Unix symlink semantics and the unix-only
 // PermissionsExt path. Gating the whole module keeps `cargo test`
-// compiling on non-Unix targets (issue #35).
+// compiling on non-Unix targets.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(cwd, root);
     }
 
-    /// #137: simulate the parent-dir TOCTOU. We build `root/sub/leaf`
+    /// Simulate the parent-dir TOCTOU. We build `root/sub/leaf`
     /// at resolve time, then swap `sub` for a symlink (the same
     /// primitive an attacker would have if they could win the race
     /// after `walk_safe` returns) and call `recheck_ancestors_no_symlinks`
@@ -594,7 +594,7 @@ mod tests {
         );
     }
 
-    /// #137: end-to-end check against the public handle_request entry
+    /// End-to-end check against the public handle_request entry
     /// point. Mkdir on a path whose parent is a symlink must be refused
     /// even though walk_safe would have validated the (pre-swap) tree.
     #[test]

@@ -11,7 +11,7 @@
 //! after the transfer batch completes (rsync's `--delete-after`
 //! semantics).
 //!
-//! `.qftpignore` (#65): if a file with that name exists at the
+//! `.qftpignore`: if a file with that name exists at the
 //! local root, each non-empty, non-`#` line is treated as a glob
 //! pattern matched against relative paths. A trailing `/` restricts
 //! the match to directories; a leading `/` anchors to the local
@@ -19,7 +19,7 @@
 //! deliberately not implemented yet -- a pragmatic subset that
 //! covers the common cases (`*.log`, `target/`, `/build/`).
 //!
-//! Out of scope (filed as a follow-up of #71):
+//! Out of scope (filed as a follow-up of):
 //!   - Download direction (remote → local).
 //!   - Negation (`!pattern`) and nested `.qftpignore` files.
 //!   - Parallel streams. Sync currently issues one Put / Rm at a
@@ -302,7 +302,7 @@ fn walk_local(root: &Path, ignore: &IgnoreMatcher) -> Result<HashMap<PathBuf, Me
     Ok(out)
 }
 
-/// `.qftpignore` matcher (#65). One entry per non-empty non-comment
+/// `.qftpignore` matcher. One entry per non-empty non-comment
 /// line. The matcher is intentionally simpler than gitignore:
 ///
 ///   - Trailing `/` -> directory-only.
@@ -428,7 +428,7 @@ fn walk_remote(
             _ => continue,
         };
         for e in entries {
-            // #108: a malicious server could synthesize entry names with
+            // A malicious server could synthesize entry names with
             // `..` or absolute paths. With `--delete`, those names would
             // be echoed back as `Rm` requests, asking the server to
             // delete arbitrary paths. Reject lexically before we even

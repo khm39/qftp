@@ -5,7 +5,7 @@
 //! and the server hands that buffer to `decode_framed_message`; any panic
 //! here would crash the server.
 //!
-//! #141: previously this called `bincode::deserialize::<Request>(data)`
+//! Previously this called `bincode::deserialize::<Request>(data)`
 //! with the default (unbounded) bincode options, which is *not* what
 //! production runs. The fuzzer was therefore exercising a decode path
 //! that didn't match the binary. Use `decode_framed_message` so the

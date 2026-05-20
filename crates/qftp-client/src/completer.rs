@@ -1,4 +1,4 @@
-//! rustyline tab-completion helper for the REPL (#64).
+//! rustyline tab-completion helper for the REPL.
 //!
 //! Two completion sources:
 //!

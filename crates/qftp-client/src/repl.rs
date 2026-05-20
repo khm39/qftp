@@ -29,7 +29,7 @@ pub enum Command {
     /// `!cmd …` — pass the rest of the line to `$SHELL -c`. The
     /// empty `!` form spawns an interactive `$SHELL`.
     Shell(String),
-    /// `stats` (#80) — print process-wide transfer counters
+    /// `stats` — print process-wide transfer counters
     /// (uptime, bytes up/down, success rate). Local; no protocol
     /// round-trip.
     Stats,

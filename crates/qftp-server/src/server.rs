@@ -53,15 +53,15 @@ use crate::user::{self, User, UserDirectory};
 /// refused so a captured 0-RTT flight cannot be replayed to put the
 /// server into a different state.
 fn request_is_replay_safe(req: &Request) -> bool {
-    // #127: Quota is intentionally NOT in this set. Even though
-    // #111 caches the usage so the reply is cheap, treating it as
+    // Quota is intentionally NOT in this set. Even though
+    // caches the usage so the reply is cheap, treating it as
     // replay-safe means a captured 0-RTT Quota request can be
     // re-fired indefinitely as a "ping" against the user record —
     // useful primarily as an amplification primitive. The latency
     // cost of forcing 1-RTT for Quota is negligible since it runs
     // once per session.
     //
-    // #138: Get is also NOT in this set. Although a Get reply is
+    // Get is also NOT in this set. Although a Get reply is
     // idempotent and side-effect-free, it can return up to
     // MAX_FILE_SIZE bytes, which turns a replayed 0-RTT flight into
     // a bandwidth amplification primitive — at worst the captured
@@ -71,7 +71,7 @@ fn request_is_replay_safe(req: &Request) -> bool {
     // session; subsequent requests within the same session run at
     // normal 1-RTT either way. The list below intentionally keeps
     // only small fixed-size replies (Ls is capped at MAX_DIR_ENTRIES
-    // by #140, Stat is a fixed struct, Pwd/Cd/Quit are tiny acks).
+    // by, Stat is a fixed struct, Pwd/Cd/Quit are tiny acks).
     matches!(
         req,
         Request::Ls { .. }
@@ -90,7 +90,7 @@ const WAKER_TOKEN: Token = Token(1);
 /// Number of background threads that run blocking filesystem requests
 /// (Ls/Stat/Mkdir/Rename/Chmod/Rm/...) off the event-loop thread, so a
 /// slow directory walk on one connection can't stall every other
-/// connection (#154, H-1).
+/// connection (H-1).
 const HANDLER_WORKERS: usize = 4;
 
 /// Static knobs the loop reads on every iteration.
@@ -104,7 +104,7 @@ pub struct ServerConfig {
 }
 
 /// A generic request handed to a handler worker thread for off-loop
-/// execution (#154, H-1).
+/// execution (H-1).
 struct HandlerJob {
     conn_key: quiche::ConnectionId<'static>,
     stream_id: u64,
@@ -196,13 +196,13 @@ fn handler_worker(
 /// `Response`. This is the blocking-fs body the worker pool executes
 /// off the event-loop thread. `cwd` is updated in place for `Cd`.
 fn run_handler(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
-    // #111: Rm also decrements the per-user used-bytes cache, so it
+    // Rm also decrements the per-user used-bytes cache, so it
     // can't go through the generic handler (which never sees the
     // deleted file's size). Everything else is plain handle_request.
     if let Request::Rm { path } = req {
         match handler::resolve(cwd, &user.home, path) {
             Ok(target) => {
-                // #137: parent-dir symlink TOCTOU re-check.
+                // Parent-dir symlink TOCTOU re-check.
                 if let Err(e) = handler::recheck_ancestors_no_symlinks(&target, &user.home) {
                     Response::Err(e)
                 } else {
@@ -317,7 +317,7 @@ pub fn run(
     let mut events = Events::with_capacity(1024);
 
     // Handler worker pool, plus the Waker it uses to interrupt poll()
-    // as soon as an offloaded request has a response ready (#154, H-1).
+    // as soon as an offloaded request has a response ready (H-1).
     let waker =
         Arc::new(Waker::new(poll.registry(), WAKER_TOKEN).context("failed to create mio Waker")?);
     let handler_pool = spawn_handler_pool(waker);
@@ -673,7 +673,7 @@ fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
     let Some(der) = ctx.conn.peer_cert() else {
         return;
     };
-    // #142: try SAN dNSName / rfc822Name / URI before falling back to
+    // Try SAN dNSName / rfc822Name / URI before falling back to
     // CN, so a modern PKI (cert-manager, smallstep, SPIFFE) that
     // doesn't populate Subject CN still maps cleanly to users.toml.
     // Order of candidates is fixed in extract_identity_candidates;
@@ -685,7 +685,7 @@ fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
     let resolved = candidates
         .iter()
         .find_map(|id| users.lookup_strict(id).map(|u| (id.clone(), u)));
-    // #105: a peer that presents a cert whose identity matches no
+    // A peer that presents a cert whose identity matches no
     // configured user must be rejected outright, not silently
     // downgraded to anonymous. Close the QUIC connection with an
     // application-layer error code so the client surfaces an
@@ -800,7 +800,7 @@ fn process_readable_streams(
                     }
                 };
                 if let Some(req) = req {
-                    // #140: enforce per-field length caps on top of
+                    // Enforce per-field length caps on top of
                     // the 16 MiB frame cap. A peer that packed a
                     // multi-MiB path string into a single field
                     // would otherwise allocate that much during
@@ -989,7 +989,7 @@ fn process_readable_streams(
                 ctx.conn.close(true, 0x00, b"bye").ok();
             }
             PendingAction::Quota { stream_id } => {
-                // #111: serve the cached value rather than re-walking
+                // Serve the cached value rather than re-walking
                 // the user's home on every Quota request. The cache
                 // is initialized once at startup and kept up to date
                 // by Put/Rm completion paths. file_count is no longer
@@ -1005,7 +1005,7 @@ fn process_readable_streams(
                 send_message(&mut ctx.conn, stream_id, &resp)?;
             }
             PendingAction::HandleSimple { stream_id, req } => {
-                // H-1 (#154): generic requests run blocking filesystem
+                // H-1: generic requests run blocking filesystem
                 // syscalls, so they're offloaded to the worker pool
                 // rather than stalling the event loop. One job at a
                 // time per connection keeps `cwd` updates from `Cd`
@@ -1054,14 +1054,14 @@ fn start_get(
         Ok(p) => p,
         Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
     };
-    // #137: parent-dir symlink TOCTOU re-check. O_NOFOLLOW below
+    // Parent-dir symlink TOCTOU re-check. O_NOFOLLOW below
     // protects the leaf only; an intermediate parent that was swapped
     // to a symlink between resolve and open would still be traversed
     // by the kernel and let us serve a file outside the user's home.
     if let Err(e) = handler::recheck_ancestors_no_symlinks(&file_path, &ctx.user.home) {
         return send_err(ctx, e.code, e.message);
     }
-    // #106: open with O_NOFOLLOW first, then derive metadata from the
+    // Open with O_NOFOLLOW first, then derive metadata from the
     // resulting fd. This binds the metadata + the bytes we stream to
     // the same inode the path resolved to, eliminating the TOCTOU
     // window between `walk_safe` and `fs::open`.
@@ -1318,7 +1318,7 @@ fn start_put(
             ),
         );
     }
-    // #111: quota pre-check + in-flight reservation. The cache
+    // Quota pre-check + in-flight reservation. The cache
     // `used_bytes` and `in_flight_bytes` is kept up to date by Put
     // commit/abort and Rm. Reserve atomically so two concurrent
     // Puts can't both pass the check and overshoot the limit.
@@ -1349,7 +1349,7 @@ fn start_put(
         Ok(p) => p,
         Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
     };
-    // #137: parent-dir symlink TOCTOU re-check. The temp file is
+    // Parent-dir symlink TOCTOU re-check. The temp file is
     // opened with O_NOFOLLOW, which protects the *leaf* but not the
     // intermediate components -- a parent that was swapped to a
     // symlink between resolve_parent and open would still be
@@ -1366,7 +1366,7 @@ fn start_put(
         ctx.streams.insert(stream_id, StreamState::Done);
         return Ok(());
     }
-    // #70: enforce client-requested overwrite refusal. lstat (not
+    // Enforce client-requested overwrite refusal. lstat (not
     // stat) so a planted symlink at `final_path` counts as
     // "exists" -- otherwise an attacker who could plant a dangling
     // symlink could bypass --no-clobber by aiming it at /nonexistent.
@@ -1550,7 +1550,7 @@ fn drive_put(
 
     // Phase A: drain body bytes until `remaining == 0`. Anything past
     // the body in the same recv goes into the trailer buffer when
-    // streaming-checksum mode is active (#152).
+    // streaming-checksum mode is active.
     loop {
         if *remaining == 0 {
             break;
@@ -1673,7 +1673,7 @@ fn drive_put(
         }
         apply_mode(final_path, *mode);
         *completed = true;
-        // #111: hand the reservation over to the persistent cache.
+        // Hand the reservation over to the persistent cache.
         // Once `completed` is true the Drop impl no longer touches
         // in_flight (it only does so on abort), so it's safe to
         // drain the reservation here.
@@ -1693,7 +1693,7 @@ fn drive_put(
 #[cfg(unix)]
 fn apply_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
-    // #120: strip suid/sgid/sticky bits before applying. Letting
+    // Strip suid/sgid/sticky bits before applying. Letting
     // clients land 04xxx / 02xxx / 01xxx on files inside the server
     // root supplies a setuid primitive to any downstream process
     // that later copies the tree (rsync --preserve-permissions,
@@ -1712,7 +1712,7 @@ fn apply_mode(_path: &Path, _mode: u32) {}
 fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    // #136: 0o600 + O_NOFOLLOW so the in-flight `.qftp.partial.*` file
+    // 0o600 + O_NOFOLLOW so the in-flight `.qftp.partial.*` file
     // is never readable by other local users on a multi-user host.
     // Without the explicit mode, daemon umask (typically 0o022)
     // would land the file at 0o644 = world-readable until
@@ -1736,7 +1736,7 @@ fn open_temp_for_resume(path: &Path, for_append: bool) -> std::io::Result<File> 
 }
 
 fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
-    // #119: append 8 bytes (16 hex chars) of cryptographic randomness
+    // Append 8 bytes (16 hex chars) of cryptographic randomness
     // to the temp name so a colluding user on the same writable
     // directory can't plant a regular file at the predicted path
     // and block legitimate uploads. The pid + stream_id form is
@@ -1779,7 +1779,7 @@ mod tests {
         assert!(request_is_replay_safe(&Request::Quit));
     }
 
-    /// #138: Get must NOT be in the replay-safe set. Even though
+    /// Get must NOT be in the replay-safe set. Even though
     /// its reply is side-effect-free, the body can be up to
     /// MAX_FILE_SIZE -- replaying a captured 0-RTT Get against a
     /// spoofed source IP is a bandwidth amplification primitive.
@@ -1820,7 +1820,7 @@ mod tests {
         }));
     }
 
-    /// #136: the in-flight partial-upload temp file must be 0o600
+    /// The in-flight partial-upload temp file must be 0o600
     /// regardless of the process umask, so it isn't readable by
     /// other local users while the upload is still in progress.
     #[cfg(unix)]

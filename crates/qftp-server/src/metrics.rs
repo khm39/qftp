@@ -229,7 +229,7 @@ pub fn spawn(metrics: Arc<Metrics>, bind: &str, shutdown: Arc<AtomicBool>) -> Re
     listener
         .set_nonblocking(true)
         .context("failed to set metrics listener nonblocking")?;
-    // #143: the /metrics and /healthz endpoints are unauthenticated.
+    // The /metrics and /healthz endpoints are unauthenticated.
     // Surface a loud warning when the operator bound them to a
     // non-loopback address so this isn't silently exposed to the
     // internet. We log via the resolved local_addr rather than the

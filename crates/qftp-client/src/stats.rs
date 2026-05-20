@@ -1,5 +1,5 @@
 //! Process-global transfer counters surfaced via the REPL `stats`
-//! command (#80). Cheap AtomicU64s incremented from
+//! command. Cheap AtomicU64s incremented from
 //! `transfer::do_put` / `transfer::do_get`; printed on demand.
 //!
 //! Counters live for the lifetime of the client process, so a long

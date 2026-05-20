@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 /// Key both rate-limiting and connection-cap buckets on a /32 IPv4
-/// or /64 IPv6 prefix (#118). A residential IPv6 allocation is
+/// or /64 IPv6 prefix. A residential IPv6 allocation is
 /// typically /56 or /64; without this masking an attacker can
 /// trivially rotate through 2^64 source addresses to evade both
 /// counters. IPv4 stays full-precision because each address is a
@@ -57,12 +57,12 @@ pub struct RateLimiter {
     buckets: HashMap<IpKey, Bucket>,
     /// Hard cap on the number of distinct IP buckets we will track at
     /// once. On overflow the least-recently-used bucket is dropped
-    /// (#121), so an attacker who fills the table just under the
+    ///, so an attacker who fills the table just under the
     /// idle threshold cannot poison it indefinitely.
     max_tracked: usize,
     /// Run a periodic sweep at most this often. Combined with the
     /// at-capacity LRU eviction, this keeps the table tight even if
-    /// it doesn't reach `max_tracked` (#121).
+    /// it doesn't reach `max_tracked`.
     sweep_interval: Duration,
     last_sweep: Instant,
     idle_cutoff: Duration,
@@ -106,7 +106,7 @@ impl RateLimiter {
         }
     }
 
-    /// #121: sweep stale entries on a fixed cadence (not just at
+    /// Sweep stale entries on a fixed cadence (not just at
     /// capacity), so an attacker can't pin the table at ~max-1 with
     /// refreshes timed just under idle_cutoff.
     fn maybe_sweep(&mut self, now: Instant) {
@@ -119,7 +119,7 @@ impl RateLimiter {
             .retain(|_, b| now.saturating_duration_since(b.last) < cutoff);
     }
 
-    /// #121: when at capacity, drop the single least-recently-used
+    /// When at capacity, drop the single least-recently-used
     /// entry to make room for the new one rather than refusing the
     /// insert. Bounded memory, fair-ish under attack.
     fn make_room_for(&mut self, key: &IpKey, _now: Instant) {
@@ -141,7 +141,7 @@ impl RateLimiter {
 }
 
 /// Tracker for the per-IP and global concurrent-connection caps.
-/// Keyed on the /32 (IPv4) or /64 (IPv6) prefix (#118) so a single
+/// Keyed on the /32 (IPv4) or /64 (IPv6) prefix so a single
 /// host can't trivially evade the per-IP cap by rotating source
 /// addresses within its allocation.
 #[derive(Default)]
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn ipv6_prefix_keys_collapse_to_slash_64() {
-        // #118: two addresses in the same /64 should share a bucket
+        // Two addresses in the same /64 should share a bucket
         // so an attacker rotating through the suffix can't bypass.
         let a = IpAddr::V6("2001:db8:1234:5678::1".parse().unwrap());
         let b = IpAddr::V6("2001:db8:1234:5678:ffff:ffff:ffff:ffff".parse().unwrap());
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn ipv6_rate_limit_shared_across_slash_64() {
-        // #118: per-IP rate limit must apply across a whole /64.
+        // Per-IP rate limit must apply across a whole /64.
         let mut rl = RateLimiter::new(1.0, 1.0);
         let a = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1));
         let b = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 2));
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn lru_eviction_at_capacity_keeps_inserting() {
-        // #121: at max_tracked, the oldest idle bucket is dropped so
+        // At max_tracked, the oldest idle bucket is dropped so
         // a fresh source can still get in. Pre-fix this returned
         // "false" / refused new entries when full.
         let mut rl = RateLimiter::new(1000.0, 1000.0);

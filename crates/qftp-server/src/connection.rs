@@ -31,7 +31,7 @@ pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
 pub const SEND_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Incremental buffer for the streaming BLAKE3 trailer that arrives
-/// after a Put body (#152). The trailer is always exactly 32 bytes;
+/// after a Put body. The trailer is always exactly 32 bytes;
 /// this holds whatever subset we've drained off the QUIC stream so
 /// far so `drive_put` can finalize verification once `filled == 32`.
 #[derive(Debug)]
@@ -94,12 +94,12 @@ pub enum StreamState {
         hasher: blake3::Hasher,
         expected_checksum: Option<[u8; 32]>,
         /// When set, the client will send a 32-byte BLAKE3 trailer on
-        /// the same stream after the body bytes (#152). We accumulate
+        /// the same stream after the body bytes. We accumulate
         /// it here as bytes arrive; once full it overrides
         /// `expected_checksum` in the verification step. `None` means
         /// the request used the legacy header-checksum path.
         trailer_buf: Option<TrailerBuf>,
-        /// #111: bytes reserved against `user.in_flight_bytes` when
+        /// Bytes reserved against `user.in_flight_bytes` when
         /// the Put was accepted. The Drop impl releases them on
         /// abort; the commit path consumes them and converts the
         /// reservation into `used_bytes`.
@@ -144,7 +144,7 @@ impl Drop for StreamState {
         } = self
         {
             if !*completed {
-                // #111: release the in-flight reservation so the
+                // Release the in-flight reservation so the
                 // user's quota can recover. This runs on every abort
                 // path — explicit StreamState::Done replacement,
                 // connection drop, or panic unwind.
@@ -178,12 +178,12 @@ pub struct ConnectionContext {
     pub created_at: Instant,
     /// The SCID the server issued for this connection -- the key it is
     /// stored under in the connection table. Held here so an offloaded
-    /// handler job can be routed back to this connection (#154, H-1).
+    /// handler job can be routed back to this connection (H-1).
     pub scid: quiche::ConnectionId<'static>,
     /// True while a generic handler request for this connection is
     /// running on a worker thread. Generic requests are processed one
     /// at a time per connection so `cwd` updates from `Cd` stay
-    /// correctly ordered (#154, H-1).
+    /// correctly ordered (H-1).
     pub handler_in_flight: bool,
     /// Generic handler requests received while `handler_in_flight` was
     /// set. Dispatched FIFO as each in-flight job completes.

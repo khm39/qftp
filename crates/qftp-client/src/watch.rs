@@ -208,7 +208,7 @@ fn run_session(
             continue;
         }
 
-        // #115: notify follows symlinks under the watched tree on
+        // Notify follows symlinks under the watched tree on
         // Linux. A symlink planted inside `local_root` could point at
         // `/home/user/.ssh/` and be silently uploaded. Resolve each
         // event path through `canonicalize` and confirm the *real*

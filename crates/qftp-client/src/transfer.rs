@@ -27,7 +27,7 @@ const CHUNK: usize = 64 * 1024;
 /// times instead of ~1024: each extra trip costs a `read_exact`,
 /// stream_send call, ingress drain, and flush_egress, and at small
 /// chunk sizes the fixed overhead — not flow-control — was capping
-/// loopback put at ~65 MiB/s (#150). quiche handles partial accepts
+/// loopback put at ~65 MiB/s. quiche handles partial accepts
 /// via the inner stream_send loop, so a larger buffer is purely a
 /// win when cwnd is open and degrades gracefully when it isn't.
 const UPLOAD_CHUNK: usize = 1024 * 1024;
@@ -174,7 +174,7 @@ pub fn do_get(
     remote: &str,
     local: &Path,
 ) -> Result<()> {
-    // #80: parent span for the whole download so structured logs
+    // Parent span for the whole download so structured logs
     // group the FileReady / chunk / verify events under a single
     // (op=get, stream_id=N, path=...) header.
     let _span = tracing::info_span!("transfer", op = "get", stream_id, path = %remote).entered();
@@ -227,8 +227,8 @@ fn do_get_inner(
         other => bail!("unexpected response to Get: {other:?}"),
     };
 
-    // #109: refuse to open through a pre-existing symlink. Combined
-    // with #108's name filter this stops a malicious server from
+    // Refuse to open through a pre-existing symlink. Combined
+    // with the name filter this stops a malicious server from
     // pointing a recursive download at, say, ~/.ssh/authorized_keys
     // via a planted symlink in the destination directory.
     let mut opts = OpenOptions::new();
@@ -238,7 +238,7 @@ fn do_get_inner(
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;
 
-    // #116: when resuming, the server's BLAKE3 trailer is computed
+    // When resuming, the server's BLAKE3 trailer is computed
     // over the whole file (server side has no resume concept on its
     // hashing path). Feed the existing on-disk prefix into the hasher
     // before we start consuming network bytes so the trailer check
@@ -410,7 +410,7 @@ fn do_get_inner(
 /// Upload `local` to `remote`. Sends a BLAKE3 checksum the server can
 /// verify against the received bytes. Resume from an existing
 /// server-side temp at `offset` is supported by passing it through.
-/// `no_clobber` (#70) asks the server to refuse the Put with
+/// `no_clobber` asks the server to refuse the Put with
 /// `AlreadyExists` rather than overwrite a pre-existing destination.
 #[allow(clippy::too_many_arguments)]
 pub fn do_put(
@@ -424,7 +424,7 @@ pub fn do_put(
     offset: u64,
     no_clobber: bool,
 ) -> Result<()> {
-    // #80: parent span for the whole upload.
+    // Parent span for the whole upload.
     let _span = tracing::info_span!("transfer", op = "put", stream_id, path = %remote).entered();
     let result = do_put_inner(
         conn, socket, poll, events, stream_id, local, remote, offset, no_clobber,
@@ -455,7 +455,7 @@ fn do_put_inner(
         bail!("resume offset {offset} is past local file size {size}; refusing");
     }
 
-    // Streaming BLAKE3 (#152): hash incrementally as we read+send,
+    // Streaming BLAKE3: hash incrementally as we read+send,
     // then ship the 32-byte digest as an in-band trailer after the
     // body. Saves the upfront full-file read+hash pass.
     let mut hasher = blake3::Hasher::new();
@@ -524,7 +524,7 @@ fn do_put_inner(
         // which made any upload that didn't fit in the initial cwnd
         // (~14 KiB) fail outright.
         //
-        // The trailer (#152) carries the FIN; never set chunk_fin on
+        // The trailer carries the FIN; never set chunk_fin on
         // body bytes.
         let mut sub = 0usize;
         while sub < want {
@@ -552,7 +552,7 @@ fn do_put_inner(
         // do NOT block in poll.poll here: back-pressure is already
         // handled by the inner `Done -> poll.poll` path, and a
         // mandatory per-chunk poll capped loopback put at ~65 MiB/s
-        // (#150) by sleeping on `conn.timeout()` between chunks even
+        // by sleeping on `conn.timeout()` between chunks even
         // when send capacity was fine.
         handle_ingress(conn, socket, &mut recv_buf)?;
         flush_egress(conn, socket)?;

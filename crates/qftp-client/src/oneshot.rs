@@ -336,7 +336,7 @@ fn run_get(
     if recursive {
         // For now, surface a clear message rather than partially
         // implementing recursive walking in one-shot. The REPL form
-        // (`get -r`) covers this case; #67 follow-up can wire it up
+        // (`get -r`) covers this case; follow-up can wire it up
         // here once the REPL/BFS helper is extracted.
         return Err(anyhow!(
             "one-shot `get -r` is not yet implemented (use the REPL: \
@@ -356,7 +356,7 @@ fn run_get(
             PathBuf::from(name)
         }
     };
-    // #70: --dry-run / --no-clobber / --interactive policy on Get
+    // --dry-run / --no-clobber / --interactive policy on Get
     // operates purely on the *local* side. transfer::do_get itself
     // already resumes a pre-existing partial download by appending
     // to it; the override here turns that into "skip" or "redownload

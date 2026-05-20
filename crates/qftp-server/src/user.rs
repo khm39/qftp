@@ -3,10 +3,10 @@
 //! Users are looked up by the Common Name (CN) of the TLS client
 //! certificate they presented during the mTLS handshake. The anonymous
 //! user is used when mTLS is not configured or the peer did not present a
-//! cert; it shares the global root and is **read-only by default** (#104).
+//! cert; it shares the global root and is **read-only by default**.
 //! A peer that presents a cert whose CN is not in the directory is
 //! rejected with `Unauthorized` rather than silently downgraded to
-//! anonymous (#105).
+//! anonymous.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -124,12 +124,12 @@ pub struct User {
     pub quota_bytes: Option<u64>,
     /// Cached `walk_size(home).0` plus successful Put accruals minus
     /// successful Rm decrements. Initialized once at startup
-    /// (avoids the per-Put `walk_size` DoS, #111).
+    /// (avoids the per-Put `walk_size` DoS,).
     pub used_bytes: AtomicU64,
     /// Bytes reserved by accepted-but-not-yet-completed Put streams.
     /// `start_put` adds the declared remaining bytes here; the Put
     /// completion path subtracts them (and adds to `used_bytes` on
-    /// success). This closes the parallel-Put bypass (#111).
+    /// success). This closes the parallel-Put bypass.
     pub in_flight_bytes: AtomicU64,
 }
 
@@ -193,7 +193,7 @@ impl UserDirectory {
     /// Build a directory where the anonymous user gets the global root.
     /// Used when no `--users` file is configured. The anonymous user is
     /// **read-only** by default; operators wanting writable anonymous
-    /// access must declare it explicitly via `users.toml` (#104).
+    /// access must declare it explicitly via `users.toml`.
     pub fn default_anonymous(global_root: &Path) -> Self {
         let anon = Arc::new(User {
             name: "anonymous".to_string(),
@@ -218,7 +218,7 @@ impl UserDirectory {
             )
         })?;
 
-        // #126: `quota_bytes = 0` is ambiguous. Operators familiar
+        // `quota_bytes = 0` is ambiguous. Operators familiar
         // with traditional disk-quota systems often expect 0 to mean
         // "unlimited"; the natural reading of this field is "zero
         // bytes allowed" (every Put fails with QuotaExceeded).
@@ -279,7 +279,7 @@ impl UserDirectory {
         };
 
         let build_user = |spec: &UserSpec, home: PathBuf| -> Arc<User> {
-            // #111: prime the used-bytes cache once at startup so the
+            // Prime the used-bytes cache once at startup so the
             // hot path (Put) doesn't re-walk the user's home.
             let (used, _) = walk_size(&home);
             Arc::new(User {
@@ -326,7 +326,7 @@ impl UserDirectory {
     /// no peer certificate is presented). A `Some(cn)` that does not match
     /// any configured user **also** returns anonymous; callers that have a
     /// peer cert should prefer [`lookup_strict`](Self::lookup_strict),
-    /// which surfaces the miss so the connection can be rejected (#105).
+    /// which surfaces the miss so the connection can be rejected.
     #[allow(dead_code)]
     pub fn lookup(&self, cn: Option<&str>) -> Arc<User> {
         match cn.and_then(|n| self.by_name.get(n.trim())) {
@@ -338,7 +338,7 @@ impl UserDirectory {
     /// Strict CN lookup used after mTLS upgrade. Returns `None` for an
     /// unknown CN so the caller can close the connection with
     /// `Unauthorized` rather than silently falling back to anonymous
-    /// (#105). The CN is trimmed of surrounding whitespace before lookup.
+    ///. The CN is trimmed of surrounding whitespace before lookup.
     pub fn lookup_strict(&self, cn: &str) -> Option<Arc<User>> {
         self.by_name.get(cn.trim()).map(Arc::clone)
     }
@@ -352,7 +352,7 @@ impl UserDirectory {
 /// certificate, in the order the caller should try them against
 /// `users.toml`. Returns an empty vector if the cert fails to parse.
 ///
-/// #142: previously this function only inspected the X.509 Subject
+/// Previously this function only inspected the X.509 Subject
 /// CN, which is deprecated by CA/Browser Forum baselines and is
 /// rarely populated by modern PKI tooling (cert-manager, smallstep,
 /// Vault PKI, SPIFFE). Now we look at:
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn default_anonymous_is_read_only() {
-        // #104: without `--users`, the implicit anonymous user must not
+        // Without `--users`, the implicit anonymous user must not
         // grant writes, deletes, or chmod.
         let dir = UserDirectory::default_anonymous(Path::new("/tmp"));
         let anon = dir.anonymous();
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn lookup_strict_misses_unknown_cn() {
-        // #105: a peer cert with an unknown CN must NOT silently
+        // A peer cert with an unknown CN must NOT silently
         // downgrade to anonymous; lookup_strict returns None so the
         // caller can close the connection.
         let dir = UserDirectory::default_anonymous(Path::new("/tmp"));
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn lookup_strict_trims_whitespace() {
-        // #105: trailing/leading whitespace on the CN should not
+        // Trailing/leading whitespace on the CN should not
         // produce a different user than the configured name.
         let tmp = tempfile::tempdir().unwrap();
         let cfg = UserConfig {
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn from_config_rejects_parent_dir_in_relative_home() {
-        // #112: a relative `home = "../../etc"` in users.toml must not
+        // A relative `home = "../../etc"` in users.toml must not
         // escape the global root.
         let tmp = tempfile::tempdir().unwrap();
         let cfg = UserConfig {
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn config_rejects_typoed_field_name() {
-        // #113: with deny_unknown_fields, a misspelled key like
+        // With deny_unknown_fields, a misspelled key like
         // `quota` (instead of `quota_bytes`) must produce an error
         // rather than silently disabling the quota.
         let toml = r#"
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn config_rejects_typoed_permissions_field() {
-        // #113: a misspelled `permision` (singular) inside a per-user
+        // A misspelled `permision` (singular) inside a per-user
         // table must be flagged at parse time.
         let toml = r#"
             [[users]]
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn from_config_rejects_zero_quota() {
-        // #126: explicit 0 is ambiguous; require omission for unlimited.
+        // Explicit 0 is ambiguous; require omission for unlimited.
         let tmp = tempfile::tempdir().unwrap();
         let cfg = UserConfig {
             anonymous: None,
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn from_config_initializes_used_bytes_from_walk_size() {
-        // #111: a freshly built UserDirectory should reflect any
+        // A freshly built UserDirectory should reflect any
         // pre-existing files under each user's home, not start at 0.
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("alice");
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn current_usage_tracks_in_flight_plus_used() {
-        // #111: parallel-Put bypass guard. The quota check must see
+        // Parallel-Put bypass guard. The quota check must see
         // committed + reserved, never just committed.
         let user = User {
             name: "u".to_string(),
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn from_config_rejects_absolute_home_outside_root() {
-        // #112: even an absolute home must canonicalize to inside the
+        // Even an absolute home must canonicalize to inside the
         // global root.
         let tmp = tempfile::tempdir().unwrap();
         let cfg = UserConfig {
@@ -681,7 +681,7 @@ mod tests {
         );
     }
 
-    // #142 ------------------------------------------------------------
+    // ------------------------------------------------------------
     //
     // Build a synthetic self-signed cert with rcgen and assert that
     // extract_identity_candidates returns SAN entries first and falls
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn extract_identity_candidates_cn_only_still_works() {
         // Legacy cert with only CN populated -- behaviour must match
-        // the pre-#142 extract_cn so existing deployments don't break.
+        // the pre- extract_cn so existing deployments don't break.
         let der = make_cert_with_identities("legacy-cn", &[], &[], &[]);
         let ids = extract_identity_candidates(&der);
         assert_eq!(ids, vec!["legacy-cn"]);

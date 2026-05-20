@@ -321,7 +321,7 @@ fn main() -> Result<()> {
     let tofu_active = args.trust_on_first_use && spec.ca.is_none() && !spec.insecure;
     let effective_verify_peer = !spec.insecure && !tofu_active;
 
-    // #128: --insecure drops the only authentication we have over the
+    // --insecure drops the only authentication we have over the
     // wire. Surface that explicitly so it never lands in a script
     // unnoticed.
     if spec.insecure {
@@ -503,7 +503,7 @@ fn run_interactive(
     next_stream_id: &mut u64,
     local_cwd: &mut PathBuf,
 ) -> Result<()> {
-    // Tab completion wired through `ReplHelper` (#64). Without an
+    // Tab completion wired through `ReplHelper`. Without an
     // explicit helper rustyline emits a beep on TAB; with it we get
     // first-word command completion + local-path completion for the
     // `put`/`lcd`/`lls`/`lmkdir`/`!` family.
@@ -803,7 +803,7 @@ fn do_recursive_get(
         };
         std::fs::create_dir_all(&ldir).ok();
         for entry in entries {
-            // #108: a malicious server can return entry names containing
+            // A malicious server can return entry names containing
             // `..` or absolute paths; `PathBuf::join` would silently
             // escape `ldir`. Reject lexically before we touch the
             // filesystem.
