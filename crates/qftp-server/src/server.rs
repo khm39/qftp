@@ -430,18 +430,21 @@ pub fn run(
                 continue;
             }
 
+            let mut ax = AcceptCtx {
+                connections: &mut connections,
+                counter: &mut counter,
+                rate_limiter: &mut rate_limiter,
+                quiche_config: &mut quiche_config,
+                retry_key: &retry_key,
+                conn_id_seed: &conn_id_seed,
+                cfg: &server_config,
+                users: &users,
+                metrics: &metrics,
+                rng: &rng,
+                socket: &socket,
+            };
             try_accept(
-                &mut connections,
-                &mut counter,
-                &mut rate_limiter,
-                &retry_key,
-                &conn_id_seed,
-                &server_config,
-                &users,
-                &metrics,
-                &rng,
-                &socket,
-                &mut quiche_config,
+                &mut ax,
                 from,
                 local_addr,
                 &hdr,
@@ -506,27 +509,33 @@ pub fn run(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Server-wide state borrowed by [`try_accept`] for one accept attempt.
+/// Bundled so the accept path takes a handful of arguments rather than
+/// the whole server's worth.
+struct AcceptCtx<'a> {
+    connections: &'a mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+    counter: &'a mut ConnectionCounter,
+    rate_limiter: &'a mut RateLimiter,
+    quiche_config: &'a mut quiche::Config,
+    retry_key: &'a RetryKey,
+    conn_id_seed: &'a [u8; 32],
+    cfg: &'a ServerConfig,
+    users: &'a UserDirectory,
+    metrics: &'a Metrics,
+    rng: &'a ring::rand::SystemRandom,
+    socket: &'a mio::net::UdpSocket,
+}
+
 fn try_accept(
-    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
-    counter: &mut ConnectionCounter,
-    rate_limiter: &mut RateLimiter,
-    retry_key: &RetryKey,
-    conn_id_seed: &[u8; 32],
-    cfg: &ServerConfig,
-    users: &UserDirectory,
-    metrics: &Metrics,
-    rng: &ring::rand::SystemRandom,
-    socket: &mio::net::UdpSocket,
-    quiche_config: &mut quiche::Config,
+    ax: &mut AcceptCtx,
     from: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
     hdr: &quiche::Header,
     pkt: &mut [u8],
     out_pkt: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<()> {
-    if !rate_limiter.try_consume(from.ip()) {
-        metrics.inc_connections_rejected_rate();
+    if !ax.rate_limiter.try_consume(from.ip()) {
+        ax.metrics.inc_connections_rejected_rate();
         debug!(peer = %from, "Initial dropped by rate limiter");
         return Ok(());
     }
@@ -534,23 +543,23 @@ fn try_accept(
     // Stateless retry: when required, the very first Initial from a peer
     // has no token. Mint one and send it back as a RETRY; the client will
     // resend the Initial with the token attached.
-    if cfg.require_retry {
+    if ax.cfg.require_retry {
         let has_token = hdr.token.as_ref().is_some_and(|t| !t.is_empty());
         if !has_token {
-            send_retry(retry_key, rng, socket, hdr, from, out_pkt)?;
-            metrics.inc_retries_issued();
+            send_retry(ax.retry_key, ax.rng, ax.socket, hdr, from, out_pkt)?;
+            ax.metrics.inc_retries_issued();
             return Ok(());
         }
         let token = hdr.token.as_ref().unwrap();
-        if retry_key.verify(from, token).is_none() {
+        if ax.retry_key.verify(from, token).is_none() {
             debug!(peer = %from, "Initial with invalid retry token");
             return Ok(());
         }
         // Verified: fall through and accept with odcid set below.
     }
 
-    if !counter.try_acquire(cfg.caps, from.ip()) {
-        metrics.inc_connections_rejected_caps();
+    if !ax.counter.try_acquire(ax.cfg.caps, from.ip()) {
+        ax.metrics.inc_connections_rejected_caps();
         debug!(peer = %from, "Initial dropped by connection cap");
         return Ok(());
     }
@@ -558,20 +567,26 @@ fn try_accept(
     // Derive the server SCID deterministically from the client's DCID +
     // process seed. Retransmitted Initials therefore land on the same
     // connection key instead of accidentally creating duplicates.
-    let scid = derive_scid(conn_id_seed, &hdr.dcid);
+    let scid = derive_scid(ax.conn_id_seed, &hdr.dcid);
 
     // Recover odcid from the retry token if we issued one.
-    let odcid_owned: Option<quiche::ConnectionId<'static>> = if cfg.require_retry {
+    let odcid_owned: Option<quiche::ConnectionId<'static>> = if ax.cfg.require_retry {
         hdr.token
             .as_ref()
-            .and_then(|t| retry_key.verify(from, t))
+            .and_then(|t| ax.retry_key.verify(from, t))
             .map(|c| quiche::ConnectionId::from_vec(c.as_ref().to_vec()))
     } else {
         None
     };
 
-    let mut conn = quiche::accept(&scid, odcid_owned.as_ref(), local_addr, from, quiche_config)
-        .context("quiche::accept failed")?;
+    let mut conn = quiche::accept(
+        &scid,
+        odcid_owned.as_ref(),
+        local_addr,
+        from,
+        ax.quiche_config,
+    )
+    .context("quiche::accept failed")?;
 
     // Feed the original Initial in so the handshake actually starts.
     let recv_info = quiche::RecvInfo {
@@ -580,25 +595,25 @@ fn try_accept(
     };
     if let Err(e) = conn.recv(pkt, recv_info) {
         warn!(peer = %from, error = ?e, "initial recv failed");
-        counter.release(from.ip());
+        ax.counter.release(from.ip());
         return Ok(());
     }
 
     // mTLS identity isn't ready until the handshake completes; start the
     // connection as the anonymous user and upgrade later if we can.
-    let ctx = ConnectionContext::new(conn, from, users.anonymous(), scid.clone());
+    let ctx = ConnectionContext::new(conn, from, ax.users.anonymous(), scid.clone());
     info!(peer = %from, "connection accepted");
-    metrics.inc_connections_total();
-    metrics.inc_connections_open();
+    ax.metrics.inc_connections_total();
+    ax.metrics.inc_connections_open();
 
     // If a previous Initial from this peer already created the slot
     // (the deterministic SCID collapses retransmits onto the same key),
     // just drop the duplicate accept.
-    if connections.contains_key(&scid) {
-        counter.release(from.ip());
+    if ax.connections.contains_key(&scid) {
+        ax.counter.release(from.ip());
         return Ok(());
     }
-    connections.insert(scid, ctx);
+    ax.connections.insert(scid, ctx);
     Ok(())
 }
 
