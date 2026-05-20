@@ -558,7 +558,6 @@ fn try_accept(
     // Derive the server SCID deterministically from the client's DCID +
     // process seed. Retransmitted Initials therefore land on the same
     // connection key instead of accidentally creating duplicates.
-    let _ = rng;
     let scid = derive_scid(conn_id_seed, &hdr.dcid);
 
     // Recover odcid from the retry token if we issued one.
@@ -1372,7 +1371,7 @@ fn start_put(
     // has the first `offset` bytes of this upload in the temp file. We
     // open it for append (not create_new) and validate the existing
     // length matches the offset. Otherwise it's a fresh upload.
-    let (writer, mut hasher) = if offset == 0 {
+    let (writer, hasher) = if offset == 0 {
         let f = match open_temp_no_follow(&temp_path) {
             Ok(f) => f,
             Err(e) => {
@@ -1449,7 +1448,6 @@ fn start_put(
         (BufWriter::with_capacity(FILE_CHUNK_SIZE, f), hasher)
     };
 
-    let _ = &mut hasher; // borrow as mutable below
     let mut new_state = StreamState::ReadingFileData {
         final_path,
         temp_path,

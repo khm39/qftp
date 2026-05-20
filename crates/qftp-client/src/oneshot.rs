@@ -575,14 +575,6 @@ fn prompt_overwrite(target: &str) -> Result<bool> {
     }
 }
 
-// Suppress dead-code warning until additional UX features (#73,
-// #80) use this; keeps the helper public to other modules without
-// triggering clippy on this PR alone.
-#[allow(dead_code)]
-fn is_tty() -> bool {
-    std::io::stdout().is_terminal()
-}
-
 fn flush_stdout() {
     let _ = std::io::stdout().flush();
 }

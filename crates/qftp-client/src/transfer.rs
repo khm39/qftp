@@ -112,7 +112,8 @@ pub fn parse_bw_limit(input: &str) -> anyhow::Result<u64> {
         anyhow::bail!("bwlimit is empty");
     }
     let bytes = s.as_bytes();
-    let (num_end, mult) = parse_suffix(bytes);
+    let (num_end, mult) = parse_suffix(bytes)
+        .ok_or_else(|| anyhow::anyhow!("bwlimit: unrecognized suffix in '{input}'"))?;
     let num: f64 = std::str::from_utf8(&bytes[..num_end])
         .map_err(|_| anyhow::anyhow!("bwlimit: non-utf8 number"))?
         .parse()
@@ -123,7 +124,7 @@ pub fn parse_bw_limit(input: &str) -> anyhow::Result<u64> {
     Ok((num * mult as f64) as u64)
 }
 
-fn parse_suffix(bytes: &[u8]) -> (usize, u64) {
+fn parse_suffix(bytes: &[u8]) -> Option<(usize, u64)> {
     // Walk back from the end to find the digit/suffix boundary.
     let mut end = bytes.len();
     while end > 0 && !bytes[end - 1].is_ascii_digit() && bytes[end - 1] != b'.' {
@@ -138,9 +139,10 @@ fn parse_suffix(bytes: &[u8]) -> (usize, u64) {
         "Ki" | "ki" => 1024,
         "Mi" | "mi" => 1024 * 1024,
         "Gi" | "gi" => 1024 * 1024 * 1024,
-        _ => 1,
+        // An unrecognized suffix is a user typo, not a 1-byte unit.
+        _ => return None,
     };
-    (end, mult)
+    Some((end, mult))
 }
 
 fn make_bar(total: u64, label: &str) -> ProgressBar {

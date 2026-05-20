@@ -526,11 +526,8 @@ mod tests {
             modified: 0,
             mode: 0o644,
         };
-        // Build a listing one entry over the cap. Using zero-cost
-        // clones because DirEntry's String is tiny.
-        let entries = (0..MAX_DIR_ENTRIES + 1)
-            .map(|_| DirEntry { ..entry.clone() })
-            .collect();
+        // Build a listing one entry over the cap.
+        let entries = (0..MAX_DIR_ENTRIES + 1).map(|_| entry.clone()).collect();
         let resp = Response::DirListing(entries);
         let e = validate_response(&resp).unwrap_err();
         assert!(e.0.contains("MAX_DIR_ENTRIES"), "unexpected error: {e}");

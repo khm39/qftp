@@ -285,9 +285,9 @@ fn handle_request(mut stream: TcpStream, metrics: Arc<Metrics>) -> Result<()> {
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf)?;
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let path = request.split_whitespace().nth(1).unwrap_or("/");
 
-    let (status, content_type, body) = match path.as_str() {
+    let (status, content_type, body) = match path {
         "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics.render()),
         "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
         _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
