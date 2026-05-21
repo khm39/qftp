@@ -11,6 +11,7 @@ readme = "../../README.md"
 
 [dependencies]
 qftp-common = { path = "../qftp-common" }
+qftp-protocol = { path = "../qftp-protocol" }
 quiche = "0.22"
 rcgen = "0.13"
 mio = { version = "1", features = ["net", "os-poll"] }
