@@ -14,11 +14,14 @@ is what we will bump to signal an intentional wire break.
   that serves qftp to browsers over WebTransport (HTTP/3). It runs
   alongside `qftp-server` (same `--root` and `users.toml`), carries
   bearer-token auth (`--users-tokens`), and streams Get / Put with the
-  same BLAKE3-trailer wire format as the native protocol. The
-  transport-independent request handling, ACLs, and user directory
-  were extracted into a new `qftp-protocol` library crate shared by
-  the server and the bridge. The bridge uses `wtransport` (quinn);
-  `qftp-server` / `qftp-client` stay on `quiche` (see ADR 0001).
+  same BLAKE3-trailer wire format as the native protocol. It also
+  ships a single-page web app -- browse, drag-and-drop upload,
+  download, delete, rename, with progress bars -- served over a
+  built-in HTTP listener (`--http-bind`). The transport-independent
+  request handling, ACLs, and user directory were extracted into a new
+  `qftp-protocol` library crate shared by the server and the bridge.
+  The bridge uses `wtransport` (quinn); `qftp-server` / `qftp-client`
+  stay on `quiche` (see ADR 0001 and `docs/web-client.md`).
 - **Protocol versioning.** ALPN is now `qftp/1` (was `qftp`). New
   binaries refuse to negotiate with peers that don't offer the new
   ALPN; the QUIC handshake fails cleanly with no fallback.

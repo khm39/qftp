@@ -59,6 +59,27 @@ runs after the TLS handshake completes, so a determined MitM could
 complete the handshake; the connection is then closed with the SSH-
 style banner. Use `--ca` whenever a real CA chain is available.
 
+### WebTransport bridge (`qftp-web-bridge`)
+
+The optional `qftp-web-bridge` exposes qftp to browsers over
+WebTransport. It is a **separate trust boundary** from the native
+server:
+
+- Browsers cannot present client certificates to a WebTransport
+  endpoint, so the bridge does **not** use mTLS. It authenticates
+  with bearer tokens (`--users-tokens`): an opaque token in the
+  connection URL's query string is mapped to a `users.toml` user.
+  Tokens are the only secret gating web access -- generate them with
+  high entropy and treat the tokens file like a password file.
+- WebTransport requires a browser-trusted TLS certificate; the bridge
+  has no `--insecure` equivalent. The token travels inside the
+  TLS-encrypted HTTP/3 handshake.
+- Without `--users-tokens`, every browser session is the anonymous
+  read-only user. Never run a writable deployment without it.
+- The bundled SPA is served over plain HTTP on `--http-bind`; bind it
+  to loopback and front it with a TLS-terminating reverse proxy.
+- Safari has no WebTransport support and cannot use the bridge.
+
 ## Out of scope
 
 - Side channels in the BLAKE3 / HMAC implementations (we rely on the

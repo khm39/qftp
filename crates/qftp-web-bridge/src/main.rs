@@ -21,6 +21,7 @@ use wtransport::endpoint::IncomingSession;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
 mod auth;
+mod http;
 mod transfer;
 
 use auth::TokenDirectory;
@@ -61,6 +62,13 @@ struct Args {
     /// as the anonymous (read-only) user.
     #[arg(long)]
     users_tokens: Option<PathBuf>,
+
+    /// TCP address for the bundled single-page-app HTTP listener.
+    /// WebTransport cannot deliver the initial page, so the bridge
+    /// serves it here. Front it with a TLS-terminating reverse proxy
+    /// in production.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    http_bind: SocketAddr,
 }
 
 /// Process-wide state shared by every accepted session.
@@ -117,7 +125,20 @@ async fn main() -> Result<()> {
     let endpoint = Endpoint::server(config).context("failed to start WebTransport endpoint")?;
     let shared = Arc::new(Shared { users, tokens });
 
-    info!(bind = %args.bind, root = %root.display(), "qftp web bridge listening");
+    // Serve the bundled SPA over plain HTTP on a separate task.
+    let http_bind = args.http_bind;
+    tokio::spawn(async move {
+        if let Err(e) = http::serve(http_bind).await {
+            warn!(error = %e, "SPA HTTP listener stopped");
+        }
+    });
+
+    info!(
+        bind = %args.bind,
+        http_bind = %args.http_bind,
+        root = %root.display(),
+        "qftp web bridge listening"
+    );
 
     loop {
         let incoming = endpoint.accept().await;
