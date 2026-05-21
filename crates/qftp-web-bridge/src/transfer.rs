@@ -22,7 +22,7 @@ use qftp_common::protocol::{validate_request, ErrorCode, ErrorResponse, Request,
 use qftp_common::transport::{decode_framed_message, MAX_MESSAGE_SIZE};
 use qftp_protocol::handler;
 use qftp_protocol::stream::{FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
-use qftp_protocol::user::{walk_size, User};
+use qftp_protocol::user::User;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use wtransport::{RecvStream, SendStream};
@@ -89,12 +89,19 @@ async fn handle_stream_impl(
         }
 
         Request::Quota => {
-            let (used_bytes, file_count) = walk_size(&user.home);
+            // Serve the cached `used + in_flight` figure rather than
+            // re-walking the user's home on every request -- an
+            // unauthenticated/anonymous client could otherwise force a
+            // full recursive directory scan per WebTransport stream.
+            // The cache is initialized once at startup (`from_config`)
+            // and kept current by the Put completion path. `file_count`
+            // is advisory only and no longer tracked exactly, matching
+            // the native server's `Quota` reply.
             send_framed(
                 &mut send,
                 &Response::QuotaInfo {
-                    used_bytes,
-                    file_count,
+                    used_bytes: user.current_usage(),
+                    file_count: 0,
                     limit_bytes: user.quota_bytes,
                 },
             )

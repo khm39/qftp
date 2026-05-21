@@ -1288,6 +1288,47 @@ fn drive_one_sender(
     SendOutcome::Finished
 }
 
+/// RAII guard for an `in_flight_bytes` quota reservation.
+///
+/// `start_put` reserves `new_bytes` against the user's quota before it
+/// has a `StreamState::ReadingFileData` to anchor the reservation to.
+/// Several early-return failure paths sit between the reservation and
+/// that state; this guard returns the bytes on every one of them.
+/// Once `ReadingFileData` exists its own Drop owns the reservation, so
+/// the guard is disarmed.
+struct InFlightReservation {
+    user: Arc<User>,
+    bytes: u64,
+    armed: bool,
+}
+
+impl InFlightReservation {
+    fn reserve(user: Arc<User>, bytes: u64) -> Self {
+        user.in_flight_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Self {
+            user,
+            bytes,
+            armed: true,
+        }
+    }
+
+    /// Hand ownership of the reservation to the constructed
+    /// `ReadingFileData` state; the guard becomes a no-op on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.user
+                .in_flight_bytes
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_put(
     ctx: &mut ConnectionContext,
@@ -1317,6 +1358,20 @@ fn start_put(
             ),
         );
     }
+    // Resume (offset > 0) is not supported. `temp_path_for` mints a
+    // fresh random suffix on every call, so a resume can never locate
+    // the prior session's `.partial` -- the old code path always failed
+    // deep inside with `InvalidRange`. A deterministic temp name would
+    // make resume work but would reintroduce the upload-blocking
+    // file-planting DoS the random suffix exists to prevent, so we
+    // reject here instead, matching the web bridge's behaviour.
+    if offset > 0 {
+        return send_err(
+            ctx,
+            ErrorCode::Unsupported,
+            "upload resume (offset > 0) is not supported".to_string(),
+        );
+    }
     // Quota pre-check + in-flight reservation. The cache
     // `used_bytes` and `in_flight_bytes` is kept up to date by Put
     // commit/abort and Rm. Reserve atomically so two concurrent
@@ -1340,10 +1395,10 @@ fn start_put(
     // Reserve unconditionally so abort/disconnect bookkeeping is
     // symmetric regardless of whether the user has a configured
     // quota; the value only matters for limited users but the
-    // counter is cheap.
-    ctx.user
-        .in_flight_bytes
-        .fetch_add(new_bytes, Ordering::Relaxed);
+    // counter is cheap. The guard releases the reservation on every
+    // early-return path below; it is disarmed once `ReadingFileData`
+    // (which owns the reservation via its Drop) is constructed.
+    let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
     let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
         Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
@@ -1355,11 +1410,8 @@ fn start_put(
     // traversed by the kernel and land the temp under the symlink
     // target.
     if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, &ctx.user.home) {
-        // Drop the in-flight reservation since we never opened the
-        // temp file.
-        ctx.user
-            .in_flight_bytes
-            .fetch_sub(new_bytes, Ordering::Relaxed);
+        // `reservation` releases the in-flight bytes on return since
+        // we never opened the temp file.
         send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
         metrics.inc_requests_failed();
         ctx.streams.insert(stream_id, StreamState::Done);
@@ -1370,9 +1422,7 @@ fn start_put(
     // "exists" -- otherwise an attacker who could plant a dangling
     // symlink could bypass --no-clobber by aiming it at /nonexistent.
     if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
-        ctx.user
-            .in_flight_bytes
-            .fetch_sub(new_bytes, Ordering::Relaxed);
+        // `reservation` releases the in-flight bytes on return.
         return send_err(
             ctx,
             ErrorCode::AlreadyExists,
@@ -1381,87 +1431,26 @@ fn start_put(
     }
     let temp_path = temp_path_for(&final_path, stream_id);
 
-    // Resume: if offset > 0 the client is claiming the server already
-    // has the first `offset` bytes of this upload in the temp file. We
-    // open it for append (not create_new) and validate the existing
-    // length matches the offset. Otherwise it's a fresh upload.
-    let (writer, hasher) = if offset == 0 {
-        let f = match open_temp_no_follow(&temp_path) {
-            Ok(f) => f,
-            Err(e) => {
-                return send_err(
-                    ctx,
-                    io_code(&e),
-                    format!("Failed to create upload temp file: {e}"),
-                );
-            }
-        };
-        (
-            BufWriter::with_capacity(FILE_CHUNK_SIZE, f),
-            blake3::Hasher::new(),
-        )
-    } else {
-        // Resume path: open existing temp, validate length, hash its
-        // contents so the final checksum still covers the full body.
-        let meta = match fs::metadata(&temp_path) {
-            Ok(m) => m,
-            Err(e) => {
-                return send_err(
-                    ctx,
-                    ErrorCode::InvalidRange,
-                    format!("Resume requested at offset {offset} but no temp file exists ({e})"),
-                );
-            }
-        };
-        if meta.len() != offset {
+    // Fresh upload: create a new temp file. Resume (offset > 0) was
+    // rejected above, so this is the only case.
+    let f = match open_temp_no_follow(&temp_path) {
+        Ok(f) => f,
+        Err(e) => {
             return send_err(
                 ctx,
-                ErrorCode::InvalidRange,
-                format!(
-                    "Resume offset {offset} doesn't match server temp length {}",
-                    meta.len()
-                ),
+                io_code(&e),
+                format!("Failed to create upload temp file: {e}"),
             );
         }
-        let mut hasher = blake3::Hasher::new();
-        let mut existing = match open_temp_for_resume(&temp_path, false) {
-            Ok(f) => f,
-            Err(e) => {
-                return send_err(
-                    ctx,
-                    io_code(&e),
-                    format!("Failed to open temp for resume: {e}"),
-                );
-            }
-        };
-        loop {
-            match std::io::Read::read(&mut existing, scratch) {
-                Ok(0) => break,
-                Ok(n) => {
-                    hasher.update(&scratch[..n]);
-                }
-                Err(e) => {
-                    return send_err(
-                        ctx,
-                        ErrorCode::Internal,
-                        format!("Failed to rehash temp for resume: {e}"),
-                    );
-                }
-            }
-        }
-        let f = match open_temp_for_resume(&temp_path, true) {
-            Ok(f) => f,
-            Err(e) => {
-                return send_err(
-                    ctx,
-                    io_code(&e),
-                    format!("Failed to reopen temp for append: {e}"),
-                );
-            }
-        };
-        (BufWriter::with_capacity(FILE_CHUNK_SIZE, f), hasher)
     };
+    let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, f);
+    let hasher = blake3::Hasher::new();
 
+    // The reservation is now owned by `ReadingFileData`'s Drop (via
+    // `reserved_bytes`); disarm the guard so the bytes aren't released
+    // twice. Every failure path below this point goes through a
+    // `ReadingFileData` value whose Drop returns the reservation.
+    reservation.disarm();
     let mut new_state = StreamState::ReadingFileData {
         final_path,
         temp_path,
@@ -1717,21 +1706,6 @@ fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
     // would land the file at 0o644 = world-readable until
     // apply_mode runs on the renamed final_path.
     qftp_common::fs_safe::apply_owner_only_no_follow(&mut opts).open(path)
-}
-
-/// Reopen an existing temp file for the Put resume path. Asserts it
-/// is a regular file (so a swapped-in symlink or directory can't
-/// redirect us) and applies `O_NOFOLLOW`. `for_append=true` reopens
-/// the file for append; `false` opens it read-only for rehashing.
-fn open_temp_for_resume(path: &Path, for_append: bool) -> std::io::Result<File> {
-    qftp_common::fs_safe::require_regular_file(path)?;
-    let mut opts = std::fs::OpenOptions::new();
-    if for_append {
-        opts.append(true);
-    } else {
-        opts.read(true);
-    }
-    qftp_common::fs_safe::apply_no_follow(&mut opts).open(path)
 }
 
 fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {

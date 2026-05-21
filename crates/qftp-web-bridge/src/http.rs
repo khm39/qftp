@@ -10,6 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +23,17 @@ const STYLE_CSS: &str = include_str!("../../../web/style.css");
 /// Largest request head we will buffer. We only ever read the request
 /// line; headers and any body are ignored.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
+
+/// Wall-clock budget for a single connection, covering both reading the
+/// request head and writing the response. Without it a client that
+/// opens a socket and never sends a full request (slowloris) pins a
+/// task and its buffer forever.
+const CONN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on connections served concurrently. The accept loop stops
+/// pulling new connections once this is reached, so a connection flood
+/// can't spawn tasks without limit.
+const MAX_CONNECTIONS: usize = 128;
 
 struct StaticFile {
     content_type: &'static str,
@@ -58,7 +70,15 @@ pub async fn serve(bind: SocketAddr, config_json: String) -> Result<()> {
         .with_context(|| format!("failed to bind SPA HTTP listener on {bind}"))?;
     tracing::info!(%bind, "SPA HTTP listener ready");
 
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        // Acquire before `accept` so a saturated listener leaves new
+        // connections in the OS backlog instead of spawning unbounded
+        // tasks.
+        let permit = Arc::clone(&conn_limit)
+            .acquire_owned()
+            .await
+            .expect("connection-limit semaphore is never closed");
         let (mut sock, _peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -68,9 +88,12 @@ pub async fn serve(bind: SocketAddr, config_json: String) -> Result<()> {
         };
         let config_json = Arc::clone(&config_json);
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(&mut sock, &config_json).await {
-                tracing::debug!(error = %e, "SPA HTTP connection error");
+            match tokio::time::timeout(CONN_TIMEOUT, handle_conn(&mut sock, &config_json)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(error = %e, "SPA HTTP connection error"),
+                Err(_) => tracing::debug!("SPA HTTP connection timed out"),
             }
+            drop(permit);
         });
     }
 }
