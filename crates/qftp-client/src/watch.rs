@@ -313,4 +313,3 @@ fn run_session(
         last_event_at = None;
     }
 }
-
