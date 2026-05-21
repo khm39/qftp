@@ -1,10 +1,51 @@
 # 0002 - OS user isolation: privileged dispatcher + per-connection setuid workers
 
-- **Status**: Proposed
-- **Date**: 2026-05-21
+- **Status**: Rejected
+- **Date**: 2026-05-21 (proposed); 2026-05-21 (rejected)
 - **Deciders**: maintainers
 - **Phase**: 5
 - **Tracking issue**: [#62](https://github.com/khm39/qftp/issues/62)
+
+## Status update (2026-05-21): Rejected
+
+This design was implemented in full (a privileged dispatcher,
+per-connection `setuid` workers, `--user-isolation` / `--check-isolation`,
+`fork`-COW handoff) and verified working end to end, then **removed**
+after a design review. The ADR is kept as the decision record; the
+code is not in the tree.
+
+Why it was rejected:
+
+- **A security feature that adds a root-level component.** The
+  dispatcher must be able to `setuid` to any configured user, which
+  makes it root-equivalent. Introducing a new root-equivalent process
+  to *improve* security is a poor trade unless the deployment really
+  needs it.
+- **It conflicts with qftp's positioning.** qftp aims to be a modern
+  FTP replacement: virtual users, no OS accounts required, simple
+  deployment. OS user isolation requires every `users.toml` entry to
+  map to a real OS account — exactly the operational friction that FTP
+  "virtual users" were invented to avoid.
+- **Prior art points the same way.** Among FTP/SFTP servers, only
+  `sshd`/SFTP defaults to per-OS-user execution, and only because it
+  *is* the OS login service. FTP servers (vsftpd, pure-ftpd) run
+  virtual-user setups as a single shared system uid and treat
+  per-OS-user as an explicit, non-default choice. qftp is not `sshd`.
+- **Cost.** A second process model, `fork`-per-connection, Linux-only
+  code, and a privileged dispatcher are a standing maintenance and
+  attack-surface burden.
+
+qftp keeps a single model: one unprivileged process, per-user homes
+and ACLs enforced in userspace (the equivalent of the FTP virtual-user
+model). If a future deployment genuinely needs kernel-enforced
+per-user ownership, this ADR is the starting point for revisiting it —
+but it should be reopened as a new ADR with that concrete requirement,
+not resurrected by default.
+
+The text below is the original (rejected) proposal, kept verbatim for
+the record.
+
+---
 
 ## Context
 

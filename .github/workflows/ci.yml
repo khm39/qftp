@@ -40,24 +40,3 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
-
-  isolation:
-    name: OS user isolation e2e
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@v2
-
-      # The dispatcher must setuid, so the e2e test runs as root via
-      # sudo; the binaries are built first as the unprivileged runner
-      # user and reused (QFTP_ISO_SKIP_BUILD=1).
-      - name: Build server and client
-        run: cargo build -p qftp-server -p qftp-client
-
-      - name: Isolation end-to-end test (privileged)
-        run: sudo env QFTP_ISO_SKIP_BUILD=1 bash scripts/isolation-test.sh

@@ -109,17 +109,6 @@ pub struct UserSpec {
     /// `None` (the default) is unlimited.
     #[serde(default)]
     pub quota_bytes: Option<u64>,
-    /// Explicit OS user id this user's file operations run as when the
-    /// server is started with `--user-isolation`. When omitted, the id
-    /// is resolved from `name` via `getpwnam` at startup. Consumed by
-    /// the isolation preflight (`--check-isolation`); has no effect in
-    /// the default single-process mode.
-    #[serde(default)]
-    pub uid: Option<u32>,
-    /// Explicit OS group id paired with `uid`. When omitted, the id is
-    /// the primary group of the resolved `uid`.
-    #[serde(default)]
-    pub gid: Option<u32>,
 }
 
 /// Resolved user record handed to per-connection contexts. The
@@ -490,27 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_optional_uid_gid() {
-        let toml = r#"
-            [[users]]
-            name = "alice"
-            uid = 1001
-            gid = 2000
-            permissions = { read = true }
-
-            [[users]]
-            name = "bob"
-            permissions = { read = true }
-        "#;
-        let cfg: UserConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.users[0].uid, Some(1001));
-        assert_eq!(cfg.users[0].gid, Some(2000));
-        // Omitted -> None; resolved from the OS account at startup.
-        assert_eq!(cfg.users[1].uid, None);
-        assert_eq!(cfg.users[1].gid, None);
-    }
-
-    #[test]
     fn lookup_falls_back_to_anonymous() {
         let dir = UserDirectory::default_anonymous(Path::new("/tmp"));
         let user = dir.lookup(Some("does-not-exist"));
@@ -554,8 +522,6 @@ mod tests {
                 home: None,
                 permissions: Permissions::read_only(),
                 quota_bytes: None,
-                uid: None,
-                gid: None,
             }],
         };
         let dir = UserDirectory::from_config(tmp.path(), cfg).unwrap();
@@ -578,8 +544,6 @@ mod tests {
                 home: Some(PathBuf::from("../../etc")),
                 permissions: Permissions::full(),
                 quota_bytes: None,
-                uid: None,
-                gid: None,
             }],
         };
         let err = UserDirectory::from_config(tmp.path(), cfg)
@@ -633,8 +597,6 @@ mod tests {
                 home: None,
                 permissions: Permissions::read_only(),
                 quota_bytes: Some(0),
-                uid: None,
-                gid: None,
             }],
         };
         let err = UserDirectory::from_config(tmp.path(), cfg)
@@ -662,8 +624,6 @@ mod tests {
                 home: Some(PathBuf::from("alice")),
                 permissions: Permissions::read_only(),
                 quota_bytes: Some(10_000),
-                uid: None,
-                gid: None,
             }],
         };
         let dir = UserDirectory::from_config(tmp.path(), cfg).unwrap();
@@ -710,8 +670,6 @@ mod tests {
                 home: Some(PathBuf::from("/etc")),
                 permissions: Permissions::read_only(),
                 quota_bytes: None,
-                uid: None,
-                gid: None,
             }],
         };
         let err = UserDirectory::from_config(tmp.path(), cfg)
