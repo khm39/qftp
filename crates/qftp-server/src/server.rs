@@ -1288,6 +1288,47 @@ fn drive_one_sender(
     SendOutcome::Finished
 }
 
+/// RAII guard for an `in_flight_bytes` quota reservation.
+///
+/// `start_put` reserves `new_bytes` against the user's quota before it
+/// has a `StreamState::ReadingFileData` to anchor the reservation to.
+/// Several early-return failure paths sit between the reservation and
+/// that state; this guard returns the bytes on every one of them.
+/// Once `ReadingFileData` exists its own Drop owns the reservation, so
+/// the guard is disarmed.
+struct InFlightReservation {
+    user: Arc<User>,
+    bytes: u64,
+    armed: bool,
+}
+
+impl InFlightReservation {
+    fn reserve(user: Arc<User>, bytes: u64) -> Self {
+        user.in_flight_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Self {
+            user,
+            bytes,
+            armed: true,
+        }
+    }
+
+    /// Hand ownership of the reservation to the constructed
+    /// `ReadingFileData` state; the guard becomes a no-op on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.user
+                .in_flight_bytes
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_put(
     ctx: &mut ConnectionContext,
@@ -1340,10 +1381,10 @@ fn start_put(
     // Reserve unconditionally so abort/disconnect bookkeeping is
     // symmetric regardless of whether the user has a configured
     // quota; the value only matters for limited users but the
-    // counter is cheap.
-    ctx.user
-        .in_flight_bytes
-        .fetch_add(new_bytes, Ordering::Relaxed);
+    // counter is cheap. The guard releases the reservation on every
+    // early-return path below; it is disarmed once `ReadingFileData`
+    // (which owns the reservation via its Drop) is constructed.
+    let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
     let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
         Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
@@ -1355,11 +1396,8 @@ fn start_put(
     // traversed by the kernel and land the temp under the symlink
     // target.
     if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, &ctx.user.home) {
-        // Drop the in-flight reservation since we never opened the
-        // temp file.
-        ctx.user
-            .in_flight_bytes
-            .fetch_sub(new_bytes, Ordering::Relaxed);
+        // `reservation` releases the in-flight bytes on return since
+        // we never opened the temp file.
         send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
         metrics.inc_requests_failed();
         ctx.streams.insert(stream_id, StreamState::Done);
@@ -1370,9 +1408,7 @@ fn start_put(
     // "exists" -- otherwise an attacker who could plant a dangling
     // symlink could bypass --no-clobber by aiming it at /nonexistent.
     if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
-        ctx.user
-            .in_flight_bytes
-            .fetch_sub(new_bytes, Ordering::Relaxed);
+        // `reservation` releases the in-flight bytes on return.
         return send_err(
             ctx,
             ErrorCode::AlreadyExists,
@@ -1462,6 +1498,11 @@ fn start_put(
         (BufWriter::with_capacity(FILE_CHUNK_SIZE, f), hasher)
     };
 
+    // The reservation is now owned by `ReadingFileData`'s Drop (via
+    // `reserved_bytes`); disarm the guard so the bytes aren't released
+    // twice. Every failure path below this point goes through a
+    // `ReadingFileData` value whose Drop returns the reservation.
+    reservation.disarm();
     let mut new_state = StreamState::ReadingFileData {
         final_path,
         temp_path,

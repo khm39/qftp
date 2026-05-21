@@ -339,6 +339,26 @@ fn main() -> Result<()> {
         .clone()
         .or_else(session_store::default_dir);
 
+    // Load known_hosts up front when TOFU is active: the pinned
+    // fingerprint binds the 0-RTT session ticket inside `establish`
+    // (a stored ticket is only resumed against the same server
+    // identity it was saved for), and the same view drives the
+    // post-handshake pin check.
+    let tofu = if tofu_active {
+        let kh_path = args
+            .known_hosts
+            .clone()
+            .or_else(known_hosts::default_path)
+            .context("$HOME is not set; --known-hosts must be provided for TOFU")?;
+        let kh = known_hosts::KnownHosts::load(&kh_path)?;
+        Some((kh_path, kh))
+    } else {
+        None
+    };
+    let expected_cert_fingerprint = tofu
+        .as_ref()
+        .and_then(|(_, kh)| kh.pinned_fingerprint(&spec.host));
+
     let connect::Established {
         mut conn,
         socket,
@@ -352,20 +372,15 @@ fn main() -> Result<()> {
             verify_peer: effective_verify_peer,
             zero_rtt: !args.no_zero_rtt,
             ticket_dir: ticket_dir.clone(),
+            expected_cert_fingerprint,
         },
     )?;
 
-    if tofu_active {
-        let kh_path = args
-            .known_hosts
-            .clone()
-            .or_else(known_hosts::default_path)
-            .context("$HOME is not set; --known-hosts must be provided for TOFU")?;
+    if let Some((kh_path, kh)) = &tofu {
         let der = conn
             .peer_cert()
             .context("server presented no certificate; cannot pin")?;
         let seen = known_hosts::fingerprint_hex(der);
-        let kh = known_hosts::KnownHosts::load(&kh_path)?;
         match kh.lookup(&spec.host, &seen) {
             known_hosts::Verdict::Match => {
                 tracing::info!(
@@ -375,7 +390,7 @@ fn main() -> Result<()> {
                 );
             }
             known_hosts::Verdict::New => {
-                known_hosts::KnownHosts::append_to_file(&kh_path, &spec.host, &seen)?;
+                known_hosts::KnownHosts::append_to_file(kh_path, &spec.host, &seen)?;
                 eprintln!(
                     "The authenticity of host '{}' can't be established.",
                     spec.host

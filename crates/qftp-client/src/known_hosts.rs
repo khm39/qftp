@@ -122,6 +122,16 @@ impl KnownHosts {
         Ok(KnownHosts { entries })
     }
 
+    /// Raw 32-byte fingerprint pinned for `host_port`, if an entry
+    /// exists. Used to bind a stored 0-RTT session ticket to the pinned
+    /// server identity before the handshake runs. Returns `None` for an
+    /// unknown host (nothing to bind to yet) or an entry whose hex is
+    /// not exactly 32 bytes.
+    pub fn pinned_fingerprint(&self, host_port: &str) -> Option<[u8; 32]> {
+        let entry = self.entries.iter().find(|e| e.host_port == host_port)?;
+        decode_fingerprint_hex(&entry.fingerprint_hex)
+    }
+
     pub fn lookup(&self, host_port: &str, fingerprint_hex: &str) -> Verdict {
         let want = fingerprint_hex.to_ascii_lowercase();
         for e in &self.entries {
@@ -228,6 +238,22 @@ fn is_valid_host_port(s: &str) -> bool {
 /// 64 lowercase or uppercase hex chars.
 fn is_valid_fingerprint_hex(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Decode a 64-char hex fingerprint into its 32 raw bytes. Returns
+/// `None` for any string that is not exactly 64 hex digits.
+fn decode_fingerprint_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *byte = (hi * 16 + lo) as u8;
+    }
+    Some(out)
 }
 
 /// Compute the lowercase-hex SHA-256 of a DER-encoded leaf cert.
@@ -386,6 +412,31 @@ mod tests {
         let fp = "0".repeat(64);
         KnownHosts::append_to_file(&path, "[::1]:4433", &fp)
             .expect("bracketed IPv6 host should be accepted");
+    }
+
+    #[test]
+    fn pinned_fingerprint_decodes_entry_and_misses_unknown_host() {
+        let fp_hex = format!("ab{}", "00".repeat(31));
+        let src = format!("host:4433 sha256:{fp_hex}\n");
+        let kh = KnownHosts::from_reader(Cursor::new(src.as_bytes())).unwrap();
+        let raw = kh
+            .pinned_fingerprint("host:4433")
+            .expect("known host should yield a fingerprint");
+        assert_eq!(raw[0], 0xab);
+        assert!(raw[1..].iter().all(|&b| b == 0));
+        assert!(kh.pinned_fingerprint("unknown:4433").is_none());
+    }
+
+    #[test]
+    fn pinned_fingerprint_round_trips_with_fingerprint_sha256() {
+        let der = b"server-leaf-cert-der";
+        let fp_hex = fingerprint_hex(der);
+        let src = format!("srv:4433 sha256:{fp_hex}\n");
+        let kh = KnownHosts::from_reader(Cursor::new(src.as_bytes())).unwrap();
+        assert_eq!(
+            kh.pinned_fingerprint("srv:4433"),
+            Some(fingerprint_sha256(der))
+        );
     }
 
     #[test]

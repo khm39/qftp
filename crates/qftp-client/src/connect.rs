@@ -50,16 +50,25 @@ pub struct EstablishOpts {
     pub zero_rtt: bool,
     /// Session-ticket directory override. `None` uses the default.
     pub ticket_dir: Option<PathBuf>,
+    /// Server-cert fingerprint a stored 0-RTT ticket must be bound to.
+    /// In TOFU mode this is the pinned known_hosts value, so a ticket
+    /// is only resumed against the same server identity it was saved
+    /// for (defends against DNS-repoint / cert-rotation replay). `None`
+    /// in CA mode, where the TLS layer's chain validation covers it.
+    pub expected_cert_fingerprint: Option<[u8; 32]>,
 }
 
 impl EstablishOpts {
     /// Defaults for the non-interactive paths: TLS verification follows
     /// `spec.insecure`, 0-RTT on, and the default ticket directory.
+    /// These paths use CA-mode verification (no TOFU), so the ticket
+    /// fingerprint binding is left to the TLS layer.
     pub fn for_spec(spec: &ConnectionSpec) -> Self {
         Self {
             verify_peer: !spec.insecure,
             zero_rtt: true,
             ticket_dir: None,
+            expected_cert_fingerprint: None,
         }
     }
 }
@@ -120,7 +129,9 @@ pub fn establish(
     if opts.zero_rtt {
         let dir = opts.ticket_dir.clone().or_else(session_store::default_dir);
         if let Some(dir) = &dir {
-            if let Some(ticket) = session_store::load(dir, &spec.host, None) {
+            if let Some(ticket) =
+                session_store::load(dir, &spec.host, opts.expected_cert_fingerprint.as_ref())
+            {
                 match conn.set_session(&ticket) {
                     Ok(()) => {
                         resumed = true;

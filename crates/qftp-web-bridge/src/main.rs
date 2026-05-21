@@ -26,6 +26,15 @@ mod transfer;
 
 use auth::TokenDirectory;
 
+/// Upper bound on bidirectional streams handled concurrently within a
+/// single WebTransport session. Each accepted stream spawns a task that
+/// holds buffers and (for `Put`) an in-flight quota reservation, so an
+/// unbounded `accept_bi` loop lets one session exhaust bridge memory.
+/// Reaching the cap stops the session from accepting new streams until
+/// an in-flight one finishes, which the QUIC layer surfaces to the peer
+/// as ordinary stream-limit back-pressure.
+const MAX_CONCURRENT_STREAMS: usize = 64;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "qftp-web-bridge",
@@ -185,10 +194,23 @@ async fn handle_session(incoming: IncomingSession, shared: Arc<Shared>) -> Resul
     info!(user = %user.name, remote = %connection.remote_address(),
         "WebTransport session established");
 
+    // Bound concurrent per-session streams. Acquiring the permit
+    // *before* `accept_bi` means a session that has saturated the cap
+    // stops draining new streams off the connection until one
+    // completes, rather than spawning tasks without limit.
+    let stream_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
     loop {
+        let permit = Arc::clone(&stream_limit)
+            .acquire_owned()
+            .await
+            .expect("stream-limit semaphore is never closed");
         match connection.accept_bi().await {
             Ok((send, recv)) => {
-                tokio::spawn(transfer::handle_stream(send, recv, Arc::clone(&user)));
+                let user = Arc::clone(&user);
+                tokio::spawn(async move {
+                    transfer::handle_stream(send, recv, user).await;
+                    drop(permit);
+                });
             }
             Err(e) => {
                 info!(user = %user.name, reason = %e, "WebTransport session closed");

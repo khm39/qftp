@@ -91,8 +91,19 @@ impl TokenDirectory {
             None => Some(users.anonymous()),
             Some(map) => {
                 let token = extract_token(path)?;
-                let name = map.get(token)?;
-                users.lookup_strict(name)
+                // The token is an authentication secret, so it must not
+                // be looked up with `HashMap::get`: that comparison is
+                // not constant-time and leaks how many leading bytes a
+                // guess got right. Scan every entry instead, comparing
+                // each in constant time and never breaking early, so
+                // the lookup time is independent of the token's value.
+                let mut matched: Option<&String> = None;
+                for (known, name) in map {
+                    if constant_time_eq(token.as_bytes(), known.as_bytes()) {
+                        matched = Some(name);
+                    }
+                }
+                users.lookup_strict(matched?)
             }
         }
     }
@@ -104,6 +115,22 @@ fn extract_token(path: &str) -> Option<&str> {
     query
         .split('&')
         .find_map(|pair| pair.strip_prefix("token="))
+}
+
+/// Length-checked byte comparison that runs in time independent of the
+/// contents (the early `false` only reveals the length, which for a
+/// high-entropy token is not the secret-bearing part). Used for the
+/// bearer-token check so a timing side channel can't recover the token
+/// byte by byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -127,6 +154,17 @@ mod tests {
         assert!(!dir.auth_enabled());
         let u = dir.resolve("/no-token-here", &users).unwrap();
         assert_eq!(u.name, "anonymous");
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"s3cret-token", b"s3cret-token"));
+        assert!(constant_time_eq(b"", b""));
+        // Single-byte difference, equal length.
+        assert!(!constant_time_eq(b"s3cret-token", b"s3cret-tokeN"));
+        // Length mismatch.
+        assert!(!constant_time_eq(b"s3cret-token", b"s3cret-token-"));
+        assert!(!constant_time_eq(b"", b"x"));
     }
 
     #[test]
