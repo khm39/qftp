@@ -14,6 +14,8 @@ use tracing::{info, warn};
 
 mod connection;
 mod handler;
+#[cfg(unix)]
+mod isolation;
 mod limits;
 mod metrics;
 #[cfg(unix)]
@@ -80,6 +82,14 @@ struct Args {
     /// isolation equivalent of `sshd -t`. Requires `--users`.
     #[arg(long, default_value_t = false)]
     check_isolation: bool,
+    /// Run with OS user isolation (ADR 0002; Linux only). A privileged
+    /// dispatcher accepts connections and runs the mTLS handshake, then
+    /// forks a per-connection worker that `setuid`s to the
+    /// authenticated user before any file I/O. Requires `--users` and
+    /// either root or CAP_SETUID+CAP_SETGID. Validate the setup first
+    /// with `--check-isolation`.
+    #[arg(long, default_value_t = false)]
+    user_isolation: bool,
 
     // --- Caps & rate limiting ---
     #[arg(long, default_value_t = 64)]
@@ -138,6 +148,10 @@ fn main() -> Result<()> {
     let tls = load_or_make_tls(&args)?;
     let quiche_config = create_server_config(&tls)?;
 
+    if args.user_isolation {
+        return run_isolation_server(&args, &root, quiche_config);
+    }
+
     let users = match &args.users {
         Some(path) => {
             let text = fs::read_to_string(path)
@@ -191,10 +205,110 @@ fn main() -> Result<()> {
         users,
         metrics,
         shutdown,
+        server::RunRole::Standalone,
     )?;
 
     info!("QFTP server stopped");
     Ok(())
+}
+
+/// `--user-isolation`: run the OS-isolation dispatcher (ADR 0002).
+/// Resolves every configured user to an OS account up front, refuses
+/// to start on any miss or missing capability, then hands the loop to
+/// `server::run_dispatcher`.
+#[cfg(unix)]
+fn run_isolation_server(args: &Args, root: &Path, quiche_config: quiche::Config) -> Result<()> {
+    let users_path = args
+        .users
+        .as_ref()
+        .context("--user-isolation requires --users <FILE>")?;
+    let text = fs::read_to_string(users_path)
+        .with_context(|| format!("failed to read users file: {}", users_path.display()))?;
+    let cfg: user::UserConfig = toml::from_str(&text)
+        .with_context(|| format!("failed to parse users file: {}", users_path.display()))?;
+
+    if !privdrop::can_change_credentials() {
+        anyhow::bail!(
+            "--user-isolation needs root or CAP_SETUID+CAP_SETGID; \
+             run `qftp-server --check-isolation --users {}` to diagnose",
+            users_path.display()
+        );
+    }
+
+    // Resolve every configured user to OS ids up front and refuse to
+    // start on any miss -- a worker that cannot drop privileges must
+    // never be allowed to accept a connection.
+    let id_map = build_id_map(&cfg)?;
+
+    let users = std::sync::Arc::new(user::UserDirectory::from_config(root, cfg)?);
+
+    if args.metrics_bind.is_some() {
+        warn!(
+            "--metrics-bind is ignored under --user-isolation; per-worker \
+             metrics aggregation is not yet implemented"
+        );
+    }
+
+    let addr: std::net::SocketAddr = args.bind.parse().context("invalid bind address")?;
+    let std_socket = isolation::bind_reuseport(addr)
+        .with_context(|| format!("failed to bind dispatcher socket on {addr}"))?;
+    qftp_common::transport::tune_udp_buffers(&std_socket);
+    let socket = mio::net::UdpSocket::from_std(std_socket);
+
+    let shutdown = install_signal_handler()?;
+    let metrics = std::sync::Arc::new(metrics::Metrics::default());
+    let server_config = server::ServerConfig {
+        caps: limits::Caps {
+            max_total_connections: args.max_connections,
+            max_per_ip_connections: args.max_connections_per_ip,
+        },
+        require_retry: args.require_retry,
+        rate_limit_rps: args.rate_limit_rps,
+        rate_limit_burst: args.rate_limit_burst,
+    };
+
+    info!(
+        %addr,
+        root = %root.display(),
+        mtls = args.client_ca.is_some(),
+        users = id_map.len(),
+        "QFTP server starting (OS user isolation)"
+    );
+    server::run_dispatcher(
+        quiche_config,
+        socket,
+        server_config,
+        users,
+        id_map,
+        metrics,
+        shutdown,
+    )?;
+    info!("QFTP server stopped");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_isolation_server(_args: &Args, _root: &Path, _quiche_config: quiche::Config) -> Result<()> {
+    anyhow::bail!("--user-isolation is only supported on Linux (ADR 0002)")
+}
+
+/// Resolve every `users.toml` entry (anonymous + named users) to a
+/// concrete `(uid, gid)`; fail on the first user that cannot be mapped.
+#[cfg(unix)]
+fn build_id_map(
+    cfg: &user::UserConfig,
+) -> Result<std::collections::HashMap<String, privdrop::ResolvedIds>> {
+    let mut map = std::collections::HashMap::new();
+    for spec in cfg.anonymous.iter().chain(cfg.users.iter()) {
+        let ids = privdrop::resolve(&spec.name, spec.uid, spec.gid).with_context(|| {
+            format!(
+                "--user-isolation: cannot map user '{}' to an OS account",
+                spec.name
+            )
+        })?;
+        map.insert(spec.name.clone(), ids);
+    }
+    Ok(map)
 }
 
 fn init_tracing(format: &str) -> Result<()> {

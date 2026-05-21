@@ -103,6 +103,18 @@ pub struct ServerConfig {
     pub rate_limit_burst: f64,
 }
 
+/// Selects how [`run`] behaves.
+pub enum RunRole {
+    /// Classic multi-connection server: accept Initials, serve every
+    /// connection, and loop until shutdown.
+    Standalone,
+    /// OS-isolation worker (ADR 0002): serve exactly the one connection
+    /// the dispatcher handed over via `fork`, then exit. Never accepts
+    /// new connections. Boxed so the empty `Standalone` variant doesn't
+    /// pay for the (large) `ConnectionContext`.
+    Worker(Box<ConnectionContext>),
+}
+
 /// A generic request handed to a handler worker thread for off-loop
 /// execution (H-1).
 struct HandlerJob {
@@ -308,6 +320,7 @@ pub fn run(
     users: Arc<UserDirectory>,
     metrics: Arc<Metrics>,
     shutdown: Arc<AtomicBool>,
+    role: RunRole,
 ) -> Result<()> {
     let mut poll = Poll::new().context("failed to create mio Poll")?;
     let mut socket = socket;
@@ -337,6 +350,17 @@ pub fn run(
 
     // Connection table keyed by the SCID we issued (= derive_scid(seed, dcid)).
     let mut connections: HashMap<quiche::ConnectionId<'static>, ConnectionContext> = HashMap::new();
+
+    // Isolation worker (ADR 0002): the dispatcher handed us one
+    // already-established connection via fork. Seed the table with it
+    // and serve only that one -- never accept.
+    let worker_mode = match role {
+        RunRole::Standalone => false,
+        RunRole::Worker(ctx) => {
+            connections.insert(ctx.scid.clone(), *ctx);
+            true
+        }
+    };
 
     let mut buf = [0u8; 65536];
     let mut out_pkt = [0u8; 1350];
@@ -426,7 +450,10 @@ pub fn run(
                 continue;
             }
 
-            if closing {
+            // A worker serves a single fixed connection and never
+            // accepts; a stray Initial on its connected socket is
+            // dropped.
+            if closing || worker_mode {
                 continue;
             }
 
@@ -484,9 +511,14 @@ pub fn run(
         connections.retain(|_, ctx| {
             let alive = !ctx.conn.is_closed();
             if !alive {
-                let peer_ip = ctx.peer_addr.ip();
-                counter.release(peer_ip);
-                metrics.dec_connections_open();
+                // A worker never acquired a counter slot or bumped the
+                // open-connections gauge for its seeded connection
+                // (the dispatcher owns that accounting), so it must not
+                // release them here either.
+                if !worker_mode {
+                    counter.release(ctx.peer_addr.ip());
+                    metrics.dec_connections_open();
+                }
                 info!(peer = %ctx.peer_addr, user = %ctx.user.name, "connection closed");
             }
             alive
@@ -500,7 +532,9 @@ pub fn run(
             ctx.streams.retain(|_, s| !matches!(s, StreamState::Done));
         }
 
-        if closing && connections.is_empty() {
+        // A worker exits as soon as its single connection is gone; the
+        // standalone server only stops once draining is complete.
+        if (closing || worker_mode) && connections.is_empty() {
             break;
         }
     }
@@ -1764,6 +1798,212 @@ fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(name)
+}
+
+/// OS-isolation dispatcher (ADR 0002; Unix only).
+///
+/// Single-threaded by design: it owns the UDP socket, accepts
+/// connections, and runs the full QUIC + mTLS handshake, but never
+/// serves a request and never spawns a thread -- which is what keeps
+/// `fork` safe. At handshake completion it `fork`s a per-connection
+/// worker that inherits the established `quiche::Connection` via
+/// copy-on-write and `setuid`s to the authenticated user (see
+/// `isolation::become_worker`) before any file I/O happens.
+#[cfg(unix)]
+pub fn run_dispatcher(
+    mut quiche_config: quiche::Config,
+    socket: mio::net::UdpSocket,
+    server_config: ServerConfig,
+    users: Arc<UserDirectory>,
+    ids: HashMap<String, crate::privdrop::ResolvedIds>,
+    metrics: Arc<Metrics>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut poll = Poll::new().context("failed to create mio Poll")?;
+    let mut socket = socket;
+    poll.registry()
+        .register(&mut socket, SERVER_TOKEN, Interest::READABLE)
+        .context("failed to register socket")?;
+    let mut events = Events::with_capacity(1024);
+
+    let rng = ring::rand::SystemRandom::new();
+    let mut rate_limiter =
+        RateLimiter::new(server_config.rate_limit_rps, server_config.rate_limit_burst);
+    let mut counter = ConnectionCounter::default();
+    let retry_key = RetryKey::new();
+
+    let mut conn_id_seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&rng, &mut conn_id_seed).expect("system RNG failed");
+
+    let mut connections: HashMap<quiche::ConnectionId<'static>, ConnectionContext> = HashMap::new();
+    let mut buf = [0u8; 65536];
+    let mut out_pkt = [0u8; MAX_DATAGRAM_SIZE];
+    let local_addr = socket.local_addr().context("failed to get local addr")?;
+
+    info!(
+        max_total = server_config.caps.max_total_connections,
+        require_retry = server_config.require_retry,
+        users = ids.len(),
+        "isolation dispatcher started"
+    );
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutdown signal received; dispatcher stopping (workers run on)");
+            break;
+        }
+
+        let shortest_timeout = connections.values().filter_map(|c| c.conn.timeout()).min();
+        poll.poll(
+            &mut events,
+            shortest_timeout.or(Some(Duration::from_millis(250))),
+        )
+        .context("poll failed")?;
+
+        // 1. Drain incoming UDP: route to a handshaking connection, or
+        //    accept a new Initial.
+        loop {
+            let (len, from) = match socket.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e).context("UDP recv_from failed"),
+            };
+            let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(error = ?e, "failed to parse QUIC header");
+                    continue;
+                }
+            };
+            let recv_info = quiche::RecvInfo {
+                from,
+                to: local_addr,
+            };
+            if let Some(ctx) = connections.get_mut(&hdr.dcid) {
+                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                    warn!(peer = %from, error = ?e, "QUIC recv error");
+                }
+                continue;
+            }
+            let alias = derive_scid(&conn_id_seed, &hdr.dcid);
+            if let Some(ctx) = connections.get_mut(&alias) {
+                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                    warn!(peer = %from, error = ?e, "QUIC recv error");
+                }
+                continue;
+            }
+            if hdr.ty != quiche::Type::Initial {
+                // A 1-RTT packet for a connection already handed to a
+                // worker can land here in the brief window before the
+                // worker's connected socket is up. QUIC retransmits;
+                // dropping it is harmless.
+                debug!(peer = %from, ty = ?hdr.ty, "stray non-Initial packet, ignoring");
+                continue;
+            }
+            let mut ax = AcceptCtx {
+                connections: &mut connections,
+                counter: &mut counter,
+                rate_limiter: &mut rate_limiter,
+                quiche_config: &mut quiche_config,
+                retry_key: &retry_key,
+                conn_id_seed: &conn_id_seed,
+                cfg: &server_config,
+                users: &users,
+                metrics: &metrics,
+                rng: &rng,
+                socket: &socket,
+            };
+            try_accept(
+                &mut ax,
+                from,
+                local_addr,
+                &hdr,
+                &mut buf[..len],
+                &mut out_pkt,
+            )?;
+        }
+
+        // 2. Advance timers, resolve the authenticated user, flush
+        //    handshake packets.
+        for ctx in connections.values_mut() {
+            ctx.conn.on_timeout();
+        }
+        for ctx in connections.values_mut() {
+            upgrade_user_from_cert(ctx, &users);
+            flush_egress(&mut ctx.conn, &socket)?;
+        }
+
+        // 3. Hand every fully-established connection to a worker.
+        let ready: Vec<quiche::ConnectionId<'static>> = connections
+            .iter()
+            .filter(|(_, c)| {
+                c.conn.is_established() && !c.conn.is_closed() && !c.conn.is_draining()
+            })
+            .map(|(scid, _)| scid.clone())
+            .collect();
+        for scid in ready {
+            let (uname, peer_addr) = {
+                let ctx = connections.get(&scid).expect("ready conn present");
+                (ctx.user.name.clone(), ctx.peer_addr)
+            };
+            let resolved = match ids.get(&uname) {
+                Some(r) => r.clone(),
+                None => {
+                    warn!(user = %uname, peer = %peer_addr, "no OS uid mapping; closing");
+                    if let Some(ctx) = connections.get_mut(&scid) {
+                        let _ = ctx.conn.close(true, 0x101, b"no OS user mapping");
+                        flush_egress(&mut ctx.conn, &socket)?;
+                    }
+                    continue;
+                }
+            };
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                let e = std::io::Error::last_os_error();
+                warn!(error = %e, peer = %peer_addr, "fork failed; closing connection");
+                if let Some(ctx) = connections.get_mut(&scid) {
+                    let _ = ctx.conn.close(true, 0x101, b"server fork failed");
+                    flush_egress(&mut ctx.conn, &socket)?;
+                }
+                continue;
+            }
+            if pid == 0 {
+                // CHILD: shed every other connection (they belong to
+                // the dispatcher) and become this connection's worker.
+                // `become_worker` never returns.
+                let ctx = connections.remove(&scid).expect("ready conn present");
+                drop(connections);
+                crate::isolation::become_worker(
+                    ctx,
+                    local_addr,
+                    resolved,
+                    quiche_config,
+                    server_config,
+                    users,
+                    metrics,
+                    shutdown,
+                );
+            }
+            // PARENT: the connection now belongs to the worker process.
+            info!(worker_pid = pid, peer = %peer_addr, user = %uname, "handed connection to isolation worker");
+            connections.remove(&scid);
+            counter.release(peer_addr.ip());
+            metrics.dec_connections_open();
+        }
+
+        // 4. Reap connections closed above (no mapping / fork failure).
+        connections.retain(|_, ctx| {
+            let alive = !ctx.conn.is_closed();
+            if !alive {
+                counter.release(ctx.peer_addr.ip());
+                metrics.dec_connections_open();
+            }
+            alive
+        });
+    }
+
+    info!("isolation dispatcher stopped");
+    Ok(())
 }
 
 #[cfg(test)]
