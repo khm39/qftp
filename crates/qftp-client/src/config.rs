@@ -26,7 +26,7 @@ pub struct ConnectionSpec {
     /// SNI / certificate name expected on the server cert.
     pub server_name: String,
     /// Optional user component parsed from `qftp://user@host`.
-    /// Reserved for #77 (SSH-style password / pubkey auth); the
+    /// Reserved for future SSH-style password / pubkey auth; the
     /// current mTLS-only protocol ignores it.
     #[allow(dead_code)]
     pub user: Option<String>,
@@ -67,7 +67,7 @@ pub fn parse_url(input: &str) -> Result<UrlTarget> {
             "unsupported scheme: {scheme} (expected qftp or qftps)"
         ));
     }
-    // qftp authenticates with mTLS or (later) #77 pubkey/passphrase;
+    // qftp authenticates with mTLS or (later) pubkey/passphrase;
     // there is no protocol-level password. Silently ignoring a `:pw`
     // in the URL would let users believe they had auth set up. Reject
     // it explicitly so secrets cannot leak into shell history.
@@ -182,7 +182,7 @@ pub fn expand_tilde(p: &str) -> String {
 
 /// CLI-level overrides; `None` means "leave whatever was resolved
 /// from URL/config alone".
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Overrides {
     pub host: Option<String>,
     pub server_name: Option<String>,

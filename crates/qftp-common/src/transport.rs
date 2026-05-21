@@ -12,13 +12,13 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// ~100ms RTT (~12.5 MB), with headroom so `send_file_streaming`
 /// doesn't have to spin-wait on the peer's ACK. The actual user-space
 /// buffer is `FILE_CHUNK_SIZE` (64 KiB); this window only bounds
-/// quiche's internal bookkeeping and kernel UDP buffers (#139).
+/// quiche's internal bookkeeping and kernel UDP buffers.
 pub const INITIAL_MAX_STREAM_DATA: u64 = 16 * 1024 * 1024;
 
 /// Per-connection flow-control window. `initial_max_streams_bidi` is
 /// 4, so this is sized as `4 * INITIAL_MAX_STREAM_DATA` -- enough for
 /// every concurrent stream to be at its individual cap with no extra
-/// slack (#139). Previous value was 2 GiB which was vastly over-sized
+/// slack. Previous value was 2 GiB which was vastly over-sized
 /// for the BDP this protocol actually sees.
 pub const INITIAL_MAX_CONNECTION_DATA: u64 = 4 * INITIAL_MAX_STREAM_DATA;
 
@@ -67,7 +67,7 @@ pub fn tune_udp_buffers(socket: &std::net::UdpSocket) {
 pub fn tune_udp_buffers(_socket: &std::net::UdpSocket) {}
 
 /// Maximum number of QUIC datagrams to coalesce into a single
-/// `sendmsg(UDP_SEGMENT)` burst (#151). The underlying GSO skb must
+/// `sendmsg(UDP_SEGMENT)` burst. The underlying GSO skb must
 /// fit within Linux's per-device `gso_max_size`, which is 65 536
 /// bytes on every NIC we've seen (including loopback). At our
 /// `MAX_DATAGRAM_SIZE = 1350` that gives a hard ceiling of 48
@@ -84,9 +84,20 @@ const GSO_BURST_PACKETS: usize = 32;
 #[cfg(target_os = "linux")]
 static GSO_USABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+// Reusable per-thread scratch for the GSO coalescing path. `flush_egress`
+// runs once per connection per event-loop iteration, so allocating this
+// buffer per call shows up on the hot path; a thread-local keeps one
+// buffer alive for the lifetime of each thread that flushes (the server
+// loop, each client, each fanout worker).
+#[cfg(target_os = "linux")]
+thread_local! {
+    static GSO_BUF: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(vec![0u8; MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS]);
+}
+
 /// Flush pending outgoing packets from the QUIC connection to the UDP
 /// socket. On Linux this coalesces up to `GSO_BURST_PACKETS` datagrams
-/// into a single `sendmsg(UDP_SEGMENT)` (#151); on other platforms,
+/// into a single `sendmsg(UDP_SEGMENT)`; on other platforms,
 /// and after a runtime fallback, it falls back to one `send_to` per
 /// datagram. The latter is what quiche's own examples used originally
 /// and what every earlier version of `flush_egress` did, so the
@@ -134,8 +145,17 @@ fn flush_egress_linux(conn: &mut quiche::Connection, socket: &mio::net::UdpSocke
         return flush_egress_per_packet(conn, socket);
     }
 
-    let mut buf = vec![0u8; MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS];
+    GSO_BUF.with(|cell| flush_egress_gso(conn, socket, cell.borrow_mut().as_mut_slice()))
+}
 
+/// GSO-coalescing flush loop. `buf` is caller-provided reusable scratch
+/// (`GSO_BUF`), at least `MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS` bytes.
+#[cfg(target_os = "linux")]
+fn flush_egress_gso(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    buf: &mut [u8],
+) -> Result<()> {
     'outer: loop {
         let mut total = 0usize;
         let mut seg_size = 0usize;
@@ -448,7 +468,7 @@ pub fn recv_message<T: DeserializeOwned>(
 /// payload bytes are drained from `stream_buf`. Returns `Ok(None)`
 /// when the buffer doesn't yet contain a complete frame.
 ///
-/// This is split out from `recv_message` (#141) so the fuzz targets
+/// This is split out from `recv_message` so the fuzz targets
 /// in `fuzz/` can drive the same decode path that runs in production.
 /// Decoding bincode bytes directly (without the 4-byte prefix and
 /// `with_limit(MAX_MESSAGE_SIZE)`) leaves the actual code path
@@ -472,7 +492,7 @@ pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> R
         return Ok(None);
     }
 
-    // #117: bound per-field allocations during deserialization. The
+    // Bound per-field allocations during deserialization. The
     // 4-byte frame length is already bounded by MAX_MESSAGE_SIZE, but
     // bincode's defaults will happily allocate a 16 MiB `String` for
     // a single field within that frame. with_limit caps individual
@@ -507,7 +527,7 @@ fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> R
     // BufReader/BufWriter capacity (64 KiB) -- this window only bounds
     // quiche's internal bookkeeping and kernel UDP buffers. initial_max_streams_bidi
     // stays low because the current client only opens one bidi stream at
-    // a time. #139: previous values were 2 GiB total / 1 GiB per stream,
+    // a time. Previous values were 2 GiB total / 1 GiB per stream,
     // vastly over-sized for the gigabit BDP this protocol actually sees;
     // shrunk so quiche state + UDP buffers don't bloat per peer.
     config.set_initial_max_data(INITIAL_MAX_CONNECTION_DATA);
@@ -519,7 +539,7 @@ fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> R
     // Pacing is on by default in quiche, which makes `conn.send` return
     // `Done` after one BBR-calculated burst even when many packets are
     // queued. That defeats our `sendmsg(UDP_SEGMENT)` coalescing in
-    // `flush_egress` (#151) -- we'd land 1-3 packets per batch instead
+    // `flush_egress` -- we'd land 1-3 packets per batch instead
     // of the 64-packet GSO cap. The protocol does its own back-pressure
     // via QUIC's flow-control window, and the existing congestion
     // controller still gates total in-flight bytes, so disabling the
@@ -535,7 +555,7 @@ fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> R
     //     bytes stay confidential.
     //   * verify_peer = false (--insecure or TOFU before pin-binding
     //     lands): an attacker who terminates the connection could
-    //     receive the first Request bytes (#110). Skip enable_early_data
+    //     receive the first Request bytes. Skip enable_early_data
     //     to force a 1-RTT handshake; the application-layer TOFU
     //     check then runs before any request bytes leave the host.
     if allow_early_data {
@@ -611,7 +631,7 @@ pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
     } else if tls.verify_peer {
         // Fall back to the platform trust store. quiche delegates to
         // BoringSSL; without an explicit bundle the OS roots are used.
-        // #124: log on failure so an operator on a minimal image
+        // Log on failure so an operator on a minimal image
         // (Alpine without ca-certificates, scratch container) gets a
         // concrete diagnostic instead of "TLS broken with no
         // explanation" later in the handshake.
@@ -633,7 +653,7 @@ pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
             .context("failed to load client key")?;
     }
 
-    // #110: gate 0-RTT on whether the TLS stack will actually
+    // Gate 0-RTT on whether the TLS stack will actually
     // authenticate the peer.
     apply_common_config(&mut config, tls.verify_peer)?;
 

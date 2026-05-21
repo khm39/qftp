@@ -1,12 +1,10 @@
 use std::io::{BufRead, IsTerminal};
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
@@ -16,6 +14,7 @@ mod connect;
 mod fanout;
 mod known_hosts;
 mod oneshot;
+mod proto;
 mod repl;
 mod session_store;
 mod stats;
@@ -23,7 +22,7 @@ mod sync;
 mod transfer;
 mod watch;
 
-const CLIENT: Token = Token(0);
+use proto::{request_response, take_stream};
 
 /// Long-form `--version` body. Built from the package version plus
 /// the build-time facts injected by `build.rs`.
@@ -315,8 +314,6 @@ fn main() -> Result<()> {
 
     let spec = config::resolve(args.target.as_deref(), &cfg_file, &overrides)?;
 
-    let client_cert = connect::client_cert_from_spec(&spec);
-
     // TOFU is only meaningful when the user has *not* supplied a CA
     // bundle. A `--ca` overrides it (we trust the PKI chain). When
     // TOFU is active we ask quiche to skip its own peer verification
@@ -324,7 +321,7 @@ fn main() -> Result<()> {
     let tofu_active = args.trust_on_first_use && spec.ca.is_none() && !spec.insecure;
     let effective_verify_peer = !spec.insecure && !tofu_active;
 
-    // #128: --insecure drops the only authentication we have over the
+    // --insecure drops the only authentication we have over the
     // wire. Surface that explicitly so it never lands in a script
     // unnoticed.
     if spec.insecure {
@@ -335,86 +332,28 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut config = create_client_config(qftp_common::transport::ClientTlsConfig {
-        verify_peer: effective_verify_peer,
-        ca_path: spec.ca.clone(),
-        client_cert,
-    })?;
-
-    let peer_addr = spec
-        .host
-        .parse()
-        .with_context(|| format!("failed to parse host address: {}", spec.host))?;
-    let std_socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
-    std_socket.set_nonblocking(true)?;
-    std_socket.connect(peer_addr)?;
-    qftp_common::transport::tune_udp_buffers(&std_socket);
-    let local_addr = std_socket.local_addr()?;
-    let mut socket = mio::net::UdpSocket::from_std(std_socket);
-
-    let rng = ring::rand::SystemRandom::new();
-    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-    use ring::rand::SecureRandom;
-    rng.fill(&mut scid_bytes).unwrap();
-    let scid = quiche::ConnectionId::from_vec(scid_bytes.to_vec());
-
-    let mut conn = quiche::connect(
-        Some(&spec.server_name),
-        &scid,
-        local_addr,
-        peer_addr,
-        &mut config,
-    )?;
-
-    // 0-RTT session resumption. If a fresh ticket exists for this
-    // host:port, hand it to quiche before any I/O so the first
-    // outgoing Initial carries 0-RTT data. A rejected ticket is a
-    // silent fallback to 1-RTT; we delete it so we don't keep
-    // replaying a bad blob.
+    // Needed both to drive 0-RTT resumption inside `establish` and to
+    // persist the freshest ticket on a clean exit.
     let ticket_dir = args
         .session_ticket_dir
         .clone()
         .or_else(session_store::default_dir);
-    let mut resumed = false;
-    if !args.no_zero_rtt {
-        if let Some(dir) = &ticket_dir {
-            if let Some(ticket) = session_store::load(dir, &spec.host, None) {
-                match conn.set_session(&ticket) {
-                    Ok(()) => {
-                        resumed = true;
-                        tracing::info!(host = %spec.host, "0-RTT: resuming session");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "stale session ticket; falling back to 1-RTT");
-                        let _ = session_store::forget(dir, &spec.host);
-                    }
-                }
-            }
-        }
-    }
 
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(1024);
-    poll.registry()
-        .register(&mut socket, CLIENT, Interest::READABLE)?;
-
-    flush_egress(&mut conn, &socket)?;
-    loop {
-        poll.poll(
-            &mut events,
-            conn.timeout().or(Some(Duration::from_millis(100))),
-        )?;
-        conn.on_timeout();
-        handle_ingress(&mut conn, &socket, &mut [0u8; 65535])?;
-        flush_egress(&mut conn, &socket)?;
-
-        if conn.is_established() {
-            break;
-        }
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed during handshake");
-        }
-    }
+    let connect::Established {
+        mut conn,
+        socket,
+        mut poll,
+        mut events,
+        resumed,
+    } = connect::establish(
+        &spec,
+        "connect",
+        connect::EstablishOpts {
+            verify_peer: effective_verify_peer,
+            zero_rtt: !args.no_zero_rtt,
+            ticket_dir: ticket_dir.clone(),
+        },
+    )?;
 
     if tofu_active {
         let kh_path = args
@@ -465,11 +404,15 @@ fn main() -> Result<()> {
     let mut local_cwd: PathBuf = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if let Some(path) = &spec.initial_path {
-        let stream_id = take_stream(&mut next_stream_id);
-        send_message(&mut conn, stream_id, &Request::Cd { path: path.clone() })?;
-        stream_send_all(&mut conn, stream_id, &[], true)?;
-        flush_egress(&mut conn, &socket)?;
-        match poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id)? {
+        let req = Request::Cd { path: path.clone() };
+        match request_response(
+            &mut conn,
+            &socket,
+            &mut poll,
+            &mut events,
+            &mut next_stream_id,
+            &req,
+        )? {
             Response::Ok => {}
             Response::Err(e) => {
                 eprintln!("initial cd {} failed: [{:?}] {}", path, e.code, e.message);
@@ -560,7 +503,7 @@ fn run_interactive(
     next_stream_id: &mut u64,
     local_cwd: &mut PathBuf,
 ) -> Result<()> {
-    // Tab completion wired through `ReplHelper` (#64). Without an
+    // Tab completion wired through `ReplHelper`. Without an
     // explicit helper rustyline emits a beep on TAB; with it we get
     // first-word command completion + local-path completion for the
     // `put`/`lcd`/`lls`/`lmkdir`/`!` family.
@@ -707,11 +650,7 @@ fn run_one_line(
         }
         repl::Command::Remote(req) => {
             let is_quit = matches!(req, Request::Quit);
-            let stream_id = take_stream(next_stream_id);
-            send_message(conn, stream_id, &req)?;
-            stream_send_all(conn, stream_id, &[], true)?;
-            flush_egress(conn, socket)?;
-            let resp = poll_response(conn, socket, poll, events, stream_id)?;
+            let resp = request_response(conn, socket, poll, events, next_stream_id, &req)?;
             repl::display_response(&resp);
             if is_quit {
                 *quit_out = true;
@@ -806,12 +745,6 @@ fn run_one_line(
     Ok(())
 }
 
-fn take_stream(next: &mut u64) -> u64 {
-    let cur = *next;
-    *next += 4;
-    cur
-}
-
 /// Resolve a user-supplied local path against the REPL's local cwd.
 /// Absolute paths and paths starting with `~/` pass through; relative
 /// paths are joined onto `local_cwd`.
@@ -829,37 +762,6 @@ fn expand_glob(pattern: &str) -> Vec<PathBuf> {
     match glob::glob(pattern) {
         Ok(paths) => paths.filter_map(|p| p.ok()).collect(),
         Err(_) => vec![PathBuf::from(pattern)],
-    }
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    loop {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
-
-        match recv_message::<Response>(conn, stream_id, &mut buf)? {
-            Some(resp) => {
-                // #140: per-field cap defense in depth.
-                qftp_common::protocol::validate_response(&resp)
-                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
-                flush_egress(conn, socket)?;
-                return Ok(resp);
-            }
-            None => {
-                flush_egress(conn, socket)?;
-            }
-        }
-        if conn.is_closed() {
-            anyhow::bail!("Connection closed");
-        }
     }
 }
 
@@ -886,12 +788,8 @@ fn do_recursive_get(
     // BFS via Ls.
     let mut queue: Vec<(String, PathBuf)> = vec![(remote.to_string(), local_root.clone())];
     while let Some((rdir, ldir)) = queue.pop() {
-        let stream_id = take_stream(next_stream_id);
         let req = Request::Ls { path: rdir.clone() };
-        send_message(conn, stream_id, &req)?;
-        stream_send_all(conn, stream_id, &[], true)?;
-        flush_egress(conn, socket)?;
-        let resp = poll_response(conn, socket, poll, events, stream_id)?;
+        let resp = request_response(conn, socket, poll, events, next_stream_id, &req)?;
         let entries = match resp {
             Response::DirListing(e) => e,
             Response::Err(e) => {
@@ -905,7 +803,7 @@ fn do_recursive_get(
         };
         std::fs::create_dir_all(&ldir).ok();
         for entry in entries {
-            // #108: a malicious server can return entry names containing
+            // A malicious server can return entry names containing
             // `..` or absolute paths; `PathBuf::join` would silently
             // escape `ldir`. Reject lexically before we touch the
             // filesystem.
@@ -970,17 +868,16 @@ fn do_recursive_put(
         );
     }
     // Ensure top-level mkdir.
-    let stream_id = take_stream(next_stream_id);
-    send_message(
+    let _ = request_response(
         conn,
-        stream_id,
+        socket,
+        poll,
+        events,
+        next_stream_id,
         &Request::Mkdir {
             path: remote_root.to_string(),
         },
     )?;
-    stream_send_all(conn, stream_id, &[], true)?;
-    flush_egress(conn, socket)?;
-    let _ = poll_response(conn, socket, poll, events, stream_id)?;
 
     // BFS local.
     let mut queue: Vec<(PathBuf, String)> = vec![(local.to_path_buf(), remote_root.to_string())];
@@ -1002,17 +899,16 @@ fn do_recursive_put(
                 format!("{rremote}/{name_str}")
             };
             if path.is_dir() {
-                let stream_id = take_stream(next_stream_id);
-                send_message(
+                let _ = request_response(
                     conn,
-                    stream_id,
+                    socket,
+                    poll,
+                    events,
+                    next_stream_id,
                     &Request::Mkdir {
                         path: remote_child.clone(),
                     },
                 )?;
-                stream_send_all(conn, stream_id, &[], true)?;
-                flush_egress(conn, socket)?;
-                let _ = poll_response(conn, socket, poll, events, stream_id)?;
                 queue.push((path, remote_child));
             } else {
                 let stream_id = take_stream(next_stream_id);

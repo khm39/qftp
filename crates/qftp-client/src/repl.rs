@@ -1,5 +1,7 @@
 use qftp_common::protocol::{ErrorResponse, Request, Response};
 
+use crate::stats::format_size;
+
 #[derive(Debug)]
 pub enum Command {
     Remote(Request),
@@ -27,7 +29,7 @@ pub enum Command {
     /// `!cmd …` — pass the rest of the line to `$SHELL -c`. The
     /// empty `!` form spawns an interactive `$SHELL`.
     Shell(String),
-    /// `stats` (#80) — print process-wide transfer counters
+    /// `stats` — print process-wide transfer counters
     /// (uptime, bytes up/down, success rate). Local; no protocol
     /// round-trip.
     Stats,
@@ -300,18 +302,6 @@ pub fn error_hint(code: &qftp_common::protocol::ErrorCode) -> Option<&'static st
         }
         _ => return None,
     })
-}
-
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
 }
 
 fn format_mode(mode: u32) -> String {

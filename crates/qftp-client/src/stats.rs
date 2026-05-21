@@ -1,5 +1,5 @@
 //! Process-global transfer counters surfaced via the REPL `stats`
-//! command (#80). Cheap AtomicU64s incremented from
+//! command. Cheap AtomicU64s incremented from
 //! `transfer::do_put` / `transfer::do_get`; printed on demand.
 //!
 //! Counters live for the lifetime of the client process, so a long
@@ -94,22 +94,16 @@ fn format_duration(d: std::time::Duration) -> String {
 /// Print a human-readable summary of the snapshot to stdout. Output
 /// format is stable enough to grep in tests but not a structured API.
 pub fn print(s: &Snapshot) {
-    let total = s.files_uploaded + s.files_downloaded;
-    let success = total;
+    let succeeded = s.files_uploaded + s.files_downloaded;
     let failed = s.transfers_failed;
-    let attempted = success + failed;
+    let attempted = succeeded + failed;
     let pct = if attempted == 0 {
         100.0
     } else {
-        (success as f64 / attempted as f64) * 100.0
+        (succeeded as f64 / attempted as f64) * 100.0
     };
     println!("uptime:    {}", format_duration(s.uptime));
-    println!(
-        "transfers: {success} succeeded, {failed} failed ({pct:.0}%)",
-        success = success,
-        failed = failed,
-        pct = pct
-    );
+    println!("transfers: {succeeded} succeeded, {failed} failed ({pct:.0}%)");
     println!(
         "bytes:     up={}  down={}",
         format_size(s.bytes_uploaded),

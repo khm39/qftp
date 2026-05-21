@@ -95,7 +95,7 @@ impl ServerFixture {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let root = tempfile::tempdir().context("server tempdir")?;
 
-            // The default anonymous user is read-only since #104. The
+            // The default anonymous user is read-only. The
             // bench needs to upload, so write a users.toml that grants
             // the anonymous user full permissions on this throwaway
             // root.

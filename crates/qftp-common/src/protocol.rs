@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 ///   - any NUL byte
 ///   - leading whitespace or control characters are not blocked here;
 ///     `Path::join` handles those harmlessly. Path-traversal is the
-///     concern (#108 / SECURITY.md).
+///     concern (SECURITY.md).
 pub fn safe_entry_name(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return false;
@@ -44,7 +44,7 @@ pub fn safe_entry_name(name: &str) -> bool {
     !name.contains(['/', '\\', '\0'])
 }
 
-/// #140: per-field upper bounds enforced after `recv_message` returns
+/// Per-field upper bounds enforced after `recv_message` returns
 /// a decoded message but before any further processing. The frame as
 /// a whole is already capped at `MAX_MESSAGE_SIZE` (16 MiB) by
 /// `decode_framed_message`, but bincode's `with_limit` does not cap
@@ -233,7 +233,7 @@ pub enum Request {
     /// from where they left off; the server validates that the existing
     /// temp matches that offset before accepting more bytes. `checksum`
     /// (BLAKE3) is verified after the last byte is written.
-    /// `no_clobber` (#70): when true, the server refuses the upload
+    /// `no_clobber`: when true, the server refuses the upload
     /// with `AlreadyExists` if `path` already exists. Pre-existing
     /// behavior (silent overwrite) is preserved by the `#[serde(default)]`
     /// `false`.
@@ -248,7 +248,7 @@ pub enum Request {
         #[serde(default)]
         no_clobber: bool,
         /// When true, the client appends a 32-byte BLAKE3 trailer on
-        /// the same stream after the `size` body bytes (#152). This
+        /// the same stream after the `size` body bytes. This
         /// lets the client hash as it sends instead of doing a full
         /// pre-send pass to populate the header `checksum` field.
         /// When false, `checksum` is authoritative (legacy path);
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(PROTOCOL_MAJOR, 1);
     }
 
-    // #140 ------------------------------------------------------------
+    // ------------------------------------------------------------
 
     #[test]
     fn validate_request_rejects_oversized_path() {
@@ -526,11 +526,8 @@ mod tests {
             modified: 0,
             mode: 0o644,
         };
-        // Build a listing one entry over the cap. Using zero-cost
-        // clones because DirEntry's String is tiny.
-        let entries = (0..MAX_DIR_ENTRIES + 1)
-            .map(|_| DirEntry { ..entry.clone() })
-            .collect();
+        // Build a listing one entry over the cap.
+        let entries = (0..MAX_DIR_ENTRIES + 1).map(|_| entry.clone()).collect();
         let resp = Response::DirListing(entries);
         let e = validate_response(&resp).unwrap_err();
         assert!(e.0.contains("MAX_DIR_ENTRIES"), "unexpected error: {e}");

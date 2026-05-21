@@ -20,7 +20,7 @@
 //! file (default `/etc/qftp/users.toml`).
 //!
 //! Runtime ops (kick / show-connections / reload) require a server
-//! admin socket and are deferred to a follow-up of #79.
+//! admin socket and are deferred to a follow-up.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -366,7 +366,7 @@ fn find_user_index(users: &toml_edit::ArrayOfTables, name: &str) -> Option<usize
 }
 
 fn write_atomic(path: &Path, body: &str) -> Result<()> {
-    // #125: previously this used a deterministic `users.toml.tmp`
+    // Previously this used a deterministic `users.toml.tmp`
     // name, which raced under concurrent admin invocations and
     // could leave the temp at relaxed permissions if it already
     // existed (`OpenOptionsExt::mode` is only honored at create).

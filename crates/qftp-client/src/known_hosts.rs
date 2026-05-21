@@ -142,7 +142,7 @@ impl KnownHosts {
     /// directory) if needed. Mode is set to 0600 on Unix so a
     /// fingerprint database isn't world-readable.
     pub fn append_to_file(path: &Path, host_port: &str, fingerprint_hex: &str) -> Result<()> {
-        // #114: refuse to write host strings that could inject extra
+        // Refuse to write host strings that could inject extra
         // (attacker-pinned) entries on adjacent lines. The host_port
         // value originates from a CLI argument / config / URL and
         // could carry embedded newlines or framing-sensitive
@@ -167,7 +167,7 @@ impl KnownHosts {
         let mut f = opts
             .open(path)
             .with_context(|| format!("failed to open {} for append", path.display()))?;
-        // #123: serialize concurrent `qftp-client -T` invocations so
+        // Serialize concurrent `qftp-client -T` invocations so
         // we don't get duplicate or interleaved entries. flock is
         // released automatically when the File drops.
         let _guard = ExclusiveLock::acquire(&f)
@@ -240,7 +240,7 @@ pub fn fingerprint_hex(der: &[u8]) -> String {
 }
 
 /// Raw 32-byte SHA-256 of a DER-encoded leaf cert. Used for binary
-/// binding fields like the session-ticket file header (#122).
+/// binding fields like the session-ticket file header.
 pub fn fingerprint_sha256(der: &[u8]) -> [u8; 32] {
     let digest = ring::digest::digest(&ring::digest::SHA256, der);
     let mut out = [0u8; 32];
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn append_rejects_host_string_with_newline() {
-        // #114: a newline in host_port would inject an attacker-pinned
+        // A newline in host_port would inject an attacker-pinned
         // entry on the next line. Refuse to write.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("known_hosts");

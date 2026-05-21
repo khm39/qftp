@@ -94,7 +94,7 @@ struct Args {
     // --- Observability ---
     /// Bind address for the Prometheus /metrics and /healthz HTTP
     /// endpoint. Disabled when omitted. The endpoint is *unauthenticated*
-    /// (#143): bind to 127.0.0.1 or a management VLAN and scrape via
+    ///: bind to 127.0.0.1 or a management VLAN and scrape via
     /// a reverse proxy or SSH tunnel. The server logs a warning if it
     /// detects a non-loopback bind so this isn't silently exposed.
     #[arg(long)]
@@ -201,7 +201,7 @@ fn init_tracing(format: &str) -> Result<()> {
 
 /// Write a private-key PEM atomically with restrictive permissions.
 ///
-/// #107: the previous code used `fs::write` (default mode, follows
+/// The previous code used `fs::write` (default mode, follows
 /// symlinks) and then `fs::set_permissions(0o600)`. The window between
 /// those two calls was an exploitable TOCTOU and the predictable
 /// per-PID temp filename also enabled symlink-prefill attacks on
@@ -252,7 +252,7 @@ fn load_or_make_tls(args: &Args) -> Result<ServerTlsConfig> {
             std::env::temp_dir().join(format!("qftp-server-key-{}.pem", std::process::id()));
         // Cert is public material; a normal write is fine.
         fs::write(&cert_path, &cert_pem).context("failed to write cert PEM")?;
-        // #107: the private key must never appear with default
+        // The private key must never appear with default
         // permissions in /tmp. Create with mode 0o600 atomically, and
         // refuse to clobber a pre-existing path (defeats symlink
         // prefill of the predictable per-PID name).
@@ -335,7 +335,7 @@ fn load_or_make_persistent_self_signed(args: &Args) -> Result<ServerTlsConfig> {
         #[cfg(unix)]
         fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o644))
             .with_context(|| format!("failed to chmod {}", cert_path.display()))?;
-        // #107: write the key atomically with 0o600 + O_NOFOLLOW
+        // Write the key atomically with 0o600 + O_NOFOLLOW
         // rather than write+chmod (TOCTOU + symlink prefill).
         write_private_key(&key_path, &key_pem)?;
         info!(dir = %dir.display(), "wrote new persistent self-signed cert");
@@ -420,7 +420,7 @@ fn check_key_permissions(path: &str) -> Result<()> {
             mode & 0o777
         );
     }
-    // #144: also require the file to be owned by the current
+    // Also require the file to be owned by the current
     // effective uid. mode 0o600 on a file owned by another uid means
     // "the other uid can read this and we just happen to also be
     // able to", which is a config-error / privilege-mismatch we
@@ -488,7 +488,7 @@ mod check_key_permissions_tests {
         );
     }
 
-    // The cross-uid case (#144) requires root to reproduce in a test,
+    // The cross-uid case requires root to reproduce in a test,
     // so we don't exercise that path here. The owner-equality check
     // is guarded by `euid != 0 && meta.uid() != euid`; the happy
     // paths above prove the branch is taken under the normal

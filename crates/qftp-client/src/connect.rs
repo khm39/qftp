@@ -1,17 +1,20 @@
 //! Shared client-side QUIC connection setup.
 //!
-//! The one-shot path, the sync uploader, the watch uploader, and the
-//! fanout helper all need the same sequence: build a `quiche::Config`
-//! from a `ConnectionSpec`, bind a UDP socket, mint a SCID, call
-//! `quiche::connect`, optionally hand it a 0-RTT session ticket, then
-//! pump the handshake until established or closed. This module
-//! collapses those five copies into one helper.
+//! Every client path — the REPL, the one-shot subcommands, the sync
+//! and watch uploaders, and the fanout helper — needs the same
+//! sequence: build a `quiche::Config` from a `ConnectionSpec`, bind a
+//! UDP socket, mint a SCID, call `quiche::connect`, optionally hand it
+//! a 0-RTT session ticket, then pump the handshake until established
+//! or closed. This module is the single implementation.
 //!
-//! The REPL path in `main.rs` does extra work (TOFU pinning, explicit
-//! `--no-zero-rtt`, custom ticket directory, banner) so it doesn't go
-//! through here; it uses `client_cert_from_spec` for the one piece
-//! it does share.
+//! [`EstablishOpts`] carries the few knobs that differ between paths:
+//! the non-interactive callers use [`EstablishOpts::for_spec`], while
+//! the REPL builds it explicitly so it can route `--no-zero-rtt`, a
+//! custom ticket directory, and TOFU's verify-peer override through.
+//! TOFU pinning itself runs in `main.rs` on the returned connection.
+
 use std::net::UdpSocket;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -38,16 +41,49 @@ pub fn client_cert_from_spec(spec: &ConnectionSpec) -> Option<ClientCert> {
     }
 }
 
+/// Knobs for [`establish`] that vary between client paths.
+pub struct EstablishOpts {
+    /// Verify the server cert in the TLS stack. False for `--insecure`
+    /// or while TOFU runs its own pin check after the handshake.
+    pub verify_peer: bool,
+    /// Attempt 0-RTT resumption from a stored session ticket.
+    pub zero_rtt: bool,
+    /// Session-ticket directory override. `None` uses the default.
+    pub ticket_dir: Option<PathBuf>,
+}
+
+impl EstablishOpts {
+    /// Defaults for the non-interactive paths: TLS verification follows
+    /// `spec.insecure`, 0-RTT on, and the default ticket directory.
+    pub fn for_spec(spec: &ConnectionSpec) -> Self {
+        Self {
+            verify_peer: !spec.insecure,
+            zero_rtt: true,
+            ticket_dir: None,
+        }
+    }
+}
+
+/// A connection driven through its handshake, ready for requests.
+pub struct Established {
+    pub conn: quiche::Connection,
+    pub socket: mio::net::UdpSocket,
+    pub poll: Poll,
+    pub events: Events,
+    /// True when quiche accepted a 0-RTT session ticket.
+    pub resumed: bool,
+}
+
 /// Open a connection to `spec.host` and drive the handshake to
-/// completion. The optional `context_label` is woven into error
-/// messages so a failure from sync / watch / fanout still points at
-/// the right caller.
+/// completion. `context_label` is woven into error messages so a
+/// failure still points at the calling path.
 pub fn establish(
     spec: &ConnectionSpec,
     context_label: &str,
-) -> Result<(quiche::Connection, mio::net::UdpSocket, Poll, Events)> {
+    opts: EstablishOpts,
+) -> Result<Established> {
     let mut config = create_client_config(ClientTlsConfig {
-        verify_peer: !spec.insecure,
+        verify_peer: opts.verify_peer,
         ca_path: spec.ca.clone(),
         client_cert: client_cert_from_spec(spec),
     })?;
@@ -77,13 +113,28 @@ pub fn establish(
         &mut config,
     )?;
 
-    // 0-RTT resume if we have a ticket. A rejected ticket is a silent
-    // fallback to 1-RTT; the caller path-specific REPL flow has a
-    // richer policy (forget the ticket, emit a tracing line) but the
-    // automated paths just want the speedup when it works.
-    if let Some(dir) = session_store::default_dir() {
-        if let Some(ticket) = session_store::load(&dir, &spec.host, None) {
-            let _ = conn.set_session(&ticket);
+    // 0-RTT resume: hand quiche a stored ticket before any I/O so the
+    // first Initial can carry early data. A rejected ticket falls back
+    // to 1-RTT; the stale blob is forgotten so it isn't replayed.
+    let mut resumed = false;
+    if opts.zero_rtt {
+        let dir = opts.ticket_dir.clone().or_else(session_store::default_dir);
+        if let Some(dir) = &dir {
+            if let Some(ticket) = session_store::load(dir, &spec.host, None) {
+                match conn.set_session(&ticket) {
+                    Ok(()) => {
+                        resumed = true;
+                        tracing::info!(host = %spec.host, "0-RTT: resuming session");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "stale session ticket; falling back to 1-RTT"
+                        );
+                        let _ = session_store::forget(dir, &spec.host);
+                    }
+                }
+            }
         }
     }
 
@@ -112,5 +163,11 @@ pub fn establish(
         }
     }
 
-    Ok((conn, socket, poll, events))
+    Ok(Established {
+        conn,
+        socket,
+        poll,
+        events,
+        resumed,
+    })
 }

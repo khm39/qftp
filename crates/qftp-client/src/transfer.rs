@@ -18,6 +18,8 @@ use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
+use crate::proto::{poll_response, poll_response_with_buf};
+
 const CHUNK: usize = 64 * 1024;
 
 /// Outer-loop buffer for the upload body. Sized much larger than the
@@ -25,7 +27,7 @@ const CHUNK: usize = 64 * 1024;
 /// times instead of ~1024: each extra trip costs a `read_exact`,
 /// stream_send call, ingress drain, and flush_egress, and at small
 /// chunk sizes the fixed overhead — not flow-control — was capping
-/// loopback put at ~65 MiB/s (#150). quiche handles partial accepts
+/// loopback put at ~65 MiB/s. quiche handles partial accepts
 /// via the inner stream_send loop, so a larger buffer is purely a
 /// win when cwnd is open and degrades gracefully when it isn't.
 const UPLOAD_CHUNK: usize = 1024 * 1024;
@@ -110,7 +112,8 @@ pub fn parse_bw_limit(input: &str) -> anyhow::Result<u64> {
         anyhow::bail!("bwlimit is empty");
     }
     let bytes = s.as_bytes();
-    let (num_end, mult) = parse_suffix(bytes);
+    let (num_end, mult) = parse_suffix(bytes)
+        .ok_or_else(|| anyhow::anyhow!("bwlimit: unrecognized suffix in '{input}'"))?;
     let num: f64 = std::str::from_utf8(&bytes[..num_end])
         .map_err(|_| anyhow::anyhow!("bwlimit: non-utf8 number"))?
         .parse()
@@ -121,7 +124,7 @@ pub fn parse_bw_limit(input: &str) -> anyhow::Result<u64> {
     Ok((num * mult as f64) as u64)
 }
 
-fn parse_suffix(bytes: &[u8]) -> (usize, u64) {
+fn parse_suffix(bytes: &[u8]) -> Option<(usize, u64)> {
     // Walk back from the end to find the digit/suffix boundary.
     let mut end = bytes.len();
     while end > 0 && !bytes[end - 1].is_ascii_digit() && bytes[end - 1] != b'.' {
@@ -136,9 +139,10 @@ fn parse_suffix(bytes: &[u8]) -> (usize, u64) {
         "Ki" | "ki" => 1024,
         "Mi" | "mi" => 1024 * 1024,
         "Gi" | "gi" => 1024 * 1024 * 1024,
-        _ => 1,
+        // An unrecognized suffix is a user typo, not a 1-byte unit.
+        _ => return None,
     };
-    (end, mult)
+    Some((end, mult))
 }
 
 fn make_bar(total: u64, label: &str) -> ProgressBar {
@@ -170,7 +174,7 @@ pub fn do_get(
     remote: &str,
     local: &Path,
 ) -> Result<()> {
-    // #80: parent span for the whole download so structured logs
+    // Parent span for the whole download so structured logs
     // group the FileReady / chunk / verify events under a single
     // (op=get, stream_id=N, path=...) header.
     let _span = tracing::info_span!("transfer", op = "get", stream_id, path = %remote).entered();
@@ -223,8 +227,8 @@ fn do_get_inner(
         other => bail!("unexpected response to Get: {other:?}"),
     };
 
-    // #109: refuse to open through a pre-existing symlink. Combined
-    // with #108's name filter this stops a malicious server from
+    // Refuse to open through a pre-existing symlink. Combined
+    // with the name filter this stops a malicious server from
     // pointing a recursive download at, say, ~/.ssh/authorized_keys
     // via a planted symlink in the destination directory.
     let mut opts = OpenOptions::new();
@@ -234,7 +238,7 @@ fn do_get_inner(
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;
 
-    // #116: when resuming, the server's BLAKE3 trailer is computed
+    // When resuming, the server's BLAKE3 trailer is computed
     // over the whole file (server side has no resume concept on its
     // hashing path). Feed the existing on-disk prefix into the hasher
     // before we start consuming network bytes so the trailer check
@@ -271,6 +275,7 @@ fn do_get_inner(
     let mut received: u64 = 0;
     let mut trailer = Vec::<u8>::new();
     let mut tmp = [0u8; CHUNK];
+    let mut recv_buf = [0u8; 65535];
 
     let want_trailer = if checksum_follows { 32 } else { 0 };
     let mut stream_finished = false;
@@ -303,7 +308,6 @@ fn do_get_inner(
         // one in `poll_response_with_buf`); the response was sitting
         // on the stream and the kernel UDP buffer was empty, so
         // epoll had no edge event to fire.
-        let mut recv_buf = [0u8; 65535];
         handle_ingress(conn, socket, &mut recv_buf)?;
 
         let mut drained_any = false;
@@ -406,7 +410,7 @@ fn do_get_inner(
 /// Upload `local` to `remote`. Sends a BLAKE3 checksum the server can
 /// verify against the received bytes. Resume from an existing
 /// server-side temp at `offset` is supported by passing it through.
-/// `no_clobber` (#70) asks the server to refuse the Put with
+/// `no_clobber` asks the server to refuse the Put with
 /// `AlreadyExists` rather than overwrite a pre-existing destination.
 #[allow(clippy::too_many_arguments)]
 pub fn do_put(
@@ -420,7 +424,7 @@ pub fn do_put(
     offset: u64,
     no_clobber: bool,
 ) -> Result<()> {
-    // #80: parent span for the whole upload.
+    // Parent span for the whole upload.
     let _span = tracing::info_span!("transfer", op = "put", stream_id, path = %remote).entered();
     let result = do_put_inner(
         conn, socket, poll, events, stream_id, local, remote, offset, no_clobber,
@@ -451,7 +455,7 @@ fn do_put_inner(
         bail!("resume offset {offset} is past local file size {size}; refusing");
     }
 
-    // Streaming BLAKE3 (#152): hash incrementally as we read+send,
+    // Streaming BLAKE3: hash incrementally as we read+send,
     // then ship the 32-byte digest as an in-band trailer after the
     // body. Saves the upfront full-file read+hash pass.
     let mut hasher = blake3::Hasher::new();
@@ -520,7 +524,7 @@ fn do_put_inner(
         // which made any upload that didn't fit in the initial cwnd
         // (~14 KiB) fail outright.
         //
-        // The trailer (#152) carries the FIN; never set chunk_fin on
+        // The trailer carries the FIN; never set chunk_fin on
         // body bytes.
         let mut sub = 0usize;
         while sub < want {
@@ -548,7 +552,7 @@ fn do_put_inner(
         // do NOT block in poll.poll here: back-pressure is already
         // handled by the inner `Done -> poll.poll` path, and a
         // mandatory per-chunk poll capped loopback put at ~65 MiB/s
-        // (#150) by sleeping on `conn.timeout()` between chunks even
+        // by sleeping on `conn.timeout()` between chunks even
         // when send capacity was fine.
         handle_ingress(conn, socket, &mut recv_buf)?;
         flush_egress(conn, socket)?;
@@ -558,8 +562,9 @@ fn do_put_inner(
     let trailer = *hasher.finalize().as_bytes();
     let mut sub = 0usize;
     while sub < trailer.len() {
-        let chunk_fin = sub == 0 || sub + (trailer.len() - sub) == trailer.len();
-        match conn.stream_send(stream_id, &trailer[sub..], chunk_fin) {
+        // The trailer is the last data on the stream, so every write
+        // carries FIN; quiche keeps it pending across partial writes.
+        match conn.stream_send(stream_id, &trailer[sub..], true) {
             Ok(0) | Err(quiche::Error::Done) => {
                 flush_egress(conn, socket)?;
                 poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
@@ -597,71 +602,6 @@ fn unix_mode(meta: &std::fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn unix_mode(_meta: &std::fs::Metadata) -> u32 {
     0o644
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    poll_response_with_buf(conn, socket, poll, events, stream_id, &mut buf)
-}
-
-/// Same as [`poll_response`] but lets the caller observe whatever
-/// trailing bytes recv_message pulled off the stream beyond the
-/// response frame. For `Get`, the FileReady response and the first
-/// chunk of body bytes can arrive together; without this the body
-/// bytes that were already drained from quiche would be lost when the
-/// caller's body-read loop took over.
-fn poll_response_with_buf(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-    buf: &mut Vec<u8>,
-) -> Result<Response> {
-    loop {
-        // Try to deserialize a response from anything quiche already
-        // has buffered on this stream BEFORE blocking in poll.poll.
-        // The body-send loop in `do_put` runs a final ingress pump
-        // after the last chunk goes out, and the server's response
-        // packet often arrives during that pump -- so by the time we
-        // get here the response bytes are already sitting in the
-        // stream's recv buffer. Without this pre-poll drain we would
-        // call poll.poll(timeout=30s) and sleep on the QUIC idle
-        // timeout even though the message has been delivered.
-        if let Some(resp) = recv_message::<Response>(conn, stream_id, buf)? {
-            flush_egress(conn, socket)?;
-            return Ok(resp);
-        }
-
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
-
-        match recv_message::<Response>(conn, stream_id, buf)? {
-            Some(resp) => {
-                // #140: per-field cap defense in depth against a
-                // malicious server packing a multi-MiB string / huge
-                // listing into a single field.
-                qftp_common::protocol::validate_response(&resp)
-                    .map_err(|e| anyhow::anyhow!("server sent invalid response: {e}"))?;
-                flush_egress(conn, socket)?;
-                return Ok(resp);
-            }
-            None => {
-                flush_egress(conn, socket)?;
-            }
-        }
-
-        if conn.is_closed() {
-            bail!("Connection closed");
-        }
-    }
 }
 
 #[cfg(test)]

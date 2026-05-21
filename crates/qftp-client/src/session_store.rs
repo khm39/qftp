@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, Context, Result};
 
 /// Magic + version header prepended to every ticket file written by
-/// versions that bind the ticket to a server-cert fingerprint (#122).
+/// versions that bind the ticket to a server-cert fingerprint.
 /// Files without this header are treated as "no binding, load
 /// unconditionally" for backward compatibility.
 const TICKET_FILE_MAGIC: &[u8; 8] = b"QFT1\0FP\n";
@@ -64,7 +64,7 @@ pub fn ticket_path(dir: &Path, host_port: &str) -> PathBuf {
 /// fresh. Returns `None` for missing / expired / unreadable
 /// tickets so the caller can fall through to a 1-RTT handshake.
 ///
-/// `expected_fingerprint` (#122) lets a TOFU caller bind the saved
+/// `expected_fingerprint` lets a TOFU caller bind the saved
 /// ticket to the pinned server identity. When `Some(fp)`, the
 /// stored fingerprint must match exactly or the file is dropped and
 /// `None` returned — defends against DNS-repoint / cert-rotation
@@ -133,7 +133,7 @@ fn parse_ticket_file(buf: &[u8]) -> Option<(&[u8; 32], &[u8])> {
 ///
 /// `fingerprint` is the SHA-256 of the server's leaf cert; it is
 /// stored alongside the ticket so a subsequent `load` against a
-/// rotated / hijacked host can detect the change (#122).
+/// rotated / hijacked host can detect the change.
 pub fn save(
     dir: &Path,
     host_port: &str,
@@ -192,7 +192,7 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Persist a ticket extracted from a live quiche connection,
-/// computing the fingerprint binding (#122) automatically from the
+/// computing the fingerprint binding automatically from the
 /// peer cert. Returns `Ok(())` and saves nothing if the connection
 /// did not produce a session or did not present a leaf cert.
 pub fn save_from_conn(dir: &Path, host_port: &str, conn: &quiche::Connection) -> Result<()> {
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn load_with_matching_fingerprint_returns_ticket() {
-        // #122: TOFU caller passes the pinned fingerprint and gets
+        // TOFU caller passes the pinned fingerprint and gets
         // the ticket back when it matches.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn load_with_mismatched_fingerprint_purges_ticket() {
-        // #122: a fingerprint that doesn't match the stored binding
+        // A fingerprint that doesn't match the stored binding
         // means the host is now a different physical server (DNS
         // repoint or cert rotation). Drop the ticket.
         let tmp = TempDir::new().unwrap();

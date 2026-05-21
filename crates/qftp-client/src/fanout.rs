@@ -46,14 +46,6 @@ pub fn run(
         anyhow::bail!("put-multi: not a regular file: {local}");
     }
 
-    // Pre-compute BLAKE3 once so each thread doesn't re-hash.
-    let checksum = hash_blake3(&local_path)?;
-    tracing::info!(
-        file = %local_path.display(),
-        sha = ?hex_short(&checksum),
-        "put-multi: pre-hashed"
-    );
-
     let results: Arc<Mutex<Vec<Outcome>>> = Arc::new(Mutex::new(Vec::with_capacity(targets.len())));
     let mut handles = Vec::with_capacity(targets.len());
 
@@ -61,13 +53,13 @@ pub fn run(
         let host = host.clone();
         let local_path = local_path.clone();
         let remote_path = remote_path.to_string();
-        let overrides = clone_overrides(overrides);
+        let overrides = overrides.clone();
         let results = Arc::clone(&results);
         let h = thread::Builder::new()
             .name(format!("fanout-{host}"))
             .spawn(move || {
                 let t0 = Instant::now();
-                let res = upload_to_host(&host, &local_path, &remote_path, &overrides, checksum);
+                let res = upload_to_host(&host, &local_path, &remote_path, &overrides);
                 let elapsed_ms = t0.elapsed().as_millis();
                 let outcome = match res {
                     Ok(()) => Outcome {
@@ -133,15 +125,9 @@ fn upload_to_host(
     local: &std::path::Path,
     remote_path: &str,
     overrides: &Overrides,
-    _checksum: [u8; 32],
 ) -> Result<()> {
-    // Build a qftp:// URL pointing at this host + path; reuse the
-    // existing one-shot Put path. It already pre-hashes inside
-    // do_put; the pre-computed `_checksum` is reserved for a future
-    // optimization that threads it through transfer::do_put without
-    // re-reading the file. For now we just leverage the fact that
-    // each thread independently re-reads (cheap once the file is in
-    // page cache).
+    // Build a qftp:// URL pointing at this host + path and reuse the
+    // one-shot Put path; transfer::do_put hashes the body itself.
     let url = if !host.contains("://") {
         format!("qftp://{host}{remote_path}")
     } else {
@@ -167,16 +153,29 @@ fn do_put_once(
     local: &std::path::Path,
     remote_path: &str,
 ) -> Result<()> {
+    use qftp_common::protocol::Request;
     use qftp_common::transport::*;
 
-    let (mut conn, socket, mut poll, mut events) = crate::connect::establish(spec, "fanout")?;
+    let crate::connect::Established {
+        mut conn,
+        socket,
+        mut poll,
+        mut events,
+        ..
+    } = crate::connect::establish(
+        spec,
+        "fanout",
+        crate::connect::EstablishOpts::for_spec(spec),
+    )?;
 
+    let mut next_stream_id: u64 = 0;
+    let put_stream = crate::proto::take_stream(&mut next_stream_id);
     crate::transfer::do_put(
         &mut conn,
         &socket,
         &mut poll,
         &mut events,
-        0,
+        put_stream,
         local,
         remote_path,
         0,
@@ -184,9 +183,9 @@ fn do_put_once(
     )?;
 
     // Polite close.
-    let _ = crate::transfer::do_put;
-    let _ = send_message(&mut conn, 4, &qftp_common::protocol::Request::Quit);
-    let _ = stream_send_all(&mut conn, 4, &[], true);
+    let quit_stream = crate::proto::take_stream(&mut next_stream_id);
+    let _ = send_message(&mut conn, quit_stream, &Request::Quit);
+    let _ = stream_send_all(&mut conn, quit_stream, &[], true);
     let _ = flush_egress(&mut conn, &socket);
 
     if let Some(dir) = crate::session_store::default_dir() {
@@ -194,39 +193,4 @@ fn do_put_once(
     }
 
     Ok(())
-}
-
-fn hash_blake3(path: &std::path::Path) -> Result<[u8; 32]> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(*hasher.finalize().as_bytes())
-}
-
-fn hex_short(b: &[u8]) -> String {
-    let mut s = String::with_capacity(16);
-    for byte in b.iter().take(8) {
-        s.push_str(&format!("{byte:02x}"));
-    }
-    s
-}
-
-/// Manual clone for `Overrides` since the struct isn't `Clone`.
-fn clone_overrides(o: &Overrides) -> Overrides {
-    Overrides {
-        host: o.host.clone(),
-        server_name: o.server_name.clone(),
-        insecure: o.insecure,
-        ca: o.ca.clone(),
-        client_cert: o.client_cert.clone(),
-        client_key: o.client_key.clone(),
-    }
 }

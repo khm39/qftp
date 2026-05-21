@@ -11,7 +11,7 @@
 //! after the transfer batch completes (rsync's `--delete-after`
 //! semantics).
 //!
-//! `.qftpignore` (#65): if a file with that name exists at the
+//! `.qftpignore`: if a file with that name exists at the
 //! local root, each non-empty, non-`#` line is treated as a glob
 //! pattern matched against relative paths. A trailing `/` restricts
 //! the match to directories; a leading `/` anchors to the local
@@ -19,7 +19,7 @@
 //! deliberately not implemented yet -- a pragmatic subset that
 //! covers the common cases (`*.log`, `target/`, `/build/`).
 //!
-//! Out of scope (filed as a follow-up of #71):
+//! Out of scope (filed as a follow-up of):
 //!   - Download direction (remote → local).
 //!   - Negation (`!pattern`) and nested `.qftpignore` files.
 //!   - Parallel streams. Sync currently issues one Put / Rm at a
@@ -28,14 +28,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
-use crate::config::{self, ConnectionSpec, Overrides};
+use crate::config::{self, Overrides};
+use crate::proto::{request_response, take_stream};
 use crate::session_store;
 use crate::transfer;
 
@@ -81,7 +82,17 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     let local_files = walk_local(&local_root, &ignore)?;
     tracing::info!(count = local_files.len(), "sync: local files");
 
-    let (mut conn, socket, mut poll, mut events) = connect(&spec)?;
+    let crate::connect::Established {
+        mut conn,
+        socket,
+        mut poll,
+        mut events,
+        ..
+    } = crate::connect::establish(
+        &spec,
+        "sync",
+        crate::connect::EstablishOpts::for_spec(&spec),
+    )?;
     let mut next: u64 = 0;
 
     // Remote index: relative-path -> (size, mtime). We walk the
@@ -148,7 +159,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
 
     // Ensure the remote root exists. mkdir of an existing dir gets
     // AlreadyExists which we ignore.
-    let _ = single_request(
+    let _ = request_response(
         &mut conn,
         &socket,
         &mut poll,
@@ -165,7 +176,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
         let remote_path = join_remote(&remote_root, rel);
         // Make parents.
         if let Some(parent) = Path::new(&remote_path).parent() {
-            let _ = single_request(
+            let _ = request_response(
                 &mut conn,
                 &socket,
                 &mut poll,
@@ -197,7 +208,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     // succeeds at least for the upload side).
     for rel in &to_delete {
         let remote_path = join_remote(&remote_root, Path::new(rel));
-        match single_request(
+        match request_response(
             &mut conn,
             &socket,
             &mut poll,
@@ -291,7 +302,7 @@ fn walk_local(root: &Path, ignore: &IgnoreMatcher) -> Result<HashMap<PathBuf, Me
     Ok(out)
 }
 
-/// `.qftpignore` matcher (#65). One entry per non-empty non-comment
+/// `.qftpignore` matcher. One entry per non-empty non-comment
 /// line. The matcher is intentionally simpler than gitignore:
 ///
 ///   - Trailing `/` -> directory-only.
@@ -404,7 +415,7 @@ fn walk_remote(
     let mut stack: Vec<(String, PathBuf)> = vec![(root.to_string(), PathBuf::new())];
     while let Some((abs, rel)) = stack.pop() {
         let req = Request::Ls { path: abs.clone() };
-        let resp = match single_request(conn, socket, poll, events, next, &req) {
+        let resp = match request_response(conn, socket, poll, events, next, &req) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, dir = %abs, "sync: remote Ls failed");
@@ -417,7 +428,7 @@ fn walk_remote(
             _ => continue,
         };
         for e in entries {
-            // #108: a malicious server could synthesize entry names with
+            // A malicious server could synthesize entry names with
             // `..` or absolute paths. With `--delete`, those names would
             // be echoed back as `Rm` requests, asking the server to
             // delete arbitrary paths. Reject lexically before we even
@@ -468,61 +479,6 @@ fn join_remote(prefix: &str, rel: &Path) -> String {
     } else {
         format!("{prefix}/{rel_str}")
     }
-}
-
-fn take_stream(next: &mut u64) -> u64 {
-    let cur = *next;
-    *next += 4;
-    cur
-}
-
-fn single_request(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next: &mut u64,
-    req: &Request,
-) -> Result<Response> {
-    let stream_id = take_stream(next);
-    send_message(conn, stream_id, req)?;
-    stream_send_all(conn, stream_id, &[], true)?;
-    flush_egress(conn, socket)?;
-    poll_response(conn, socket, poll, events, stream_id)
-}
-
-fn poll_response(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    stream_id: u64,
-) -> Result<Response> {
-    let mut buf = Vec::new();
-    loop {
-        poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-        conn.on_timeout();
-        handle_ingress(conn, socket, &mut [0u8; 65535])?;
-        match recv_message::<Response>(conn, stream_id, &mut buf)? {
-            Some(r) => {
-                // #140: per-field cap defense in depth.
-                qftp_common::protocol::validate_response(&r)
-                    .map_err(|e| anyhow!("server sent invalid response: {e}"))?;
-                flush_egress(conn, socket)?;
-                return Ok(r);
-            }
-            None => flush_egress(conn, socket)?,
-        }
-        if conn.is_closed() {
-            return Err(anyhow!("sync: connection closed mid-request"));
-        }
-    }
-}
-
-fn connect(
-    spec: &ConnectionSpec,
-) -> Result<(quiche::Connection, mio::net::UdpSocket, Poll, Events)> {
-    crate::connect::establish(spec, "sync")
 }
 
 // SystemTime helper is reserved for the future remote->local path;

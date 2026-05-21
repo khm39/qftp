@@ -2,7 +2,7 @@
 //!
 //! Centralizes the `O_NOFOLLOW` open pattern that's used in several
 //! places to prevent a planted symlink from redirecting an open to an
-//! arbitrary file (issues #106/#107/#109). All callers should funnel
+//! arbitrary file. All callers should funnel
 //! through here so the cfg-unix gating stays in one place.
 
 use std::fs::OpenOptions;
@@ -22,8 +22,8 @@ pub fn apply_no_follow(opts: &mut OpenOptions) -> &mut OpenOptions {
 
 /// Apply `O_NOFOLLOW` and a 0o600 create mode on unix. Used when the
 /// file being opened holds material we never want another local user
-/// to read -- private keys (#107) and in-flight Put temp files
-/// (#136). Without an explicit mode the file inherits the daemon
+/// to read -- private keys and in-flight Put temp files
+///. Without an explicit mode the file inherits the daemon
 /// umask (typically 0o022 -> 0o644 = world-readable) which leaks the
 /// content for the duration the file exists.
 pub fn apply_owner_only_no_follow(opts: &mut OpenOptions) -> &mut OpenOptions {
