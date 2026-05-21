@@ -74,8 +74,7 @@ impl RetryKey {
         }
         let (payload, tag) = token.split_at(token.len() - HMAC_LEN);
         let expected = self.sign(payload);
-        // Constant-time comparison.
-        if !constant_time_eq(tag, &expected) {
+        if !qftp_common::util::constant_time_eq(tag, &expected) {
             return None;
         }
 
@@ -123,17 +122,6 @@ impl RetryKey {
         out.copy_from_slice(&full[..HMAC_LEN]);
         out
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

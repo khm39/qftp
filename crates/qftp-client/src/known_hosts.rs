@@ -258,11 +258,7 @@ fn decode_fingerprint_hex(hex: &str) -> Option<[u8; 32]> {
 
 /// Compute the lowercase-hex SHA-256 of a DER-encoded leaf cert.
 pub fn fingerprint_hex(der: &[u8]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in fingerprint_sha256(der).iter() {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    qftp_common::util::to_hex(&fingerprint_sha256(der))
 }
 
 /// Raw 32-byte SHA-256 of a DER-encoded leaf cert. Used for binary

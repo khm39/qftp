@@ -18,8 +18,7 @@ pub const INITIAL_MAX_STREAM_DATA: u64 = 16 * 1024 * 1024;
 /// Per-connection flow-control window. `initial_max_streams_bidi` is
 /// 4, so this is sized as `4 * INITIAL_MAX_STREAM_DATA` -- enough for
 /// every concurrent stream to be at its individual cap with no extra
-/// slack. Previous value was 2 GiB which was vastly over-sized
-/// for the BDP this protocol actually sees.
+/// slack.
 pub const INITIAL_MAX_CONNECTION_DATA: u64 = 4 * INITIAL_MAX_STREAM_DATA;
 
 /// Target size for SO_RCVBUF / SO_SNDBUF on the QUIC sockets, in bytes.
@@ -381,15 +380,14 @@ pub fn handle_ingress(
     Ok(())
 }
 
-/// Serialize a message and send it on a QUIC stream with a 4-byte BE length prefix.
-pub fn send_message<T: Serialize>(
-    conn: &mut quiche::Connection,
-    stream_id: u64,
-    msg: &T,
-) -> Result<()> {
+/// Serialize a message into a single buffer with a 4-byte BE length
+/// prefix. The inverse of [`decode_framed_message`]; transports that
+/// don't speak `quiche::Connection` (the WebTransport bridge) frame
+/// through this so the wire format stays in one place.
+pub fn encode_framed_message<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
     // Serialize straight into one length-prefixed buffer: the 4-byte
     // BE prefix up front, then bincode appends the payload after it.
-    // Avoids the separate payload Vec + copy the two-step form needed.
+    // Avoids the separate payload Vec + copy the two-step form needs.
     let payload_len = bincode::serialized_size(msg).context("failed to size message")? as usize;
     anyhow::ensure!(
         payload_len <= MAX_MESSAGE_SIZE,
@@ -400,9 +398,17 @@ pub fn send_message<T: Serialize>(
     let mut data = Vec::with_capacity(4 + payload_len);
     data.extend_from_slice(&(payload_len as u32).to_be_bytes());
     bincode::serialize_into(&mut data, msg).context("failed to serialize message")?;
+    Ok(data)
+}
 
+/// Serialize a message and send it on a QUIC stream with a 4-byte BE length prefix.
+pub fn send_message<T: Serialize>(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    msg: &T,
+) -> Result<()> {
+    let data = encode_framed_message(msg)?;
     stream_send_all(conn, stream_id, &data, false)?;
-
     Ok(())
 }
 

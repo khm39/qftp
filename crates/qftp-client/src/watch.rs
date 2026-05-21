@@ -24,7 +24,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, ConnectionSpec, Overrides};
-use crate::proto::{poll_response, take_stream};
+use crate::proto::{join_remote, poll_response, take_stream};
 use crate::transfer;
 
 /// What we want done with one path after collapsing a burst of
@@ -159,6 +159,12 @@ fn run_session(
     let mut pending: HashMap<PathBuf, Action> = HashMap::new();
     let mut last_event_at: Option<Instant> = None;
 
+    // The watched root never changes for the lifetime of the session,
+    // so canonicalize it once rather than on every debounce flush.
+    let canonical_root = local_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize watch root {}", local_root.display()))?;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -213,9 +219,6 @@ fn run_session(
         // `/home/user/.ssh/` and be silently uploaded. Resolve each
         // event path through `canonicalize` and confirm the *real*
         // path is still under the canonical root before acting.
-        let canonical_root = local_root
-            .canonicalize()
-            .with_context(|| format!("canonicalize watch root {}", local_root.display()))?;
         for (path, action) in pending.drain() {
             let canonical = match path.canonicalize() {
                 Ok(p) => p,
@@ -308,31 +311,5 @@ fn run_session(
             }
         }
         last_event_at = None;
-    }
-}
-
-fn join_remote(prefix: &str, rel: &Path) -> String {
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    if prefix.is_empty() || prefix == "/" {
-        format!("/{rel_str}")
-    } else if prefix.ends_with('/') {
-        format!("{prefix}{rel_str}")
-    } else {
-        format!("{prefix}/{rel_str}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn join_remote_root() {
-        assert_eq!(join_remote("/", Path::new("a/b.txt")), "/a/b.txt");
-    }
-    #[test]
-    fn join_remote_prefix() {
-        assert_eq!(join_remote("/dst", Path::new("a/b.txt")), "/dst/a/b.txt");
-        assert_eq!(join_remote("/dst/", Path::new("a/b.txt")), "/dst/a/b.txt");
     }
 }

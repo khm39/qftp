@@ -232,7 +232,10 @@ fn do_get_inner(
     // pointing a recursive download at, say, ~/.ssh/authorized_keys
     // via a planted symlink in the destination directory.
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(resume_offset == 0);
+    opts.read(true)
+        .write(true)
+        .create(true)
+        .truncate(resume_offset == 0);
     qftp_common::fs_safe::apply_no_follow(&mut opts);
     let mut file = opts
         .open(local)
@@ -247,13 +250,14 @@ fn do_get_inner(
     // passing checksum on a corrupt result.
     let mut hasher = blake3::Hasher::new();
     if resume_offset > 0 {
-        let mut prefix = File::open(local)
-            .with_context(|| format!("re-open {} to hash resume prefix", local.display()))?;
+        // Hash the prefix straight from the O_NOFOLLOW handle we'll
+        // write through: a second open-by-path would cost an extra
+        // syscall and reopen without the symlink guard.
         let mut buf = [0u8; CHUNK];
         let mut left = resume_offset;
         while left > 0 {
             let want = (left as usize).min(buf.len());
-            let n = prefix
+            let n = file
                 .read(&mut buf[..want])
                 .with_context(|| format!("read resume prefix from {}", local.display()))?;
             if n == 0 {
@@ -519,10 +523,9 @@ fn do_put_inner(
         // truncate or refuse the write when the connection's send
         // capacity (flow-control + congestion window) is exhausted —
         // in both cases we have to flush egress and pull ACKs in
-        // before the rest of the chunk can be queued. The previous
-        // version of this loop propagated `Error::Done` immediately,
-        // which made any upload that didn't fit in the initial cwnd
-        // (~14 KiB) fail outright.
+        // before the rest of the chunk can be queued. Propagating
+        // `Error::Done` here instead would fail any upload that
+        // didn't fit in the initial cwnd (~14 KiB).
         //
         // The trailer carries the FIN; never set chunk_fin on
         // body bytes.
