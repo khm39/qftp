@@ -1,0 +1,74 @@
+# qftp + WebTransport bridge -- reference deployment.
+#
+# Three services share one filesystem (./data, mounted at /srv):
+#
+#   qftp-server      native qftp/1 over QUIC                 UDP  4434
+#   qftp-web-bridge  WebTransport for browsers               UDP  4433
+#   nginx            HTTPS for the SPA page  ->  bridge :8080 TCP  8443
+#
+# nginx terminates TLS for the *web page* only. WebTransport
+# (HTTP/3, UDP 4433) is NOT proxied -- the browser reaches the bridge
+# directly and the bridge owns that QUIC/TLS endpoint itself.
+#
+# Before `docker compose up`, provide (see README.md in this folder):
+#   ./certs/cert.pem ./certs/key.pem   TLS certificate + private key
+#   ./data/                            the served filesystem (writable
+#                                      by the container user, uid 65532)
+# users.toml and tokens.toml in this folder are sample configs.
+
+services:
+  qftp-server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: qftp:example
+    command:
+      - --bind=0.0.0.0:4434
+      - --root=/srv
+      - --cert=/certs/cert.pem
+      - --key=/certs/key.pem
+      - --users=/config/users.toml
+      - --require-retry
+    volumes:
+      - ./data:/srv
+      - ./certs:/certs:ro
+      - ./users.toml:/config/users.toml:ro
+    ports:
+      - "4434:4434/udp"
+    restart: unless-stopped
+
+  qftp-web-bridge:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: qftp:example
+    entrypoint: ["/usr/local/bin/qftp-web-bridge"]
+    command:
+      - --bind=0.0.0.0:4433
+      - --http-bind=0.0.0.0:8080
+      - --root=/srv
+      - --cert=/certs/cert.pem
+      - --key=/certs/key.pem
+      - --users=/config/users.toml
+      - --users-tokens=/config/tokens.toml
+    volumes:
+      - ./data:/srv
+      - ./certs:/certs:ro
+      - ./users.toml:/config/users.toml:ro
+      - ./tokens.toml:/config/tokens.toml:ro
+    ports:
+      # WebTransport: exposed directly (HTTP/3 / UDP), never proxied.
+      - "4433:4433/udp"
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/certs:ro
+    ports:
+      # HTTPS for the SPA page. Open https://<host>:8443/ in a browser.
+      - "8443:8443"
+    depends_on:
+      - qftp-web-bridge
+    restart: unless-stopped

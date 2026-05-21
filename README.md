@@ -186,10 +186,48 @@ legacy flags / defaults.
 | `--batch` | Read commands from stdin, one per line, instead of opening a REPL. Also implicit when stdin is not a TTY. |
 | `--history <path>` | Override the default `~/.qftp_history`. |
 
+## Web client (browser)
+
+`qftp-web-bridge` serves qftp to browsers over WebTransport (HTTP/3).
+It is a separate binary that runs alongside `qftp-server`, shares the
+same `--root` and `users.toml`, and ships a single-page app: directory
+browsing, drag-and-drop upload, download, delete, and rename, all with
+progress bars.
+
+```
+qftp-web-bridge \
+    --cert server.pem --key server.key \
+    --bind 0.0.0.0:4433 --http-bind 127.0.0.1:8080 \
+    --root /srv/qftp \
+    --users users.toml --users-tokens tokens.toml
+```
+
+Then open `http://127.0.0.1:8080/` (or front it with HTTPS for any
+non-localhost use). Browsers need WebTransport: Chrome / Edge, or
+Firefox 124+; Safari is not supported.
+
+### qftp-web-bridge
+
+| Flag | Purpose |
+|---|---|
+| `--cert <pem>` / `--key <pem>` | TLS certificate and key for the WebTransport endpoint. |
+| `--bind <ip:port>` | UDP bind address for WebTransport (HTTP/3). Default `0.0.0.0:4433`. |
+| `--http-bind <ip:port>` | TCP bind address for the bundled SPA's plain-HTTP listener. Default `127.0.0.1:8080`. |
+| `--root <path>` | Storage root; same meaning as `qftp-server --root`. |
+| `--users <toml>` | Users, homes, and permissions (the same file `qftp-server` uses). |
+| `--users-tokens <toml>` | Maps bearer tokens to user names. Without it, every session is the anonymous read-only user. |
+
+A ready-to-run Docker Compose deployment (bridge + server + nginx) is
+in [examples/docker-compose/](examples/docker-compose/). The setup
+steps, bearer-token auth model, and certificate handling are in
+[docs/web-client.md](docs/web-client.md).
+
 ## Documentation
 
 - [docs/protocol.md](docs/protocol.md) -- wire format and stream
   conventions.
+- [docs/web-client.md](docs/web-client.md) -- the browser client and
+  the WebTransport bridge.
 - [docs/adr/](docs/adr/) -- architectural decision records (the
   `quiche` vs `quinn` choice is [0001](docs/adr/0001-quic-runtime.md)).
 - [SECURITY.md](SECURITY.md) -- vulnerability reporting and supported

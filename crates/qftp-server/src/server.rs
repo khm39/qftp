@@ -37,14 +37,13 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 use tracing::{debug, info, warn};
 
-use crate::connection::{
-    ConnectionContext, StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
-};
-use crate::handler::{self, err, io_code};
+use crate::connection::ConnectionContext;
 use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
 use crate::retry::RetryKey;
-use crate::user::{self, User, UserDirectory};
+use qftp_protocol::handler::{self, err, io_code};
+use qftp_protocol::stream::{StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
+use qftp_protocol::user::{self, User, UserDirectory};
 
 /// Which Request variants are safe to serve while the connection is
 /// still in the 0-RTT phase. The rule is "read-only / no
@@ -1473,7 +1472,7 @@ fn start_put(
         hasher,
         expected_checksum,
         trailer_buf: if checksum_trailer {
-            Some(crate::connection::TrailerBuf::new())
+            Some(qftp_protocol::stream::TrailerBuf::new())
         } else {
             None
         },

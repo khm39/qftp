@@ -10,15 +10,14 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use qftp_common::transport::{create_server_config, ServerTlsConfig};
+use qftp_protocol::user;
 use tracing::{info, warn};
 
 mod connection;
-mod handler;
 mod limits;
 mod metrics;
 mod retry;
 mod server;
-mod user;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),

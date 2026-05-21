@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>qftp web client</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>qftp</h1>
+    <span id="conn-status" class="status status-off">disconnected</span>
+  </header>
+
+  <main>
+    <!-- Shown when the browser has no WebTransport (e.g. Safari). -->
+    <section id="unsupported" class="card error" hidden>
+      <h2>WebTransport unavailable</h2>
+      <p>
+        This browser cannot speak WebTransport, which qftp's web client
+        requires. Use a recent Chrome or Edge, or Firefox&nbsp;124+.
+        Safari does not support WebTransport yet.
+      </p>
+    </section>
+
+    <!-- Login / connection form. -->
+    <section id="login" class="card" hidden>
+      <h2>Connect</h2>
+      <label>Server URL
+        <input id="url" type="text" placeholder="https://host:4433/" autocomplete="off">
+      </label>
+      <label>Access token
+        <input id="token" type="password" placeholder="(blank = anonymous)" autocomplete="off">
+      </label>
+      <button id="connect">Connect</button>
+      <p id="login-error" class="error-text" hidden></p>
+    </section>
+
+    <!-- File browser, shown once connected. -->
+    <section id="browser" hidden>
+      <div class="toolbar">
+        <button id="up" title="Parent directory">Up</button>
+        <code id="path" class="path">/</code>
+        <span class="spacer"></span>
+        <button id="mkdir">New folder</button>
+        <button id="refresh">Refresh</button>
+        <button id="disconnect">Disconnect</button>
+      </div>
+
+      <div id="dropzone" class="dropzone">
+        Drop files here to upload, or
+        <label class="link">choose files<input id="filepick" type="file" multiple hidden></label>
+      </div>
+
+      <div id="transfers"></div>
+
+      <table id="listing">
+        <thead>
+          <tr><th>Name</th><th class="num">Size</th><th>Modified</th><th></th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p id="empty-dir" class="muted" hidden>This folder is empty.</p>
+    </section>
+  </main>
+
+  <ul id="log" aria-live="polite"></ul>
+
+  <script src="app.js"></script>
+</body>
+</html>
