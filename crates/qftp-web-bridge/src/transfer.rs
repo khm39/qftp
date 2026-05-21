@@ -12,7 +12,6 @@
 //! with absolute paths (the SPA tracks its own location). This lets the
 //! session loop run streams concurrently without a shared, mutable cwd.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -146,15 +145,7 @@ async fn read_request(recv: &mut RecvStream) -> Result<(Request, Vec<u8>)> {
 
 /// Serialize `msg` into a length-prefixed frame and write it.
 async fn send_framed<T: Serialize>(send: &mut SendStream, msg: &T) -> Result<()> {
-    let payload = bincode::serialize(msg).context("failed to serialize response")?;
-    anyhow::ensure!(
-        payload.len() <= MAX_MESSAGE_SIZE,
-        "response too large: {} bytes",
-        payload.len()
-    );
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
+    let frame = qftp_common::transport::encode_framed_message(msg)?;
     send.write_all(&frame)
         .await
         .context("stream write failed")?;
@@ -553,11 +544,12 @@ async fn route_put_chunk(
 fn temp_path_for(final_path: &Path) -> PathBuf {
     let mut rand_bytes = [0u8; 8];
     use ring::rand::SecureRandom as _;
-    let _ = ring::rand::SystemRandom::new().fill(&mut rand_bytes);
-    let mut suffix = String::with_capacity(16);
-    for b in rand_bytes {
-        let _ = write!(suffix, "{b:02x}");
-    }
+    // A swallowed RNG failure here would leave an all-zero suffix and
+    // defeat the anti-planting defense, so fail loudly instead.
+    ring::rand::SystemRandom::new()
+        .fill(&mut rand_bytes)
+        .expect("system RNG failed");
+    let suffix = qftp_common::util::to_hex(&rand_bytes);
     let mut name = final_path
         .file_name()
         .map(|n| n.to_os_string())

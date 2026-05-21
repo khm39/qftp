@@ -26,7 +26,7 @@
 //!     time. Multi-stream parallelism is a natural extension; the
 //!     event-driven server side (Phase 2) already supports it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,7 +36,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, Overrides};
-use crate::proto::{request_response, take_stream};
+use crate::proto::{join_remote, request_response, take_stream};
 use crate::session_store;
 use crate::transfer;
 
@@ -170,23 +170,32 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
         },
     );
 
+    // Create the distinct parent directories once each. A flat
+    // directory of N files would otherwise send N redundant Mkdir
+    // round-trips that all return AlreadyExists after the first.
+    // Sorted so a shallower parent is created before a nested one.
+    let mut mkdir_parents: BTreeSet<String> = BTreeSet::new();
+    for rel in &to_upload {
+        let remote_path = join_remote(&remote_root, rel);
+        if let Some(parent) = Path::new(&remote_path).parent() {
+            mkdir_parents.insert(parent.to_string_lossy().into_owned());
+        }
+    }
+    for parent in mkdir_parents {
+        let _ = request_response(
+            &mut conn,
+            &socket,
+            &mut poll,
+            &mut events,
+            &mut next,
+            &Request::Mkdir { path: parent },
+        );
+    }
+
     // Upload.
     for rel in &to_upload {
         let local_path = local_root.join(rel);
         let remote_path = join_remote(&remote_root, rel);
-        // Make parents.
-        if let Some(parent) = Path::new(&remote_path).parent() {
-            let _ = request_response(
-                &mut conn,
-                &socket,
-                &mut poll,
-                &mut events,
-                &mut next,
-                &Request::Mkdir {
-                    path: parent.to_string_lossy().into_owned(),
-                },
-            );
-        }
         let stream_id = take_stream(&mut next);
         match transfer::do_put(
             &mut conn,
@@ -441,11 +450,7 @@ fn walk_remote(
                 );
                 continue;
             }
-            let child_abs = if abs.ends_with('/') {
-                format!("{abs}{}", e.name)
-            } else {
-                format!("{abs}/{}", e.name)
-            };
+            let child_abs = join_remote(&abs, Path::new(&e.name));
             let child_rel = rel.join(&e.name);
             if e.is_dir {
                 stack.push((child_abs, child_rel));
@@ -470,17 +475,6 @@ fn mtime_differs(a: u64, b: u64) -> bool {
     a.abs_diff(b) > 1
 }
 
-fn join_remote(prefix: &str, rel: &Path) -> String {
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    if prefix == "/" || prefix.is_empty() {
-        format!("/{rel_str}")
-    } else if prefix.ends_with('/') {
-        format!("{prefix}{rel_str}")
-    } else {
-        format!("{prefix}/{rel_str}")
-    }
-}
-
 // SystemTime helper is reserved for the future remote->local path;
 // silence dead_code in the upload-only flow.
 #[allow(dead_code)]
@@ -500,17 +494,6 @@ mod tests {
         assert!(!mtime_differs(10, 10));
         assert!(!mtime_differs(10, 11));
         assert!(mtime_differs(10, 12));
-    }
-
-    #[test]
-    fn join_remote_root() {
-        assert_eq!(join_remote("/", Path::new("a/b.txt")), "/a/b.txt");
-    }
-
-    #[test]
-    fn join_remote_prefix() {
-        assert_eq!(join_remote("/dst", Path::new("a/b.txt")), "/dst/a/b.txt");
-        assert_eq!(join_remote("/dst/", Path::new("a/b.txt")), "/dst/a/b.txt");
     }
 
     fn matcher_from(lines: &[&str]) -> IgnoreMatcher {

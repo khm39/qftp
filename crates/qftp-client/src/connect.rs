@@ -112,7 +112,7 @@ pub fn establish(
     let rng = ring::rand::SystemRandom::new();
     let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
     use ring::rand::SecureRandom;
-    rng.fill(&mut scid_bytes).unwrap();
+    rng.fill(&mut scid_bytes).expect("system RNG failed");
     let scid = quiche::ConnectionId::from_vec(scid_bytes.to_vec());
     let mut conn = quiche::connect(
         Some(&spec.server_name),

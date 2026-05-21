@@ -84,3 +84,35 @@ pub fn request_response(
     flush_egress(conn, socket)?;
     poll_response(conn, socket, poll, events, stream_id)
 }
+
+/// Join a remote directory prefix with a relative path. Backslashes in
+/// `rel` are normalized to `/` so Windows clients still produce POSIX
+/// remote paths; a `prefix` of `/` or empty roots the result at `/`.
+pub fn join_remote(prefix: &str, rel: &std::path::Path) -> String {
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    if prefix.is_empty() || prefix == "/" {
+        format!("/{rel_str}")
+    } else if prefix.ends_with('/') {
+        format!("{prefix}{rel_str}")
+    } else {
+        format!("{prefix}/{rel_str}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_remote;
+    use std::path::Path;
+
+    #[test]
+    fn join_remote_root() {
+        assert_eq!(join_remote("/", Path::new("a/b.txt")), "/a/b.txt");
+        assert_eq!(join_remote("", Path::new("a/b.txt")), "/a/b.txt");
+    }
+
+    #[test]
+    fn join_remote_prefix() {
+        assert_eq!(join_remote("/dst", Path::new("a/b.txt")), "/dst/a/b.txt");
+        assert_eq!(join_remote("/dst/", Path::new("a/b.txt")), "/dst/a/b.txt");
+    }
+}

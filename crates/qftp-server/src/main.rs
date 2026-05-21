@@ -394,7 +394,7 @@ fn log_fingerprint(cert_pem: &str, source: &str) {
         Ok((_, pem)) => {
             use sha2::Digest;
             let digest = sha2::Sha256::digest(&pem.contents);
-            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            let hex = qftp_common::util::to_hex(&digest);
             info!(
                 source,
                 fingerprint = %format!("sha256:{hex}"),

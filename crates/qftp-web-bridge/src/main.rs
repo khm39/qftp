@@ -128,12 +128,9 @@ async fn main() -> Result<()> {
     // The SPA needs the leaf certificate's SHA-256 hash so it can pin a
     // self-signed certificate via WebTransport `serverCertificateHashes`
     // when the cert is not browser-trusted. The hash is not secret.
-    let cert_hash_hex: String = identity.certificate_chain().as_slice()[0]
-        .hash()
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let cert_hash_hex = qftp_common::util::to_hex(
+        identity.certificate_chain().as_slice()[0].hash().as_ref(),
+    );
     let config_json = format!(
         "{{\"certHash\":\"{cert_hash_hex}\",\"webtransportPort\":{}}}",
         args.bind.port()

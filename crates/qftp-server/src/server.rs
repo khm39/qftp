@@ -22,7 +22,6 @@
 //! the loop.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -52,7 +51,7 @@ use qftp_protocol::user::{self, User, UserDirectory};
 /// refused so a captured 0-RTT flight cannot be replayed to put the
 /// server into a different state.
 fn request_is_replay_safe(req: &Request) -> bool {
-    // Quota is intentionally NOT in this set. Even though
+    // Quota is intentionally NOT in this set. Even though the server
     // caches the usage so the reply is cheap, treating it as
     // replay-safe means a captured 0-RTT Quota request can be
     // re-fired indefinitely as a "ping" against the user record —
@@ -69,8 +68,8 @@ fn request_is_replay_safe(req: &Request) -> bool {
     // for Get is one extra round trip on the first request of a
     // session; subsequent requests within the same session run at
     // normal 1-RTT either way. The list below intentionally keeps
-    // only small fixed-size replies (Ls is capped at MAX_DIR_ENTRIES
-    // by, Stat is a fixed struct, Pwd/Cd/Quit are tiny acks).
+    // only small fixed-size replies (Ls is capped at MAX_DIR_ENTRIES,
+    // Stat is a fixed struct, Pwd/Cd/Quit are tiny acks).
     matches!(
         req,
         Request::Ls { .. }
@@ -213,9 +212,16 @@ fn run_handler(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
                     match std::fs::remove_file(&target) {
                         Ok(()) => {
                             if pre_size > 0 {
-                                let prev = user.used_bytes.load(Ordering::Relaxed);
-                                user.used_bytes
-                                    .store(prev.saturating_sub(pre_size), Ordering::Relaxed);
+                                // Atomic saturating subtract: a plain
+                                // load/store loses concurrent Rm
+                                // decrements from other worker threads,
+                                // drifting `used_bytes` upward until the
+                                // user is falsely quota-locked.
+                                let _ = user.used_bytes.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |v| Some(v.saturating_sub(pre_size)),
+                                );
                             }
                             Response::Ok
                         }
@@ -1717,11 +1723,12 @@ fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
     // collapses the planting attack to ~2^64.
     let mut rand_bytes = [0u8; 8];
     use ring::rand::SecureRandom as _;
-    let _ = ring::rand::SystemRandom::new().fill(&mut rand_bytes);
-    let mut suffix = String::with_capacity(16);
-    for b in rand_bytes {
-        let _ = write!(suffix, "{b:02x}");
-    }
+    // A swallowed RNG failure here would leave an all-zero suffix and
+    // defeat the anti-planting defense above, so fail loudly instead.
+    ring::rand::SystemRandom::new()
+        .fill(&mut rand_bytes)
+        .expect("system RNG failed");
+    let suffix = qftp_common::util::to_hex(&rand_bytes);
 
     let mut name = final_path
         .file_name()

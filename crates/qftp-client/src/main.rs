@@ -22,7 +22,7 @@ mod sync;
 mod transfer;
 mod watch;
 
-use proto::{request_response, take_stream};
+use proto::{join_remote, request_response, take_stream};
 
 /// Long-form `--version` body. Built from the package version plus
 /// the build-time facts injected by `build.rs`.
@@ -829,11 +829,7 @@ fn do_recursive_get(
                 );
                 continue;
             }
-            let remote_child = if rdir.ends_with('/') {
-                format!("{rdir}{}", entry.name)
-            } else {
-                format!("{rdir}/{}", entry.name)
-            };
+            let remote_child = join_remote(&rdir, Path::new(&entry.name));
             let local_child = ldir.join(&entry.name);
             if entry.is_dir {
                 queue.push((remote_child, local_child));
@@ -908,11 +904,7 @@ fn do_recursive_put(
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy().into_owned();
-            let remote_child = if rremote.ends_with('/') {
-                format!("{rremote}{name_str}")
-            } else {
-                format!("{rremote}/{name_str}")
-            };
+            let remote_child = join_remote(&rremote, Path::new(&name_str));
             if path.is_dir() {
                 let _ = request_response(
                     conn,
