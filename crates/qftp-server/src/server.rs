@@ -1853,6 +1853,17 @@ pub fn run_dispatcher(
             break;
         }
 
+        // Reap workers that have exited so they don't linger as
+        // zombies. Non-blocking; a non-positive return means there is
+        // nothing left to reap this tick.
+        loop {
+            let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if pid <= 0 {
+                break;
+            }
+            debug!(worker_pid = pid, "reaped exited isolation worker");
+        }
+
         let shortest_timeout = connections.values().filter_map(|c| c.conn.timeout()).min();
         poll.poll(
             &mut events,

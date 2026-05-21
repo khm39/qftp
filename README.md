@@ -153,6 +153,8 @@ qftp-client \
 | `--self-signed-state-dir <path>` | Override the persistent self-signed state directory. |
 | `--client-ca <pem>` | When set, clients must present an mTLS cert chained to this CA. |
 | `--users <toml>` | TOML file defining users, homes, and permissions. Without it, every connection is an anonymous user with full perms on `--root`. |
+| `--user-isolation` | Linux only. Serve each connection from a process running as the authenticated user's real UID, so uploaded files are owned by that OS user (ADR 0002). Needs root or `CAP_SETUID`+`CAP_SETGID`, plus `--users`. |
+| `--check-isolation` | Validate the `users.toml` -> OS account mapping for `--user-isolation` and exit -- the isolation equivalent of `sshd -t`. |
 | `--max-connections <n>` | Hard cap on concurrent connections. Default 64. |
 | `--max-connections-per-ip <n>` | Hard cap per source IP. Default 8. |
 | `--require-retry` | Demand QUIC stateless retry on every Initial. Recommended for any internet-facing deployment. |
@@ -190,8 +192,11 @@ legacy flags / defaults.
 
 - [docs/protocol.md](docs/protocol.md) -- wire format and stream
   conventions.
-- [docs/adr/](docs/adr/) -- architectural decision records (the
-  `quiche` vs `quinn` choice is [0001](docs/adr/0001-quic-runtime.md)).
+- [docs/architecture.md](docs/architecture.md) -- runtime structure,
+  the QUIC event loop, and the standard vs OS-isolation process models.
+- [docs/adr/](docs/adr/) -- architectural decision records: the
+  `quiche` vs `quinn` choice is [0001](docs/adr/0001-quic-runtime.md),
+  OS user isolation is [0002](docs/adr/0002-process-isolation.md).
 - [SECURITY.md](SECURITY.md) -- vulnerability reporting and supported
   versions.
 - [CHANGELOG.md](CHANGELOG.md) -- per-release notes.

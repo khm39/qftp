@@ -10,6 +10,17 @@ is what we will bump to signal an intentional wire break.
 
 ### Added
 
+- **OS user isolation (Linux).** `qftp-server --user-isolation` serves
+  each connection from a per-connection process that `setuid`s to the
+  authenticated user, so transfers run under -- and uploaded files are
+  owned by -- the real OS user. A privileged single-threaded
+  dispatcher runs the QUIC + mTLS handshake and `fork`s a worker that
+  inherits the established connection via copy-on-write. `users.toml`
+  gains optional `uid` / `gid` fields, and `--check-isolation` is an
+  `sshd -t`-style preflight that validates the mapping. Off by
+  default; no wire-protocol change. See
+  [docs/architecture.md](docs/architecture.md) and ADR
+  [0002](docs/adr/0002-process-isolation.md).
 - **Protocol versioning.** ALPN is now `qftp/1` (was `qftp`). New
   binaries refuse to negotiate with peers that don't offer the new
   ALPN; the QUIC handshake fails cleanly with no fallback.

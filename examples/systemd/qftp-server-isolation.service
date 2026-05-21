@@ -1,0 +1,74 @@
+# qftp-server in OS user-isolation mode (ADR 0002).
+#
+# Differs from qftp-server.service in three ways:
+#   1. No DynamicUser= -- the dispatcher must setuid to the real OS
+#      accounts named in users.toml, which a dynamic user cannot do.
+#   2. Runs as root (or a user holding CAP_SETUID + CAP_SETGID); the
+#      CapabilityBoundingSet pins it to the minimum needed.
+#   3. ExecStart passes --user-isolation. --metrics-bind is omitted
+#      because per-worker metrics aggregation is not yet implemented.
+#
+# Operational prerequisite: every user's home directory under --root
+# must be owned by (or writable by) that user's UID, since the
+# setuid'd worker -- not root -- creates files there. Validate the
+# whole setup before enabling the unit:
+#
+#   qftp-server --check-isolation --users /etc/qftp/users.toml
+#
+# and, on a non-production box, scripts/isolation-test.sh.
+
+[Unit]
+Description=QFTP file transfer server (OS user isolation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Root is required: the dispatcher setuid's each per-connection worker
+# to the authenticated user. The bounding set keeps it to the minimum.
+User=root
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE
+StateDirectory=qftp
+
+ExecStart=/usr/local/bin/qftp-server \
+    --user-isolation \
+    --bind 0.0.0.0:4433 \
+    --root %S/qftp \
+    --cert /etc/qftp/server.crt --key /etc/qftp/server.key \
+    --client-ca /etc/qftp/ca.crt \
+    --users /etc/qftp/users.toml \
+    --require-retry \
+    --max-connections 256 \
+    --max-connections-per-ip 16 \
+    --log-format json
+
+# Send SIGTERM, give the dispatcher and its workers time to drain
+# (systemd signals the whole control group), then SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing. NoNewPrivileges stays on: it does not block the worker's
+# downward setuid, but it does stop a worker from regaining privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# @system-service includes fork/clone and the setuid/setgid/setgroups
+# family that the worker needs; if workers die with EPERM, this filter
+# is the first thing to check.
+SystemCallFilter=@system-service
+ReadWritePaths=%S/qftp
+
+[Install]
+WantedBy=multi-user.target

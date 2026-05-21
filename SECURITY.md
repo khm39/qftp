@@ -59,6 +59,39 @@ runs after the TLS handshake completes, so a determined MitM could
 complete the handshake; the connection is then closed with the SSH-
 style banner. Use `--ca` whenever a real CA chain is available.
 
+### OS user isolation
+
+By default the server runs every transfer as the one OS user that
+launched it (see the threat-model bullet above). The optional
+`--user-isolation` mode (Linux only; ADR
+[0002](docs/adr/0002-process-isolation.md)) instead serves each
+connection from a dedicated process running as the **authenticated
+user's real UID**, so the kernel's discretionary access control backs
+up the userspace ACL and uploaded files are owned by the real user.
+
+Its trust properties:
+
+- **The dispatcher is root-equivalent.** To `setuid` to any configured
+  user it needs root, or `CAP_SETUID` + `CAP_SETGID`. Treat the
+  dispatcher as a high-value target and apply the systemd hardening in
+  `examples/systemd/qftp-server-isolation.service`. `DynamicUser=` is
+  incompatible with this mode and must not be set.
+- **The dispatcher never sees plaintext file data.** It runs only the
+  QUIC + mTLS handshake; once a connection is handed to a worker, the
+  worker holds the TLS keys and the dispatcher is out of the data
+  path.
+- **Workers are unprivileged and confined.** A worker `setgroups` +
+  `setgid` + `setuid`s to the target user and verifies the drop is
+  irreversible (it must not be able to `seteuid(0)`) *before* serving
+  any byte. A bug in one worker is contained to one connection's UID.
+- **Validate before enabling.** `qftp-server --check-isolation --users
+  <file>` resolves every configured user to an OS account and checks
+  the process can switch credentials — run it in CI / at deploy time.
+
+This mode does not change the wire protocol and is independent of
+mTLS configuration; without `--user-isolation` the server behaves
+exactly as before.
+
 ## Out of scope
 
 - Side channels in the BLAKE3 / HMAC implementations (we rely on the
@@ -79,6 +112,10 @@ style banner. Use `--ca` whenever a real CA chain is available.
   never rely on the anonymous-user fallback in production.
 - Run the server as a dedicated unprivileged Unix user. The provided
   `examples/systemd/qftp-server.service` does this with `DynamicUser=`.
+- For a multi-user host where transfers should run as real OS users,
+  consider `--user-isolation` (Linux; see "OS user isolation" above and
+  `examples/systemd/qftp-server-isolation.service`). Validate the
+  `users.toml` -> OS account mapping with `--check-isolation` first.
 - Restrict `--root` to its own directory. Don't point it at `/`.
 - Scrape `--metrics-bind` on a private interface; the endpoint serves
   Prometheus text and is not authenticated. Recommended bind is
