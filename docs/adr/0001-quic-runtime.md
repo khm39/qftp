@@ -129,3 +129,26 @@ the following are true:
 
 Until then: stay on `quiche` + `mio`. Reopen this ADR if you
 disagree.
+
+## Addendum (2026-05-21): `qftp-web-bridge` uses `quinn`
+
+Phase 5 [#63](https://github.com/khm39/qftp/issues/63) adds a browser
+client over WebTransport. WebTransport runs on HTTP/3, which `quiche`
+does not expose without hand-rolling `quiche-h3`; the `wtransport`
+crate (built on `quinn`) implements it directly.
+
+This does **not** reverse the decision above. The split is by
+process, not by runtime swap:
+
+- `qftp-server` and `qftp-client` stay on `quiche` + `mio`. None of
+  the ~2000 lines of synchronous server code is touched.
+- The new `qftp-web-bridge` crate is a **separate binary** that uses
+  `wtransport` + `tokio`. It terminates WebTransport and drives the
+  transport-independent `qftp-protocol` core (extracted in Phase B.1).
+
+`quiche` and `quinn` therefore never link into the same binary, and
+the "first-class HTTP/3 inside the same process" trigger in *When to
+revisit* stays unmet — the bridge is deliberately a different
+process, deployed alongside `qftp-server` (same `--root`, same
+`users.toml`). `qftp-web-bridge` consequently carries a higher MSRV
+(1.88, `wtransport`'s floor) than the rest of the workspace (1.85).
