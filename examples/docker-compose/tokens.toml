@@ -1,0 +1,14 @@
+# Bearer tokens for the WebTransport bridge. Each token maps a browser
+# session to a user defined in users.toml.
+#
+# CHANGE THESE before any real use: a token is the only secret gating
+# that user's web access. Generate high-entropy, URL-safe values, e.g.
+#   head -c 24 /dev/urandom | base64 | tr '+/' '-_'
+
+[[tokens]]
+token = "REPLACE-WITH-A-RANDOM-TOKEN-FOR-ALICE"
+user  = "alice"
+
+[[tokens]]
+token = "REPLACE-WITH-A-RANDOM-TOKEN-FOR-BOB"
+user  = "bob"

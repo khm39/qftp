@@ -1,0 +1,13 @@
+# Per-user homes and ACLs, shared by qftp-server and qftp-web-bridge.
+#
+# `home` defaults to <root>/<name>; both services resolve it under the
+# shared --root (/srv). See the qftp-server --users documentation for
+# the full schema (quota_bytes, absolute homes, etc.).
+
+[[users]]
+name = "alice"
+permissions = { read = true, write = true, delete = true, mkdir = true, rmdir = true, rename = true }
+
+[[users]]
+name = "bob"
+permissions = { read = true }
