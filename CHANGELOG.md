@@ -81,6 +81,29 @@ is what we will bump to signal an intentional wire break.
   amplification.
 - Per-request token-bucket rate limiting kicks in after handshake, so
   an accepted peer can't drown the server with command floods.
+- **mTLS is now enforced, not optional.** quiche's `verify_peer(true)`
+  sets `SSL_VERIFY_PEER` only, so a client presenting *no* certificate
+  still completed the TLS handshake and was served as the anonymous
+  user -- which, with `--users`, can read the entire `--root`. A
+  server started with `--client-ca` now closes any established
+  connection that presents no peer certificate.
+- **Client-certificate identity confusion closed.** A certificate is
+  matched against `users.toml` over its SAN dNSName / rfc822Name / URI
+  entries and the Subject CN. Matching now refuses any certificate
+  that resolves to more than one distinct configured user, instead of
+  silently picking the first -- a cert carrying an extra SAN entry can
+  no longer select a higher-privileged account.
+- **Symlink TOCTOU re-check extended to `Ls` and `Cd`.** Both followed
+  a path component swapped to a symlink after validation (`Ls` via
+  `fs::read_dir`, `Cd` by adopting a poisoned `cwd`); they now run the
+  same ancestor + leaf re-check the mutating operations already used.
+- **Quota enforcement no longer races.** `Put` reserved its byte count
+  *after* checking the quota, so two concurrent uploads could both
+  pass and overshoot the limit. The reservation is now made before the
+  check, in both the native server and the WebTransport bridge.
+- **WebTransport bridge bounds concurrent sessions.** The bridge
+  accepted sessions without limit; each can hold many buffering
+  streams. A semaphore now caps concurrent sessions.
 
 ## [0.1.0] - placeholder
 

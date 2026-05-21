@@ -169,6 +169,10 @@ fn main() -> Result<()> {
         require_retry: args.require_retry,
         rate_limit_rps: args.rate_limit_rps,
         rate_limit_burst: args.rate_limit_burst,
+        // mTLS is "configured" exactly when a client CA bundle was
+        // passed; a connection that then presents no certificate must
+        // be rejected rather than served as the anonymous user.
+        mtls_required: args.client_ca.is_some(),
     };
 
     server::run(

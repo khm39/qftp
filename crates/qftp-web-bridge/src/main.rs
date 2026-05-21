@@ -35,6 +35,14 @@ use auth::TokenDirectory;
 /// as ordinary stream-limit back-pressure.
 const MAX_CONCURRENT_STREAMS: usize = 64;
 
+/// Upper bound on WebTransport sessions served concurrently. Each
+/// session can hold up to `MAX_CONCURRENT_STREAMS` streams, every one
+/// of which buffers request and transfer data, so an unbounded
+/// `accept` loop lets a flood of sessions exhaust bridge memory.
+/// Acquiring a permit before `accept` leaves further sessions in the
+/// QUIC backlog rather than spawning tasks without limit.
+const MAX_CONCURRENT_SESSIONS: usize = 256;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "qftp-web-bridge",
@@ -159,13 +167,22 @@ async fn main() -> Result<()> {
         "qftp web bridge listening"
     );
 
+    // Bound concurrent WebTransport sessions. Acquiring the permit
+    // before `accept` means a saturated bridge leaves new sessions in
+    // the QUIC backlog instead of spawning tasks without limit.
+    let session_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS));
     loop {
+        let permit = Arc::clone(&session_limit)
+            .acquire_owned()
+            .await
+            .expect("session-limit semaphore is never closed");
         let incoming = endpoint.accept().await;
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
             if let Err(e) = handle_session(incoming, shared).await {
                 warn!(error = %e, "session ended with error");
             }
+            drop(permit);
         });
     }
 }
