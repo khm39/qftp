@@ -693,7 +693,13 @@ mod tests {
         let mut cwd = root.join("sub");
         fs::remove_dir_all(&cwd).unwrap();
         std::os::unix::fs::symlink(outside.path(), &cwd).unwrap();
-        let resp = handle_request(&Request::Ls { path: String::new() }, &mut cwd, &root);
+        let resp = handle_request(
+            &Request::Ls {
+                path: String::new(),
+            },
+            &mut cwd,
+            &root,
+        );
         match resp {
             Response::Err(e) => assert_eq!(e.code, ErrorCode::PermissionDenied),
             other => panic!("expected PermissionDenied (escape via cwd symlink), got {other:?}"),
@@ -710,7 +716,13 @@ mod tests {
             handle_request(&Request::Ls { path: "sub".into() }, &mut cwd, &root),
             Response::DirListing(_)
         ));
-        match handle_request(&Request::Ls { path: String::new() }, &mut cwd, &root) {
+        match handle_request(
+            &Request::Ls {
+                path: String::new(),
+            },
+            &mut cwd,
+            &root,
+        ) {
             Response::DirListing(entries) => assert!(!entries.is_empty()),
             other => panic!("expected DirListing for root, got {other:?}"),
         }
