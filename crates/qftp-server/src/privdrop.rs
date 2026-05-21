@@ -1,12 +1,13 @@
 //! OS user-id resolution and privilege-change capability checks for
 //! the `--user-isolation` mode (ADR 0002).
 //!
-//! This module is the *resolution* half of process isolation: it maps a
-//! `users.toml` entry to a concrete `(uid, gid)` and reports whether the
-//! running process is even allowed to switch credentials. The actual
-//! `setuid`/`setgid` drop performed by a per-connection worker lands
-//! with the dispatcher implementation; this module is what the
-//! `--check-isolation` preflight is built on.
+//! This module maps a `users.toml` entry to a concrete `(uid, gid)`
+//! ([`resolve`]), reports whether the running process is allowed to
+//! switch credentials ([`can_change_credentials`]), and performs the
+//! actual irreversible credential drop ([`drop_to`]). The
+//! `--check-isolation` preflight is built on the first two; the
+//! per-connection worker that calls [`drop_to`] lands with the
+//! dispatcher implementation.
 
 use std::ffi::CString;
 
@@ -176,6 +177,60 @@ fn getpwuid(uid: u32) -> Result<Option<(u32, u32)>> {
     }
 }
 
+/// Permanently drop this process's credentials to `ids`.
+///
+/// On success the process runs as `(uid, gid)` with no path back: a
+/// `setuid` issued while still privileged sets the real, effective
+/// **and** saved uid, so the privilege cannot be regained. The
+/// supplementary group list is reset to exactly `[gid]`.
+///
+/// Order matters — `setgroups` and `setgid` must run while still
+/// privileged, before `setuid` drops the privilege that permits them.
+/// The drop is verified before returning; if any check fails the
+/// caller must treat it as fatal and must not continue serving, since
+/// a partially-dropped worker could climb back to root.
+///
+/// Wired into the per-connection worker by the dispatcher increment
+/// of #62; kept separate so it can be unit-tested in isolation.
+#[allow(dead_code)]
+pub fn drop_to(ids: &ResolvedIds) -> Result<()> {
+    // 1. Supplementary groups: reset to exactly [gid].
+    let groups = [ids.gid];
+    if unsafe { libc::setgroups(1, groups.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("setgroups failed");
+    }
+    // 2. setgid before setuid: after setuid the gid can no longer be
+    //    changed. Called with euid 0 it sets real/effective/saved gid.
+    if unsafe { libc::setgid(ids.gid) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("setgid failed");
+    }
+    // 3. setuid drops the user privilege. Called with euid 0 it sets
+    //    real/effective/saved uid, so the drop is irreversible.
+    if unsafe { libc::setuid(ids.uid) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("setuid failed");
+    }
+    // 4. Verify. A worker that is still able to seteuid(0) must never
+    //    be allowed to serve traffic.
+    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    let (gid, egid) = unsafe { (libc::getgid(), libc::getegid()) };
+    if uid != ids.uid || euid != ids.uid {
+        anyhow::bail!(
+            "setuid verification failed: wanted uid {}, got real={uid} effective={euid}",
+            ids.uid
+        );
+    }
+    if gid != ids.gid || egid != ids.gid {
+        anyhow::bail!(
+            "setgid verification failed: wanted gid {}, got real={gid} effective={egid}",
+            ids.gid
+        );
+    }
+    if ids.uid != 0 && unsafe { libc::seteuid(0) } == 0 {
+        anyhow::bail!("privilege drop is reversible: seteuid(0) succeeded after setuid");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +300,79 @@ mod tests {
         // The result depends on how the test runner is privileged;
         // just assert the call completes and yields a bool.
         let _: bool = can_change_credentials();
+    }
+
+    /// The #62 headline guarantee: after `drop_to`, files the process
+    /// creates are owned by the target OS user. Forks a child, drops
+    /// it to the `daemon` account, has it create a file, and verifies
+    /// the file's owner from the still-root parent.
+    ///
+    /// Needs root to setuid at all, and a `daemon` account to drop to;
+    /// both hold in this repo's CI container. Skipped otherwise.
+    #[test]
+    fn drop_to_makes_created_files_owned_by_target_user() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping drop_to test: not running as root");
+            return;
+        }
+        let target = match resolve("daemon", None, None) {
+            Ok(ids) => ids,
+            Err(_) => {
+                eprintln!("skipping drop_to test: no 'daemon' OS account");
+                return;
+            }
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        // The dropped child needs to create a file inside the dir.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let file = dir.path().join("dropped.txt");
+        let cpath = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // CHILD: drop privileges and create the file with raw
+            // syscalls only, then `_exit`. No Rust-level exit, no
+            // allocation past the drop -- this is post-fork code in a
+            // (test-runner) multithreaded process.
+            if drop_to(&target).is_err() {
+                unsafe { libc::_exit(3) };
+            }
+            let fd = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o644 as libc::c_int,
+                )
+            };
+            if fd < 0 {
+                unsafe { libc::_exit(4) };
+            }
+            let buf = b"ok";
+            unsafe {
+                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len());
+                libc::close(fd);
+                libc::_exit(0);
+            }
+        }
+
+        // PARENT: reap the child and inspect the file it created.
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid failed");
+        let exited = libc::WIFEXITED(status);
+        let code = libc::WEXITSTATUS(status);
+        assert!(
+            exited && code == 0,
+            "child failed to drop+create (exited={exited}, code={code})"
+        );
+
+        let meta = std::fs::metadata(&file).expect("dropped file must exist");
+        assert_eq!(meta.uid(), target.uid, "file not owned by the target uid");
+        assert_eq!(meta.gid(), target.gid, "file not owned by the target gid");
     }
 }
