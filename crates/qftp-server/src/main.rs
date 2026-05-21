@@ -16,6 +16,8 @@ mod connection;
 mod handler;
 mod limits;
 mod metrics;
+#[cfg(unix)]
+mod privdrop;
 mod retry;
 mod server;
 mod user;
@@ -44,9 +46,9 @@ struct Args {
     root: String,
 
     // --- TLS ---
-    #[arg(long, required_unless_present_any = ["self_signed", "generate_completions"])]
+    #[arg(long, required_unless_present_any = ["self_signed", "generate_completions", "check_isolation"])]
     cert: Option<String>,
-    #[arg(long, required_unless_present_any = ["self_signed", "generate_completions"])]
+    #[arg(long, required_unless_present_any = ["self_signed", "generate_completions", "check_isolation"])]
     key: Option<String>,
     /// Generate a fresh self-signed certificate at startup. Development only.
     #[arg(long, default_value_t = false)]
@@ -72,6 +74,12 @@ struct Args {
     /// every connection is mapped to a single full-permission anonymous user.
     #[arg(long)]
     users: Option<PathBuf>,
+    /// Validate the `users.toml` -> OS account mapping for OS user
+    /// isolation (ADR 0002) and exit. Resolves every user's uid/gid and
+    /// reports whether the process can switch credentials -- the
+    /// isolation equivalent of `sshd -t`. Requires `--users`.
+    #[arg(long, default_value_t = false)]
+    check_isolation: bool,
 
     // --- Caps & rate limiting ---
     #[arg(long, default_value_t = 64)]
@@ -117,6 +125,10 @@ fn main() -> Result<()> {
         let bin = cmd.get_name().to_string();
         clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
         return Ok(());
+    }
+
+    if args.check_isolation {
+        return run_isolation_preflight(&args);
     }
 
     init_tracing(&args.log_format)?;
@@ -197,6 +209,98 @@ fn init_tracing(format: &str) -> Result<()> {
         other => anyhow::bail!("unknown log format: {other} (expected 'text' or 'json')"),
     }
     Ok(())
+}
+
+/// `--check-isolation`: resolve every `users.toml` entry to an OS
+/// `(uid, gid)` and report whether the process can switch credentials,
+/// then exit. This is a config preflight for OS user isolation
+/// (ADR 0002) — the per-connection setuid worker is not run here.
+#[cfg(unix)]
+fn run_isolation_preflight(args: &Args) -> Result<()> {
+    let users_path = args.users.as_ref().context(
+        "--check-isolation requires --users <FILE>: isolation maps each \
+         configured user to an OS account",
+    )?;
+    let text = fs::read_to_string(users_path)
+        .with_context(|| format!("failed to read users file: {}", users_path.display()))?;
+    let cfg: user::UserConfig = toml::from_str(&text)
+        .with_context(|| format!("failed to parse users file: {}", users_path.display()))?;
+
+    println!("qftp-server: --user-isolation preflight (ADR 0002)");
+    println!("  users file: {}", users_path.display());
+
+    let euid = unsafe { libc::geteuid() };
+    let can_switch = privdrop::can_change_credentials();
+    if can_switch {
+        println!("  credentials: OK -- euid {euid} can setuid/setgid");
+    } else {
+        println!(
+            "  credentials: MISSING -- euid {euid} lacks CAP_SETUID/CAP_SETGID; \
+             run as root or grant AmbientCapabilities=CAP_SETUID CAP_SETGID"
+        );
+    }
+    println!();
+
+    let mut specs: Vec<(&str, &user::UserSpec)> = Vec::new();
+    if let Some(anon) = &cfg.anonymous {
+        specs.push(("anonymous", anon));
+    }
+    for u in &cfg.users {
+        specs.push(("user", u));
+    }
+
+    let mut errors = 0usize;
+    for (label, spec) in &specs {
+        match privdrop::resolve(&spec.name, spec.uid, spec.gid) {
+            Ok(ids) => {
+                let uid_src = if ids.uid_explicit {
+                    "pinned"
+                } else {
+                    "getpwnam"
+                };
+                let gid_src = if ids.gid_explicit {
+                    "pinned"
+                } else {
+                    "primary group"
+                };
+                println!(
+                    "  [{label}] {} -> uid={} ({uid_src}), gid={} ({gid_src})",
+                    spec.name, ids.uid, ids.gid
+                );
+            }
+            Err(e) => {
+                errors += 1;
+                println!("  [{label}] {} -> ERROR: {e:#}", spec.name);
+            }
+        }
+    }
+    if cfg.anonymous.is_none() {
+        println!(
+            "  [note] no [anonymous] entry -- anonymous connections would have \
+             no OS mapping; add one with an explicit uid to isolate them"
+        );
+    }
+
+    println!();
+    if errors == 0 && can_switch {
+        println!("preflight: OK ({} user(s) checked)", specs.len());
+        Ok(())
+    } else {
+        let mut why: Vec<String> = Vec::new();
+        if errors > 0 {
+            why.push(format!("{errors} user(s) failed to resolve"));
+        }
+        if !can_switch {
+            why.push("process cannot switch credentials".to_string());
+        }
+        println!("preflight: FAILED -- {}", why.join("; "));
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(unix))]
+fn run_isolation_preflight(_args: &Args) -> Result<()> {
+    anyhow::bail!("--check-isolation is only supported on Unix/Linux (ADR 0002)")
 }
 
 /// Write a private-key PEM atomically with restrictive permissions.
