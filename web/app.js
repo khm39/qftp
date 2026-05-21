@@ -206,8 +206,23 @@ const CHUNK = 256 * 1024;
 class Qftp {
   constructor(wt) { this.wt = wt; }
 
-  static async connect(url) {
-    const wt = new WebTransport(url);
+  static async connect(url, certHash) {
+    try {
+      // A browser-trusted certificate connects without pinning.
+      return await Qftp._dial(url, null);
+    } catch (e) {
+      // Failing with an untrusted (self-signed) certificate is exactly
+      // when serverCertificateHashes pinning is needed. Retry with it.
+      if (certHash) return await Qftp._dial(url, certHash);
+      throw e;
+    }
+  }
+
+  static async _dial(url, certHash) {
+    const options = certHash
+      ? { serverCertificateHashes: [{ algorithm: "sha-256", value: certHash }] }
+      : undefined;
+    const wt = new WebTransport(url, options);
     await wt.ready;
     return new Qftp(wt);
   }
@@ -325,7 +340,38 @@ let qftp = null;
 let currentPath = "/";
 let connected = false;
 
+// Filled from the bridge's /config.json: the WebTransport port and,
+// for self-signed deployments, the leaf certificate hash to pin.
+let appConfig = { certHash: null, webtransportPort: 4433 };
+
 function $(id) { return document.getElementById(id); }
+
+/** Decode a lowercase hex string into a Uint8Array, or null if invalid. */
+function hexToBytes(hex) {
+  if (typeof hex !== "string" || hex.length === 0 || hex.length % 2 !== 0) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(byte)) return null;
+    out[i] = byte;
+  }
+  return out;
+}
+
+/** Load /config.json from the bridge; falls back to defaults on error. */
+async function loadConfig() {
+  try {
+    const resp = await fetch("/config.json", { cache: "no-store" });
+    if (!resp.ok) return;
+    const cfg = await resp.json();
+    if (typeof cfg.webtransportPort === "number") {
+      appConfig.webtransportPort = cfg.webtransportPort;
+    }
+    appConfig.certHash = hexToBytes(cfg.certHash);
+  } catch (_) {
+    // SPA served without the bridge (e.g. behind a CDN): use defaults.
+  }
+}
 
 function log(msg, kind) {
   const li = document.createElement("li");
@@ -384,7 +430,7 @@ async function doConnect() {
   el.connect.disabled = true;
   el.loginError.hidden = true;
   try {
-    qftp = await Qftp.connect(target);
+    qftp = await Qftp.connect(target, appConfig.certHash);
     onConnected();
   } catch (e) {
     showLoginError("Connection failed. Check the URL, token, and that the "
@@ -606,7 +652,7 @@ function wireUp() {
   });
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   for (const id of ["unsupported", "login", "browser", "conn-status", "url",
     "token", "connect", "login-error", "up", "path", "mkdir", "refresh",
     "disconnect", "dropzone", "filepick", "transfers", "rows", "empty-dir", "log"]) {
@@ -619,6 +665,8 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   el.login.hidden = false;
-  el.url.value = "https://" + (location.hostname || "localhost") + ":4433/";
+  await loadConfig();
+  el.url.value = "https://" + (location.hostname || "localhost")
+    + ":" + appConfig.webtransportPort + "/";
   wireUp();
 });

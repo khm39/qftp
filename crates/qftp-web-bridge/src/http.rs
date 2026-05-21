@@ -2,12 +2,14 @@
 //!
 //! WebTransport cannot deliver the initial HTML/JS/CSS, so the bridge
 //! exposes a tiny static file server for it. This handles only `GET`,
-//! serves a fixed set of embedded routes, never touches the
-//! filesystem, and closes the connection after every response -- it is
-//! deliberately not a general-purpose web server. Put a reverse proxy
-//! (nginx) in front of it for TLS termination in production.
+//! serves a fixed set of embedded routes plus a generated
+//! `/config.json`, never touches the filesystem, and closes the
+//! connection after every response -- it is deliberately not a
+//! general-purpose web server. Put a reverse proxy (nginx) in front of
+//! it for TLS termination in production.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,8 +48,11 @@ fn route(target: &str) -> Option<StaticFile> {
     }
 }
 
-/// Bind the SPA HTTP listener and serve it forever.
-pub async fn serve(bind: SocketAddr) -> Result<()> {
+/// Bind the SPA HTTP listener and serve it forever. `config_json` is
+/// the body returned for `/config.json` (the WebTransport port and the
+/// server-certificate hash the SPA needs).
+pub async fn serve(bind: SocketAddr, config_json: String) -> Result<()> {
+    let config_json: Arc<str> = Arc::from(config_json);
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind SPA HTTP listener on {bind}"))?;
@@ -61,15 +66,16 @@ pub async fn serve(bind: SocketAddr) -> Result<()> {
                 continue;
             }
         };
+        let config_json = Arc::clone(&config_json);
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(&mut sock).await {
+            if let Err(e) = handle_conn(&mut sock, &config_json).await {
                 tracing::debug!(error = %e, "SPA HTTP connection error");
             }
         });
     }
 }
 
-async fn handle_conn(sock: &mut TcpStream) -> Result<()> {
+async fn handle_conn(sock: &mut TcpStream, config_json: &str) -> Result<()> {
     let mut head = Vec::new();
     let mut tmp = [0u8; 1024];
     loop {
@@ -85,7 +91,7 @@ async fn handle_conn(sock: &mut TcpStream) -> Result<()> {
         anyhow::ensure!(head.len() <= MAX_HEAD_BYTES, "HTTP request head too large");
     }
     let text = String::from_utf8_lossy(&head);
-    let response = build_response(text.lines().next().unwrap_or(""));
+    let response = build_response(text.lines().next().unwrap_or(""), config_json);
     sock.write_all(&response)
         .await
         .context("HTTP write failed")?;
@@ -98,7 +104,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Build a complete HTTP/1.1 response for one request line.
-fn build_response(request_line: &str) -> Vec<u8> {
+fn build_response(request_line: &str, config_json: &str) -> Vec<u8> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -109,6 +115,14 @@ fn build_response(request_line: &str) -> Vec<u8> {
             "Method Not Allowed",
             "text/plain; charset=utf-8",
             b"qftp web bridge: only GET is supported\n",
+        );
+    }
+    if target.split('?').next() == Some("/config.json") {
+        return http_response(
+            200,
+            "OK",
+            "application/json; charset=utf-8",
+            config_json.as_bytes(),
         );
     }
     match route(target) {
@@ -140,6 +154,8 @@ fn http_response(status: u16, reason: &str, content_type: &str, body: &[u8]) -> 
 mod tests {
     use super::*;
 
+    const CFG: &str = "{\"certHash\":\"abcd\",\"webtransportPort\":4433}";
+
     fn head_of(resp: &[u8]) -> String {
         let text = String::from_utf8_lossy(resp);
         text.split("\r\n\r\n").next().unwrap_or("").to_string()
@@ -147,7 +163,7 @@ mod tests {
 
     #[test]
     fn serves_index_at_root() {
-        let resp = build_response("GET / HTTP/1.1");
+        let resp = build_response("GET / HTTP/1.1", CFG);
         let head = head_of(&resp);
         assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
         assert!(head.contains("text/html"), "{head}");
@@ -155,23 +171,35 @@ mod tests {
 
     #[test]
     fn serves_app_js_with_query_string() {
-        let resp = build_response("GET /app.js?v=2 HTTP/1.1");
+        let resp = build_response("GET /app.js?v=2 HTTP/1.1", CFG);
         assert!(head_of(&resp).contains("text/javascript"));
     }
 
     #[test]
+    fn serves_config_json() {
+        let resp = build_response("GET /config.json HTTP/1.1", CFG);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK"));
+        assert!(text.contains("application/json"));
+        assert!(
+            text.ends_with(CFG),
+            "config body should be the JSON verbatim"
+        );
+    }
+
+    #[test]
     fn unknown_path_is_404() {
-        assert!(head_of(&build_response("GET /secret HTTP/1.1")).starts_with("HTTP/1.1 404"));
+        assert!(head_of(&build_response("GET /secret HTTP/1.1", CFG)).starts_with("HTTP/1.1 404"));
     }
 
     #[test]
     fn non_get_is_405() {
-        assert!(head_of(&build_response("POST / HTTP/1.1")).starts_with("HTTP/1.1 405"));
+        assert!(head_of(&build_response("POST / HTTP/1.1", CFG)).starts_with("HTTP/1.1 405"));
     }
 
     #[test]
     fn content_length_matches_body() {
-        let resp = build_response("GET /style.css HTTP/1.1");
+        let resp = build_response("GET /style.css HTTP/1.1", CFG);
         let body_len = resp.len() - head_of(&resp).len() - 4;
         let head = head_of(&resp);
         let declared: usize = head

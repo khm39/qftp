@@ -46,10 +46,22 @@ WebTransport is required: Chrome / Edge 97+ and Firefox 124+. **Safari
 does not support WebTransport** and the SPA shows an explanatory
 message there.
 
-WebTransport also requires the server certificate to be trusted by the
-browser. Use a publicly trusted certificate (or one trusted by your
-organisation's PKI). Pinning a self-signed certificate via
-`serverCertificateHashes` is a planned follow-up.
+## Certificates
+
+WebTransport will not connect to a certificate the browser does not
+trust. The bridge supports two modes and the SPA picks automatically:
+
+- **Browser-trusted certificate** -- publicly trusted, or trusted by
+  your organisation's PKI. The SPA connects normally. This is the
+  recommended setup for any internet-facing deployment.
+- **Self-signed certificate** -- the bridge publishes its leaf
+  certificate's SHA-256 hash at `GET /config.json`. If the normal
+  connect fails, the SPA retries it pinning that hash through the
+  WebTransport `serverCertificateHashes` option. This makes LAN and
+  home-server deployments work without a CA, but only for certificates
+  that satisfy the W3C constraints -- an **ECDSA P-256** key and a
+  validity period of **at most two weeks** -- and `serverCertificateHashes`
+  is primarily a Chrome / Edge feature.
 
 ## Authentication
 

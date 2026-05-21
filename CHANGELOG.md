@@ -17,7 +17,10 @@ is what we will bump to signal an intentional wire break.
   same BLAKE3-trailer wire format as the native protocol. It also
   ships a single-page web app -- browse, drag-and-drop upload,
   download, delete, rename, with progress bars -- served over a
-  built-in HTTP listener (`--http-bind`). The transport-independent
+  built-in HTTP listener (`--http-bind`). Self-signed certificates
+  work via WebTransport `serverCertificateHashes` pinning: the bridge
+  publishes its leaf-cert hash at `/config.json` and the SPA pins it.
+  The transport-independent
   request handling, ACLs, and user directory were extracted into a new
   `qftp-protocol` library crate shared by the server and the bridge.
   The bridge uses `wtransport` (quinn); `qftp-server` / `qftp-client`

@@ -160,6 +160,20 @@ fn write_file(path: &Path, contents: &str) {
     f.write_all(contents.as_bytes()).unwrap();
 }
 
+/// Issue one HTTP/1.1 GET against the SPA listener and return the
+/// whole response (head + body).
+async fn http_get(port: u16, path: &str) -> String {
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect SPA http port");
+    sock.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    sock.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn end_to_end_webtransport() {
     let dir = tempfile::tempdir().unwrap();
@@ -232,7 +246,7 @@ async fn end_to_end_webtransport() {
 
     let client_config = ClientConfig::builder()
         .with_bind_address("127.0.0.1:0".parse().unwrap())
-        .with_server_certificate_hashes([cert_hash])
+        .with_server_certificate_hashes([cert_hash.clone()])
         .build();
     let endpoint = Endpoint::client(client_config).expect("client endpoint");
 
@@ -381,17 +395,28 @@ async fn end_to_end_webtransport() {
     );
 
     // The SPA HTTP listener serves the bundled page.
-    let mut http = tokio::net::TcpStream::connect(("127.0.0.1", http_port))
-        .await
-        .expect("connect SPA http port");
-    http.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-        .await
-        .unwrap();
-    let mut page = Vec::new();
-    http.read_to_end(&mut page).await.unwrap();
-    let page = String::from_utf8_lossy(&page);
+    let page = http_get(http_port, "/").await;
     assert!(page.starts_with("HTTP/1.1 200 OK"), "SPA http status");
     assert!(page.contains("<!doctype html>"), "SPA http body");
+
+    // /config.json advertises the WebTransport port and the leaf
+    // certificate hash the SPA pins for self-signed deployments.
+    let cfg = http_get(http_port, "/config.json").await;
+    assert!(cfg.starts_with("HTTP/1.1 200 OK"), "config.json status");
+    assert!(cfg.contains("application/json"), "config.json content type");
+    let expected_hash: String = cert_hash
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(
+        cfg.contains(&format!("\"certHash\":\"{expected_hash}\"")),
+        "config.json must advertise the leaf cert hash, got: {cfg}"
+    );
+    assert!(
+        cfg.contains(&format!("\"webtransportPort\":{wt_port}")),
+        "config.json must advertise the WebTransport port"
+    );
 
     drop(alice);
     drop(bob);

@@ -116,6 +116,20 @@ async fn main() -> Result<()> {
         .await
         .context("failed to load TLS certificate/key")?;
 
+    // The SPA needs the leaf certificate's SHA-256 hash so it can pin a
+    // self-signed certificate via WebTransport `serverCertificateHashes`
+    // when the cert is not browser-trusted. The hash is not secret.
+    let cert_hash_hex: String = identity.certificate_chain().as_slice()[0]
+        .hash()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let config_json = format!(
+        "{{\"certHash\":\"{cert_hash_hex}\",\"webtransportPort\":{}}}",
+        args.bind.port()
+    );
+
     let config = ServerConfig::builder()
         .with_bind_address(args.bind)
         .with_identity(identity)
@@ -128,7 +142,7 @@ async fn main() -> Result<()> {
     // Serve the bundled SPA over plain HTTP on a separate task.
     let http_bind = args.http_bind;
     tokio::spawn(async move {
-        if let Err(e) = http::serve(http_bind).await {
+        if let Err(e) = http::serve(http_bind, config_json).await {
             warn!(error = %e, "SPA HTTP listener stopped");
         }
     });
