@@ -200,6 +200,12 @@ fn run_handler(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
     // can't go through the generic handler (which never sees the
     // deleted file's size). Everything else is plain handle_request.
     if let Request::Rm { path } = req {
+        if handler::is_upload_temp(path) {
+            return err(
+                ErrorCode::PermissionDenied,
+                "cannot remove a server-internal upload temp file",
+            );
+        }
         match handler::resolve(cwd, &user.home, path) {
             Ok(target) => {
                 // Parent-dir symlink TOCTOU re-check.

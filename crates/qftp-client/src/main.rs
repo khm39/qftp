@@ -761,10 +761,25 @@ fn run_one_line(
                         local_size,
                     );
                     let stream_id = take_stream(next_stream_id);
-                    if let Err(e) = transfer::do_put(
+                    match transfer::do_put(
                         conn, socket, poll, events, stream_id, &path, &target, offset, false,
                     ) {
-                        println!("put {} failed: {e}", path.display());
+                        Ok(()) => {}
+                        Err(e)
+                            if offset > 0
+                                && e.downcast_ref::<transfer::StalePartial>().is_some() =>
+                        {
+                            println!(
+                                "put {target}: server partial is stale, re-uploading from scratch"
+                            );
+                            let sid = take_stream(next_stream_id);
+                            if let Err(e2) = transfer::do_put(
+                                conn, socket, poll, events, sid, &path, &target, 0, false,
+                            ) {
+                                println!("put {} failed: {e2}", path.display());
+                            }
+                        }
+                        Err(e) => println!("put {} failed: {e}", path.display()),
                     }
                 }
             }

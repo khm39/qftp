@@ -7,7 +7,7 @@
 //! from it.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -221,15 +221,28 @@ impl Drop for StreamState {
             completed,
             remaining,
             reserved_bytes,
+            prior_bytes,
+            writer,
+            temp_path,
             owner,
             ..
         } = self
         {
             if !*completed {
-                let written = reserved_bytes.saturating_sub(*remaining);
                 owner
                     .in_flight_bytes
                     .fetch_sub(*reserved_bytes, Ordering::Relaxed);
+                // Flush the buffered writer, then charge the bytes
+                // actually on disk this session -- the file size minus
+                // the prefix a prior session already counted. Counting
+                // the real file rather than the logical write_all total
+                // keeps `used_bytes` correct even if a buffered write
+                // never reached disk.
+                let _ = writer.flush();
+                let written = match std::fs::metadata(&*temp_path) {
+                    Ok(m) => m.len().saturating_sub(*prior_bytes),
+                    Err(_) => reserved_bytes.saturating_sub(*remaining),
+                };
                 if written > 0 {
                     owner.used_bytes.fetch_add(written, Ordering::Relaxed);
                 }
@@ -263,7 +276,12 @@ mod tests {
         remaining: u64,
         completed: bool,
     ) -> StreamState {
-        let f = File::create(&temp).unwrap();
+        let mut f = File::create(&temp).unwrap();
+        // Put `reserved - remaining` bytes on disk so the Drop impl's
+        // metadata-based accounting sees what the test simulates as
+        // "received this session".
+        let received = reserved.saturating_sub(remaining);
+        f.write_all(&vec![0u8; received as usize]).unwrap();
         let claim = UploadClaim::try_claim(Arc::clone(&user), temp.clone()).unwrap();
         StreamState::ReadingFileData {
             final_path: temp.with_extension("final"),

@@ -593,10 +593,34 @@ fn do_put_inner(
             crate::stats::record_upload(bytes_to_send);
             Ok(())
         }
-        Response::Err(e) => bail!("server refused Put: {} ({:?})", e.message, e.code),
+        Response::Err(e) => {
+            if offset > 0 && e.code == ErrorCode::ChecksumMismatch {
+                // A resumed upload failed verification: the server-side
+                // partial no longer matches the local file. The server
+                // discards the bad partial, so signal the caller to
+                // retry the whole upload from scratch.
+                return Err(anyhow::Error::new(StalePartial));
+            }
+            bail!("server refused Put: {} ({:?})", e.message, e.code)
+        }
         other => bail!("unexpected response to Put: {other:?}"),
     }
 }
+
+/// Error returned by [`do_put`] when a *resumed* upload (`offset > 0`)
+/// was refused with `ChecksumMismatch` -- the server-side partial no
+/// longer matches the local file. The server discards the stale
+/// partial, so the caller should retry the upload from `offset = 0`.
+#[derive(Debug)]
+pub struct StalePartial;
+
+impl std::fmt::Display for StalePartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server-side partial upload is stale; retry from scratch")
+    }
+}
+
+impl std::error::Error for StalePartial {}
 
 /// Probe the server for a resumable partial upload of `remote`.
 ///
