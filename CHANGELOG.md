@@ -10,6 +10,16 @@ is what we will bump to signal an intentional wire break.
 
 ### Added
 
+- **Working upload resume.** An interrupted `put` now leaves a
+  deterministically named `<name>.qftp.partial` on the server; the
+  next `put` of the same file probes that temp with `Stat` and resumes
+  from where it stopped, mirroring `get`'s download resume. Previously
+  the random temp-file suffix made the server-side resume path
+  unreachable, so `offset > 0` was rejected outright. The bytes in an
+  aborted upload's partial are charged to the user's quota until the
+  partial is resumed or replaced, so an abort loop can't bypass the
+  limit.
+
 - **WebTransport bridge (`qftp-web-bridge`).** A new standalone binary
   that serves qftp to browsers over WebTransport (HTTP/3). It runs
   alongside `qftp-server` (same `--root` and `users.toml`), carries

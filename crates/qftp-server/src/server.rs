@@ -1364,25 +1364,13 @@ fn start_put(
             ),
         );
     }
-    // Resume (offset > 0) is not supported. `temp_path_for` mints a
-    // fresh random suffix on every call, so a resume can never locate
-    // the prior session's `.partial` -- the old code path always failed
-    // deep inside with `InvalidRange`. A deterministic temp name would
-    // make resume work but would reintroduce the upload-blocking
-    // file-planting DoS the random suffix exists to prevent, so we
-    // reject here instead, matching the web bridge's behaviour.
-    if offset > 0 {
-        return send_err(
-            ctx,
-            ErrorCode::Unsupported,
-            "upload resume (offset > 0) is not supported".to_string(),
-        );
-    }
-    // Quota pre-check + in-flight reservation. The cache
-    // `used_bytes` and `in_flight_bytes` is kept up to date by Put
+    // Quota pre-check + in-flight reservation. `size` is the count of
+    // body bytes the client is about to send -- already post-offset --
+    // so it is exactly what this upload adds to storage. The cache
+    // (`used_bytes` / `in_flight_bytes`) is kept up to date by Put
     // commit/abort and Rm. Reserve atomically so two concurrent
     // Puts can't both pass the check and overshoot the limit.
-    let new_bytes = size.saturating_sub(offset);
+    let new_bytes = size;
     if let Some(limit) = ctx.user.quota_bytes {
         let used = ctx.user.used_bytes.load(Ordering::Relaxed);
         let in_flight = ctx.user.in_flight_bytes.load(Ordering::Relaxed);
@@ -1435,22 +1423,81 @@ fn start_put(
             format!("path already exists (no_clobber): {path}"),
         );
     }
-    let temp_path = temp_path_for(&final_path, stream_id);
+    let temp_path = temp_path_for(&final_path);
 
-    // Fresh upload: create a new temp file. Resume (offset > 0) was
-    // rejected above, so this is the only case.
-    let f = match open_temp_no_follow(&temp_path) {
-        Ok(f) => f,
-        Err(e) => {
+    // Open the deterministically named resumable temp file.
+    //   * Fresh upload (offset == 0): create-or-reuse. A leftover
+    //     partial from an earlier aborted upload is truncated and
+    //     reused; its bytes were charged to `used_bytes` on that
+    //     abort, so refund them first.
+    //   * Resume (offset > 0): the temp must already exist and hold
+    //     exactly `offset` bytes; re-hash that prefix so the BLAKE3
+    //     trailer check still covers the whole file.
+    let (file, hasher) = if offset == 0 {
+        let f = match open_temp(&temp_path, false) {
+            Ok(f) => f,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to create upload temp file: {e}"),
+                );
+            }
+        };
+        let stale = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if stale > 0 {
+            ctx.user
+                .used_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                    Some(u.saturating_sub(stale))
+                })
+                .ok();
+            if let Err(e) = f.set_len(0) {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to truncate stale upload temp file: {e}"),
+                );
+            }
+        }
+        (f, blake3::Hasher::new())
+    } else {
+        let mut f = match open_temp(&temp_path, true) {
+            Ok(f) => f,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    ErrorCode::InvalidRange,
+                    format!("no resumable partial upload to continue: {e}"),
+                );
+            }
+        };
+        let have = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        if have != offset {
             return send_err(
                 ctx,
-                io_code(&e),
-                format!("Failed to create upload temp file: {e}"),
+                ErrorCode::InvalidRange,
+                format!("resume offset {offset} does not match partial length {have}"),
             );
         }
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+        let mut left = offset;
+        while left > 0 {
+            let want = (left as usize).min(buf.len());
+            if let Err(e) = f.read_exact(&mut buf[..want]) {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to re-hash partial upload: {e}"),
+                );
+            }
+            hasher.update(&buf[..want]);
+            left -= want as u64;
+        }
+        (f, hasher)
     };
-    let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, f);
-    let hasher = blake3::Hasher::new();
+    let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, file);
 
     // The reservation is now owned by `ReadingFileData`'s Drop (via
     // `reserved_bytes`); disarm the guard so the bytes aren't released
@@ -1640,11 +1687,10 @@ fn drive_put(
                 format!("Failed to flush file: {e}"),
             )));
         }
-        // Verify checksum before rename. If it mismatches we leave the
-        // temp in place for the Drop impl to clean up and refuse the
-        // upload -- never reveal a corrupted body at `final_path`.
-        // Trailer takes precedence over the legacy header checksum
-        // when both are present (defensive; client shouldn't set both).
+        // Verify checksum before rename -- never reveal a corrupted
+        // body at `final_path`. Trailer takes precedence over the
+        // legacy header checksum when both are present (defensive;
+        // client shouldn't set both).
         let expected: Option<[u8; 32]> = trailer_buf
             .as_ref()
             .filter(|b| b.is_full())
@@ -1653,6 +1699,17 @@ fn drive_put(
         if let Some(expected) = expected {
             let got = *hasher.finalize().as_bytes();
             if got != expected {
+                // The bytes on disk are known-corrupt; a resume would
+                // re-hash the same temp and fail forever. Remove it so
+                // the next upload starts fresh (mirrors `do_get`
+                // deleting a corrupt download). Settle the reservation
+                // and mark the stream done so the abort path in
+                // `StreamState`'s Drop doesn't also account for it.
+                let _ = fs::remove_file(temp_path);
+                owner
+                    .in_flight_bytes
+                    .fetch_sub(*reserved_bytes, Ordering::Relaxed);
+                *completed = true;
                 return Ok(Some(err(
                     ErrorCode::ChecksumMismatch,
                     "Upload checksum verification failed",
@@ -1703,43 +1760,49 @@ fn apply_mode(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 fn apply_mode(_path: &Path, _mode: u32) {}
 
-fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
+/// Open the resumable Put temp file at `path`.
+///
+/// `resume == false` (fresh upload): the file is created if absent and
+/// opened read+write; the caller truncates it after refunding any stale
+/// partial's bytes. `resume == true`: the file must already exist and
+/// be a regular file; it is opened read+write without `O_CREAT` so a
+/// vanished partial fails cleanly rather than starting a blank upload.
+///
+/// `O_NOFOLLOW` is set in both cases so a symlink planted at the
+/// predictable temp path can never redirect the open. The 0o600 create
+/// mode keeps an in-progress partial unreadable by other local users
+/// (daemon umask, typically 0o022, would otherwise land it at 0o644).
+fn open_temp(path: &Path, resume: bool) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    // 0o600 + O_NOFOLLOW so the in-flight `.qftp.partial.*` file
-    // is never readable by other local users on a multi-user host.
-    // Without the explicit mode, daemon umask (typically 0o022)
-    // would land the file at 0o644 = world-readable until
-    // apply_mode runs on the renamed final_path.
-    qftp_common::fs_safe::apply_owner_only_no_follow(&mut opts).open(path)
+    opts.read(true).write(true);
+    if resume {
+        qftp_common::fs_safe::require_regular_file(path)?;
+        qftp_common::fs_safe::apply_no_follow(&mut opts);
+    } else {
+        opts.create(true);
+        qftp_common::fs_safe::apply_owner_only_no_follow(&mut opts);
+    }
+    opts.open(path)
 }
 
-fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
-    // Append 8 bytes (16 hex chars) of cryptographic randomness
-    // to the temp name so a colluding user on the same writable
-    // directory can't plant a regular file at the predicted path
-    // and block legitimate uploads. The pid + stream_id form is
-    // kept for diagnostic value; the random suffix is what
-    // collapses the planting attack to ~2^64.
-    let mut rand_bytes = [0u8; 8];
-    use ring::rand::SecureRandom as _;
-    // A swallowed RNG failure here would leave an all-zero suffix and
-    // defeat the anti-planting defense above, so fail loudly instead.
-    ring::rand::SystemRandom::new()
-        .fill(&mut rand_bytes)
-        .expect("system RNG failed");
-    let suffix = qftp_common::util::to_hex(&rand_bytes);
-
+/// Compose the deterministic resumable-upload temp path for
+/// `final_path`: `<dir>/<filename>.qftp.partial`.
+///
+/// The name is intentionally predictable. An interrupted upload leaves
+/// its partial here, and a later session resumes it by sending an
+/// `offset`; the server has only the destination path to reconstruct
+/// the temp name from, so it cannot depend on a random suffix.
+///
+/// The anti-planting defence therefore moved from the name to the open
+/// mode (see [`open_temp`]): a fresh Put truncates and reuses whatever
+/// regular file sits at this path, and `O_NOFOLLOW` rejects a planted
+/// symlink.
+fn temp_path_for(final_path: &Path) -> PathBuf {
     let mut name = final_path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
-    name.push(format!(
-        ".qftp.partial.{}.{}.{}",
-        std::process::id(),
-        stream_id,
-        suffix,
-    ));
+    name.push(".qftp.partial");
     final_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -1818,9 +1881,37 @@ mod tests {
         // Force a permissive umask so the bug would be observable
         // without the explicit mode call.
         let _restore = UmaskGuard(unsafe { libc::umask(0o000) });
-        let f = open_temp_no_follow(&path).expect("temp create");
+        let f = open_temp(&path, false).expect("temp create");
         drop(f);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "temp file mode was {mode:o}, expected 0o600");
+    }
+
+    #[test]
+    fn temp_path_for_is_deterministic_and_a_sibling() {
+        // Resume relies on the same destination always mapping to the
+        // same partial path, so two calls must agree.
+        let target = Path::new("/srv/data/report.bin");
+        let a = temp_path_for(target);
+        let b = temp_path_for(target);
+        assert_eq!(a, b, "temp_path_for must be deterministic for resume");
+        assert_eq!(a.parent(), target.parent());
+        assert_eq!(
+            a.file_name().unwrap().to_str().unwrap(),
+            "report.bin.qftp.partial"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_temp_resume_requires_an_existing_partial() {
+        // A resume open must fail when there is no partial to continue
+        // rather than silently creating a blank one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.partial");
+        assert!(open_temp(&path, true).is_err());
+        // A fresh open creates it; a following resume open then works.
+        drop(open_temp(&path, false).expect("fresh open"));
+        assert!(open_temp(&path, true).is_ok());
     }
 }

@@ -742,14 +742,27 @@ fn run_one_line(
                 }
             } else {
                 for path in locals {
-                    let stream_id = take_stream(next_stream_id);
                     let target = remote.clone().unwrap_or_else(|| {
                         path.file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "uploaded".to_string())
                     });
+                    // Auto-resume an interrupted upload, mirroring the
+                    // way `get` resumes from a partial local file.
+                    let local_size =
+                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let offset = transfer::probe_put_resume_offset(
+                        conn,
+                        socket,
+                        poll,
+                        events,
+                        next_stream_id,
+                        &target,
+                        local_size,
+                    );
+                    let stream_id = take_stream(next_stream_id);
                     if let Err(e) = transfer::do_put(
-                        conn, socket, poll, events, stream_id, &path, &target, 0, false,
+                        conn, socket, poll, events, stream_id, &path, &target, offset, false,
                     ) {
                         println!("put {} failed: {e}", path.display());
                     }

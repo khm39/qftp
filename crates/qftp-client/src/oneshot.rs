@@ -512,6 +512,18 @@ fn run_put(
                 println!("would upload: {local} -> {dest}");
                 continue;
             }
+            // Auto-resume an interrupted upload unless --force asked
+            // for a clean re-send. Mirrors `get`'s resume behaviour.
+            let local_size = std::fs::metadata(&local_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let offset = if matches!(clobber, ClobberPolicy::Force) {
+                0
+            } else {
+                transfer::probe_put_resume_offset(
+                    conn, socket, poll, events, next, &dest, local_size,
+                )
+            };
             let stream_id = take_stream(next);
             match transfer::do_put(
                 conn,
@@ -521,7 +533,7 @@ fn run_put(
                 stream_id,
                 &local_path,
                 &dest,
-                0,
+                offset,
                 effective_no_clobber,
             ) {
                 Ok(()) => {}

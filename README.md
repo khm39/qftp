@@ -25,8 +25,8 @@ Pre-1.0, but functionally complete for the supported feature set:
 - Streaming upload and download (BufReader / BufWriter; the server's
   peak RAM use does not scale with file size).
 - Resume for both directions. Get auto-resumes from the local file's
-  current length; Put can specify an offset against the server's
-  `.qftp.partial` temp.
+  current length; Put auto-resumes by probing the server's
+  `<name>.qftp.partial` temp and continuing from where it stopped.
 - BLAKE3 integrity. The server emits a 32-byte trailer after Get
   bodies; the client computes the matching hash and refuses to keep a
   corrupted local file. For Put, the client commits to a BLAKE3 in the

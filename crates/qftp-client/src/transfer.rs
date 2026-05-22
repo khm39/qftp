@@ -597,6 +597,34 @@ fn do_put_inner(
     }
 }
 
+/// Probe the server for a resumable partial upload of `remote`.
+///
+/// An interrupted upload leaves a deterministically named
+/// `<remote>.qftp.partial` temp on the server (see the native server's
+/// `temp_path_for`). A `Stat` on that path reports how many bytes
+/// already landed, which is the offset a resume continues from.
+/// Returns `0` — a fresh upload — for any of: no partial, a partial
+/// that is empty or larger than the local file, or a probe error. An
+/// older server (whose partials carried a random suffix) simply
+/// answers `NotFound`, so this degrades cleanly to a fresh upload.
+pub fn probe_put_resume_offset(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next_stream_id: &mut u64,
+    remote: &str,
+    local_size: u64,
+) -> u64 {
+    let req = Request::Stat {
+        path: format!("{remote}.qftp.partial"),
+    };
+    match crate::proto::request_response(conn, socket, poll, events, next_stream_id, &req) {
+        Ok(Response::FileStat(s)) if !s.is_dir && s.size > 0 && s.size <= local_size => s.size,
+        _ => 0,
+    }
+}
+
 #[cfg(unix)]
 fn unix_mode(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;

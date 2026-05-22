@@ -132,32 +132,115 @@ pub enum StreamState {
 
 impl Drop for StreamState {
     fn drop(&mut self) {
+        // An aborted upload leaves its `.qftp.partial` temp on disk on
+        // purpose: a later session resumes it by sending an `offset`.
+        // To keep that from becoming a quota bypass, the bytes already
+        // written this session are moved out of the in-flight
+        // reservation and into `used_bytes`, so they keep counting
+        // against the user's quota until the partial is either resumed
+        // (the resume's commit accounts for the whole file) or
+        // truncated by a fresh Put to the same path (which refunds
+        // them — see `server::start_put`).
+        //
+        // This runs on every abort path — explicit StreamState::Done
+        // replacement, connection drop, or panic unwind.
         if let StreamState::ReadingFileData {
-            temp_path,
             completed,
+            remaining,
             reserved_bytes,
             owner,
             ..
         } = self
         {
             if !*completed {
-                // Release the in-flight reservation so the
-                // user's quota can recover. This runs on every abort
-                // path — explicit StreamState::Done replacement,
-                // connection drop, or panic unwind.
+                let written = reserved_bytes.saturating_sub(*remaining);
                 owner
                     .in_flight_bytes
                     .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-                if let Err(e) = std::fs::remove_file(&temp_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(
-                            path = %temp_path.display(),
-                            error = %e,
-                            "failed to clean up partial upload"
-                        );
-                    }
+                if written > 0 {
+                    owner.used_bytes.fetch_add(written, Ordering::Relaxed);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::user::{Permissions, User};
+    use std::sync::atomic::AtomicU64;
+
+    fn test_user() -> Arc<User> {
+        Arc::new(User {
+            name: "t".to_string(),
+            home: PathBuf::from("/tmp"),
+            permissions: Permissions::full(),
+            quota_bytes: Some(1_000_000),
+            used_bytes: AtomicU64::new(0),
+            in_flight_bytes: AtomicU64::new(0),
+        })
+    }
+
+    fn reading_state(
+        user: Arc<User>,
+        temp: PathBuf,
+        reserved: u64,
+        remaining: u64,
+        completed: bool,
+    ) -> StreamState {
+        let f = File::create(&temp).unwrap();
+        StreamState::ReadingFileData {
+            final_path: temp.with_extension("final"),
+            temp_path: temp,
+            writer: BufWriter::new(f),
+            remaining,
+            mode: 0o644,
+            completed,
+            hasher: blake3::Hasher::new(),
+            expected_checksum: None,
+            trailer_buf: None,
+            reserved_bytes: reserved,
+            owner: user,
+        }
+    }
+
+    #[test]
+    fn abort_moves_written_bytes_into_used() {
+        // An interrupted upload must not silently drop the bytes it
+        // already wrote: they stay charged against the user's quota
+        // (in `used_bytes`) so an abort loop can't bypass the limit.
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        user.in_flight_bytes.fetch_add(1000, Ordering::Relaxed);
+        // Declared 1000 new bytes, 600 received (remaining 400), abort.
+        let state = reading_state(Arc::clone(&user), dir.path().join("f"), 1000, 400, false);
+        drop(state);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 600);
+    }
+
+    #[test]
+    fn abort_before_any_bytes_only_releases_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        user.in_flight_bytes.fetch_add(1000, Ordering::Relaxed);
+        let state = reading_state(Arc::clone(&user), dir.path().join("f"), 1000, 1000, false);
+        drop(state);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn completed_upload_drop_is_a_noop() {
+        // The commit path already settled the counters; Drop must not
+        // touch them again when `completed` is set.
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        user.in_flight_bytes.fetch_add(1000, Ordering::Relaxed);
+        let state = reading_state(Arc::clone(&user), dir.path().join("f"), 1000, 0, true);
+        drop(state);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 1000);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
     }
 }
