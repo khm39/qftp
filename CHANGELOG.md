@@ -121,6 +121,46 @@ is what we will bump to signal an intentional wire break.
   `InvalidRange`, but the client only treated `ChecksumMismatch` as a
   stale partial, so the upload hard-failed instead of restarting from
   scratch. Both codes now trigger the retry-from-zero path. (#181)
+- **Recursive `get` and `sync` bound their server-driven walk.** A
+  malicious server returning the same sub-directory name on every `Ls`
+  drove the client to recurse without limit; both walks now stop with
+  a clear error after 10,000 directories. (#182)
+- **The Put commit re-checks for symlinked parents.** The final
+  `rename` of an uploaded temp into place ran with no ancestor symlink
+  re-check, so a parent directory swapped to a symlink during a long
+  upload could redirect the file outside the user's home. (#183)
+- **Server-supplied strings are sanitized before terminal display.**
+  Directory names, paths, and error messages from the server are
+  stripped of control characters, closing an ANSI/OSC terminal-escape
+  injection vector. (#184)
+- **Browser auth tokens are percent-decoded.** The SPA form-encodes the
+  token into the URL, but the bridge compared the raw encoded slice, so
+  any token with `+`, `/` or `=` failed every web login. (#185)
+- **`sync` fails loudly on an incomplete remote walk.** A per-directory
+  `Ls` failure was swallowed and `sync` reported success on a silently
+  partial mirror; such a failure now aborts with a non-zero exit. (#186)
+- **`--bwlimit` no longer stalls the QUIC connection.** The pacer's
+  blocking sleep left the connection unserviced long enough for the
+  idle timer to fire; the throttle wait is now spent in short slices
+  that keep servicing the connection. (#187)
+- **Resumed uploads require an integrity checksum.** A resumed `put`
+  with neither a BLAKE3 trailer nor a header checksum committed its
+  on-disk prefix unverified; such a resume is now refused up front.
+  (#188)
+- **Browser downloads always verify the integrity trailer.** The SPA
+  skipped verification when the server cleared `checksum_follows`; it
+  now requires the trailer it always asks for. (#189)
+- **CI runs the in-browser BLAKE3 test.** `web/blake3.test.js`, which
+  pins the hand-written `web/blake3.js` against the Rust crate, is now
+  executed by CI so a regression cannot ship green. (#190)
+- **`Put` / `Get` reject `*.qftp.partial` paths.** A client could
+  `Put` to a server-internal upload temp name, producing a file hidden
+  from `Ls`, un-deletable, and swept after 24h; both ops now reject
+  such paths. (#191)
+- **The `connections_open` metrics gauge no longer leaks.** A
+  duplicate accept (a retransmitted Initial deriving the same SCID)
+  incremented the gauge without a matching decrement; the counters are
+  now bumped only for a connection that is actually retained. (#192)
 
 ### Security
 

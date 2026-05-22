@@ -662,17 +662,22 @@ fn try_accept(
     // mTLS identity isn't ready until the handshake completes; start the
     // connection as the anonymous user and upgrade later if we can.
     let ctx = ConnectionContext::new(conn, from, ax.users.anonymous(), scid.clone());
-    info!(peer = %from, "connection accepted");
-    ax.metrics.inc_connections_total();
-    ax.metrics.inc_connections_open();
 
     // If a previous Initial from this peer already created the slot
     // (the deterministic SCID collapses retransmits onto the same key),
-    // just drop the duplicate accept.
+    // just drop the duplicate accept. The connection counters are
+    // bumped only *after* this check so a retransmitted Initial that
+    // derives the same SCID doesn't leak a `connections_open` gauge
+    // unit for a `ConnectionContext` that is dropped here and never
+    // enters the `connections` map (so the reap sweep, which calls
+    // `dec_connections_open()`, never runs for it).
     if ax.connections.contains_key(&scid) {
         ax.counter.release(from.ip());
         return Ok(());
     }
+    info!(peer = %from, "connection accepted");
+    ax.metrics.inc_connections_total();
+    ax.metrics.inc_connections_open();
     ax.connections.insert(scid, ctx);
     Ok(())
 }
@@ -1145,6 +1150,21 @@ fn start_get(
         fail_stream(ctx, stream_id, metrics, err(code, msg))
     };
 
+    // Server-internal upload temp files (`*.qftp.partial`) are server
+    // bookkeeping: hidden from `Ls`, un-deletable, and swept after they
+    // go stale. A client must not be able to read one either.
+    if handler::is_upload_temp(path) {
+        return fail_stream(
+            ctx,
+            stream_id,
+            metrics,
+            err(
+                ErrorCode::PermissionDenied,
+                "path refers to a server-internal upload temp file",
+            ),
+        );
+    }
+
     let file_path = match handler::resolve(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
         Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
@@ -1481,6 +1501,31 @@ fn start_put(
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
         fail_stream(ctx, stream_id, metrics, err(code, msg))
     };
+
+    // Server-internal upload temp files (`*.qftp.partial`) are server
+    // bookkeeping. A client must not `Put` to one: the committed file
+    // would be hidden from `Ls`, un-deletable, and swept after 24h.
+    if handler::is_upload_temp(path) {
+        return send_err(
+            ctx,
+            ErrorCode::PermissionDenied,
+            "path refers to a server-internal upload temp file".to_string(),
+        );
+    }
+
+    // A resumed upload (`offset > 0`) commits an on-disk `.qftp.partial`
+    // prefix that the client never re-sends. The only thing tying that
+    // prefix to the client's intent is the BLAKE3 trailer / header
+    // checksum. With neither, verification is skipped and a prefix that
+    // a co-tenant could have substituted would be committed unverified.
+    // Refuse such a resume up front.
+    if offset > 0 && !checksum_trailer && expected_checksum.is_none() {
+        return send_err(
+            ctx,
+            ErrorCode::Unsupported,
+            "resumed upload requires a checksum".to_string(),
+        );
+    }
 
     // The final file is `offset + size` bytes; check the resumed total,
     // not just this round's body, so resume can't append past the cap.
@@ -1965,6 +2010,16 @@ fn drive_put(
                     "Upload checksum verification failed",
                 )));
             }
+        }
+        // Parent-dir symlink TOCTOU re-check, immediately before the
+        // commit rename. `start_put` ran this once at entry, but the
+        // body transfer can take arbitrarily long; a parent directory
+        // swapped to a symlink during the transfer would make this
+        // rename land the file outside the user's home. Every other
+        // mutating syscall re-checks right before the call -- match
+        // that here, and do NOT rename if the re-check fails.
+        if let Err(e) = handler::recheck_ancestors_no_symlinks(final_path, &owner.home) {
+            return Ok(Some(Response::Err(e)));
         }
         if let Err(e) = fs::rename(temp_path, &final_path) {
             return Ok(Some(err(

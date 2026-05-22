@@ -203,11 +203,32 @@ pub fn parse_command(line: &str) -> Option<Command> {
     }
 }
 
+/// Make a server-supplied string safe to print to a terminal.
+///
+/// Directory names, file-stat fields, and error messages all come from
+/// the remote and are only length-checked by `validate_response`. A
+/// malicious server could embed ANSI/OSC escape sequences (terminal
+/// title hijack, cursor moves, output spoofing) or carriage returns.
+/// Every control character (the C0 set `< 0x20`, `0x7f` DEL, and the
+/// C1 set) is replaced with a visible `\xNN` escape; ordinary
+/// printable text, including non-ASCII UTF-8, is left untouched.
+fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            out.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn display_response(resp: &Response) {
     match resp {
         Response::Ok => println!("OK"),
         Response::Err(e) => display_error(e),
-        Response::Path(p) => println!("{p}"),
+        Response::Path(p) => println!("{}", sanitize_for_terminal(p)),
         Response::DirListing(entries) => {
             println!("{:<12} {:>10}  {:<4}  NAME", "MODE", "SIZE", "TYPE");
             println!("{}", "-".repeat(50));
@@ -218,7 +239,7 @@ pub fn display_response(resp: &Response) {
                     format_mode(entry.mode),
                     format_size(entry.size),
                     type_str,
-                    entry.name,
+                    sanitize_for_terminal(&entry.name),
                 );
             }
         }
@@ -266,7 +287,13 @@ pub fn display_response(resp: &Response) {
 }
 
 pub fn display_error(e: &ErrorResponse) {
-    println!("Error [{:?}]: {}", e.code, e.message);
+    // `e.message` comes straight from the server; strip terminal
+    // escape sequences before printing.
+    println!(
+        "Error [{:?}]: {}",
+        e.code,
+        sanitize_for_terminal(&e.message)
+    );
     if let Some(hint) = error_hint(&e.code) {
         println!("  hint: {hint}");
     }

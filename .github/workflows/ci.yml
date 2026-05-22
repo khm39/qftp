@@ -40,3 +40,11 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test web/blake3.js against Rust blake3 vectors
+        run: node web/blake3.test.js

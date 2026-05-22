@@ -7,9 +7,11 @@
 //! (`https://host:port/?token=...`); the token is read from the
 //! WebTransport `:path` pseudo-header when the session is accepted.
 //!
-//! Tokens must be URL-safe (no percent-encoding is performed) and
-//! should be high-entropy random strings -- they are the only secret
-//! gating access over this transport.
+//! The token in the query string is percent-decoded (form style: `+`
+//! decodes to a space) before it is checked, so tokens may contain any
+//! bytes -- base64-style tokens with `+`, `/` and `=` round-trip
+//! correctly. Tokens should be high-entropy random strings: they are
+//! the only secret gating access over this transport.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -109,12 +111,31 @@ impl TokenDirectory {
     }
 }
 
-/// Pull the `token` query parameter out of a WebTransport `:path`.
-fn extract_token(path: &str) -> Option<&str> {
+/// Pull the `token` query parameter out of a WebTransport `:path` and
+/// percent-decode it.
+///
+/// The browser SPA puts the token into the URL with
+/// `URLSearchParams.set`, which form-encodes the value: a space becomes
+/// `+` and any URL-special byte (including a literal `+`) becomes a
+/// `%XX` escape. Base64-style tokens routinely contain `+`, `/` and
+/// `=`, so the raw query-string slice must be decoded back to its
+/// original bytes before it is compared against the configured token,
+/// otherwise every such web login fails. Decoding produces an owned
+/// `String`, hence the `Option<String>` return type.
+fn extract_token(path: &str) -> Option<String> {
     let query = path.split_once('?')?.1;
-    query
+    let raw = query
         .split('&')
-        .find_map(|pair| pair.strip_prefix("token="))
+        .find_map(|pair| pair.strip_prefix("token="))?;
+    // Form encoding (what `URLSearchParams` produces) maps a space to
+    // `+`; a literal `+` arrives as `%2B`. Translate `+` back to a
+    // space before percent-decoding so the round-trip is exact.
+    let space_decoded = raw.replace('+', " ");
+    Some(
+        percent_encoding::percent_decode_str(&space_decoded)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
 }
 
 #[cfg(test)]
@@ -124,11 +145,29 @@ mod tests {
 
     #[test]
     fn extract_token_reads_query_param() {
-        assert_eq!(extract_token("/?token=abc"), Some("abc"));
-        assert_eq!(extract_token("/path?x=1&token=abc&y=2"), Some("abc"));
-        assert_eq!(extract_token("/?token="), Some(""));
+        assert_eq!(extract_token("/?token=abc"), Some("abc".to_string()));
+        assert_eq!(
+            extract_token("/path?x=1&token=abc&y=2"),
+            Some("abc".to_string())
+        );
+        assert_eq!(extract_token("/?token="), Some(String::new()));
         assert_eq!(extract_token("/no-query"), None);
         assert_eq!(extract_token("/?other=1"), None);
+    }
+
+    #[test]
+    fn extract_token_percent_decodes_value() {
+        // `URLSearchParams.set` form-encodes the token: a base64 token
+        // such as `a+b/c=` reaches the bridge as `a%2Bb%2Fc%3D`, and a
+        // space arrives as `+`. Both must decode back to the original.
+        assert_eq!(
+            extract_token("/?token=a%2Bb%2Fc%3D"),
+            Some("a+b/c=".to_string())
+        );
+        assert_eq!(
+            extract_token("/?token=one+two"),
+            Some("one two".to_string())
+        );
     }
 
     #[test]

@@ -71,11 +71,19 @@ impl Pacer {
         }
     }
 
-    /// Block until `bytes` tokens are available. No-op when the
-    /// limit is 0 (unlimited).
-    pub fn consume(&mut self, bytes: usize) {
+    /// Account for `bytes` about to be sent and return how long the
+    /// caller must wait before sending them to stay at or below
+    /// `--bwlimit`. Returns `Duration::ZERO` (the common case, and
+    /// always when the limit is 0 / unlimited) when no wait is needed.
+    ///
+    /// The wait itself is deliberately *not* performed here: a single
+    /// blocking `thread::sleep` of many seconds would starve the QUIC
+    /// connection (no ingress/egress/timeout servicing) long enough
+    /// for the idle timer to tear it down. The caller performs the
+    /// returned wait in small slices while pumping the connection.
+    pub fn consume(&mut self, bytes: usize) -> Duration {
         if self.rate <= 0.0 {
-            return;
+            return Duration::ZERO;
         }
         // Refill.
         let now = std::time::Instant::now();
@@ -85,15 +93,17 @@ impl Pacer {
 
         if (bytes as f64) <= self.tokens {
             self.tokens -= bytes as f64;
-            return;
+            return Duration::ZERO;
         }
         let need = bytes as f64 - self.tokens;
-        let sleep = std::time::Duration::from_secs_f64(need / self.rate);
-        std::thread::sleep(sleep);
-        // Treat the sleep as having drained the deficit; new
-        // `last` accounts for it on the next refill.
-        self.last = std::time::Instant::now();
+        let wait = Duration::from_secs_f64(need / self.rate);
+        // Treat the upcoming wait as having drained the deficit; the
+        // caller blocks for `wait`, so account for it now and let the
+        // next refill (off the updated `last`) credit time elapsed
+        // during the wait back into the bucket.
+        self.last = now + wait;
         self.tokens = 0.0;
+        wait
     }
 }
 
@@ -498,8 +508,34 @@ fn do_put_inner(
         // read_exact, so this pass is essentially free.
         hasher.update(&buf[..want]);
 
-        // Bandwidth throttle (`--bwlimit`). No-op when unlimited.
-        pacer.consume(want);
+        // Bandwidth throttle (`--bwlimit`). `consume` returns the
+        // delay needed to stay under the limit (ZERO when unlimited or
+        // within burst). We must NOT block in one long sleep here: the
+        // QUIC connection would go unserviced and its idle timer could
+        // expire mid-`put`. Instead spend the delay in short slices,
+        // servicing the connection between each so keepalive/ACK
+        // traffic keeps flowing.
+        let wait = pacer.consume(want);
+        if !wait.is_zero() {
+            let deadline = std::time::Instant::now() + wait;
+            while std::time::Instant::now() < deadline {
+                handle_ingress(conn, socket, &mut recv_buf)?;
+                flush_egress(conn, socket)?;
+                conn.on_timeout();
+                if conn.is_closed() {
+                    bail!("connection closed during bandwidth-limit wait");
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                // Cap each slice so QUIC is serviced often, but never
+                // sleep past the next quiche timer or the deadline.
+                let slice = remaining
+                    .min(Duration::from_millis(50))
+                    .min(conn.timeout().unwrap_or(Duration::from_millis(50)));
+                if !slice.is_zero() {
+                    std::thread::sleep(slice);
+                }
+            }
+        }
 
         // Drive a single chunk to the wire. quiche's stream_send will
         // truncate or refuse the write when the connection's send
@@ -678,36 +714,33 @@ mod tests {
     fn pacer_zero_rate_is_noop() {
         BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut p = Pacer::new();
-        let t = std::time::Instant::now();
-        p.consume(1 << 30);
-        assert!(t.elapsed() < std::time::Duration::from_millis(10));
+        // Unlimited: any size consumes instantly with no required wait.
+        assert_eq!(p.consume(1 << 30), Duration::ZERO);
     }
 
     #[test]
     fn pacer_throttles_to_rate() {
-        // 1 MB/s; send 2 MB; expect roughly 2 seconds. We test a
-        // smaller window so the suite stays fast.
+        // 1 MB/s; the bucket holds 1s of burst. `consume` no longer
+        // blocks -- it returns the Duration the caller must wait.
         BW_LIMIT_BPS.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
         let mut p = Pacer::new();
-        let t = std::time::Instant::now();
-        // 1 MB inside the burst window -> immediate.
-        p.consume(1_000_000);
-        let after_first = t.elapsed();
-        // 200 KB more -> should require ~200 ms wait.
-        p.consume(200_000);
-        let after_second = t.elapsed();
-        assert!(
-            after_first < std::time::Duration::from_millis(50),
-            "first consume should be instant, took {after_first:?}"
+        // 1 MB inside the burst window -> no wait required.
+        let first = p.consume(1_000_000);
+        // 200 KB more, bucket now empty -> ~200 ms wait required.
+        let second = p.consume(200_000);
+        assert_eq!(
+            first,
+            Duration::ZERO,
+            "first consume should require no wait, got {first:?}"
         );
-        // Some slack for CI jitter (>=150 ms, <=600 ms).
+        // Some slack for timing jitter (>=150 ms, <=600 ms).
         assert!(
-            after_second >= std::time::Duration::from_millis(150),
-            "second consume should have slept >=150ms, took {after_second:?}"
+            second >= Duration::from_millis(150),
+            "second consume should require a wait >=150ms, got {second:?}"
         );
         assert!(
-            after_second <= std::time::Duration::from_millis(600),
-            "second consume should not exceed 600ms, took {after_second:?}"
+            second <= Duration::from_millis(600),
+            "second consume wait should not exceed 600ms, got {second:?}"
         );
         // Reset for the next test.
         BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
