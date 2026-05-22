@@ -399,22 +399,20 @@ async fn do_put(
     // takes the identical claim; without it each side's BLAKE3 covers
     // only the bytes it sent, so an interleaved corrupt file could
     // still pass verification. Released when this function returns.
-    let _claim = match qftp_protocol::stream::UploadClaim::try_claim(
-        Arc::clone(user),
-        final_path.clone(),
-    ) {
-        Some(c) => c,
-        None => {
-            return reply_err(
-                send,
-                ErrorResponse::new(
-                    ErrorCode::AlreadyExists,
-                    format!("an upload to this path is already in progress: {path}"),
-                ),
-            )
-            .await;
-        }
-    };
+    let _claim =
+        match qftp_protocol::stream::UploadClaim::try_claim(Arc::clone(user), final_path.clone()) {
+            Some(c) => c,
+            None => {
+                return reply_err(
+                    send,
+                    ErrorResponse::new(
+                        ErrorCode::AlreadyExists,
+                        format!("an upload to this path is already in progress: {path}"),
+                    ),
+                )
+                .await;
+            }
+        };
 
     let temp_path = temp_path_for(&final_path);
     // The temp name is now deterministic (`<final>.qftp.partial`), so a
