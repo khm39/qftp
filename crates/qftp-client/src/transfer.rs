@@ -575,19 +575,10 @@ fn do_put_inner(
             Ok(())
         }
         Response::Err(e) => {
-            if offset > 0
-                && matches!(
-                    e.code,
-                    ErrorCode::ChecksumMismatch | ErrorCode::InvalidRange
-                )
-            {
-                // A resumed upload was refused because the server-side
-                // partial is stale: either its bytes no longer match
-                // the local file (`ChecksumMismatch`), or it has
-                // vanished / changed length so the resume offset no
-                // longer lines up (`InvalidRange`). Either way the
-                // partial is unusable, so signal the caller to retry
-                // the whole upload from scratch.
+            if is_stale_partial(offset, e.code) {
+                // The resumed upload was refused because the server-side
+                // partial is stale; signal the caller to retry the
+                // whole upload from scratch.
                 return Err(anyhow::Error::new(StalePartial));
             }
             bail!("server refused Put: {} ({:?})", e.message, e.code)
@@ -611,6 +602,15 @@ impl std::fmt::Display for StalePartial {
 }
 
 impl std::error::Error for StalePartial {}
+
+/// True when a refused resumed upload should be retried from scratch.
+/// The server-side partial is stale: its bytes mismatch the local file
+/// (`ChecksumMismatch`), or it vanished / changed length so the resume
+/// offset no longer lines up (`InvalidRange`). A non-resume upload
+/// (`offset == 0`) is never stale -- there is no partial to retry past.
+fn is_stale_partial(offset: u64, code: ErrorCode) -> bool {
+    offset > 0 && matches!(code, ErrorCode::ChecksumMismatch | ErrorCode::InvalidRange)
+}
 
 /// Probe the server for a resumable partial upload of `remote`.
 ///
@@ -711,5 +711,20 @@ mod tests {
         );
         // Reset for the next test.
         BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stale_partial_only_for_resumed_uploads() {
+        // A resumed upload (offset > 0) refused for a stale-partial
+        // reason -- mismatching bytes, or a vanished / wrong-length
+        // partial -- should retry the whole upload from scratch.
+        assert!(is_stale_partial(100, ErrorCode::ChecksumMismatch));
+        assert!(is_stale_partial(100, ErrorCode::InvalidRange));
+        // A fresh upload (offset == 0) has no partial to retry past,
+        // and an unrelated error is a real failure either way.
+        assert!(!is_stale_partial(0, ErrorCode::ChecksumMismatch));
+        assert!(!is_stale_partial(0, ErrorCode::InvalidRange));
+        assert!(!is_stale_partial(100, ErrorCode::NotFound));
+        assert!(!is_stale_partial(100, ErrorCode::PermissionDenied));
     }
 }
