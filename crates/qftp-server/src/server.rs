@@ -478,14 +478,22 @@ pub fn run(
                 rng: &rng,
                 socket: &socket,
             };
-            try_accept(
+            // An accept-time failure (a transient UDP send error while
+            // issuing a RETRY, a quiche::accept rejection) must stay
+            // scoped to this one Initial: propagating it out of `run()`
+            // would tear down the whole server and every other client's
+            // connection. Log and drop the packet, like the
+            // per-connection work below.
+            if let Err(e) = try_accept(
                 &mut ax,
                 from,
                 local_addr,
                 &hdr,
                 &mut buf[..len],
                 &mut out_pkt,
-            )?;
+            ) {
+                warn!(peer = %from, error = %e, "accept failed; dropping Initial");
+            }
         }
 
         // 1.5. Drain completed handler jobs and send their responses.
@@ -639,14 +647,23 @@ fn try_accept(
         None
     };
 
-    let mut conn = quiche::accept(
+    let mut conn = match quiche::accept(
         &scid,
         odcid_owned.as_ref(),
         local_addr,
         from,
         ax.quiche_config,
-    )
-    .context("quiche::accept failed")?;
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            // The connection slot was already counted by `try_acquire`
+            // above; release it so a failed accept doesn't leak a
+            // per-IP / global connection unit.
+            warn!(peer = %from, error = ?e, "quiche::accept failed");
+            ax.counter.release(from.ip());
+            return Ok(());
+        }
+    };
 
     // Feed the original Initial in so the handshake actually starts.
     let recv_info = quiche::RecvInfo {
@@ -1754,26 +1771,56 @@ fn start_put(
             writer,
             remaining,
             hasher,
+            trailer_buf,
             rehash,
             ..
         } = &mut new_state
         {
-            if leftover.len() as u64 > *remaining {
-                return fail_stream(
-                    ctx,
-                    stream_id,
-                    metrics,
-                    err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
-                );
+            // Bytes coalesced into the same recv as the Put request
+            // frame can hold the body *and* the 32-byte streaming
+            // checksum trailer. Split them exactly as `drive_put`'s
+            // Phase A does -- counting the trailer against the body
+            // length would spuriously reject the upload with
+            // UploadOverflow (and a checksum_trailer Put always sends
+            // that trailer in-band right after the body).
+            let to_take = (leftover.len() as u64).min(*remaining) as usize;
+            let after_body = &leftover[to_take..];
+            if !after_body.is_empty() {
+                match trailer_buf {
+                    Some(buf) => {
+                        let consumed = buf.extend(after_body);
+                        if consumed < after_body.len() {
+                            return fail_stream(
+                                ctx,
+                                stream_id,
+                                metrics,
+                                err(
+                                    ErrorCode::UploadOverflow,
+                                    "Upload exceeded declared size + trailer",
+                                ),
+                            );
+                        }
+                    }
+                    None => {
+                        return fail_stream(
+                            ctx,
+                            stream_id,
+                            metrics,
+                            err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
+                        );
+                    }
+                }
             }
+            let body = &leftover[..to_take];
             if let Some(rh) = rehash {
                 // Resume: the prefix isn't hashed yet, so these body
                 // bytes can't be hashed in order now. Hold them; the
                 // re-hash completion path in `drive_put` writes and
-                // hashes them once the prefix is done.
-                rh.pending_body = leftover;
-            } else {
-                if let Err(e) = writer.write_all(&leftover) {
+                // hashes them once the prefix is done. The trailer (if
+                // any) is already buffered above.
+                rh.pending_body = body.to_vec();
+            } else if !body.is_empty() {
+                if let Err(e) = writer.write_all(body) {
                     return fail_stream(
                         ctx,
                         stream_id,
@@ -1781,9 +1828,9 @@ fn start_put(
                         err(ErrorCode::Internal, format!("Failed to write file: {e}")),
                     );
                 }
-                hasher.update(&leftover);
-                *remaining -= leftover.len() as u64;
-                metrics.add_bytes_received(leftover.len() as u64);
+                hasher.update(body);
+                *remaining -= to_take as u64;
+                metrics.add_bytes_received(to_take as u64);
             }
         }
     }

@@ -137,9 +137,22 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     if opts.delete {
         let local_set: HashSet<&PathBuf> = local_files.keys().collect();
         for rel in remote_files.keys() {
-            if !local_set.contains(rel) {
-                to_delete.push(rel.to_string_lossy().into_owned());
+            if local_set.contains(rel) {
+                continue;
             }
+            // A remote file that `.qftpignore` excludes was pruned from
+            // `local_files` by `walk_local`, so it merely looks
+            // "missing locally". Deleting it would destroy a file the
+            // user explicitly told sync to leave alone -- rsync
+            // protects excluded files from --delete; mirror that.
+            if sync_excludes(&ignore, rel) {
+                tracing::info!(
+                    file = %rel.display(),
+                    "sync: keeping remote file excluded by .qftpignore"
+                );
+                continue;
+            }
+            to_delete.push(rel.to_string_lossy().into_owned());
         }
     }
 
@@ -494,6 +507,29 @@ fn walk_remote(
     Ok(out)
 }
 
+/// Whether `.qftpignore` would have kept `rel` out of the local walk --
+/// either the file itself matches a rule, or one of its ancestor
+/// directories does. `walk_local` prunes ignored directories, so files
+/// beneath them never reach the local index either; `sync --delete`
+/// must apply the same exclusion before treating a remote file as
+/// "missing locally".
+fn sync_excludes(ignore: &IgnoreMatcher, rel: &Path) -> bool {
+    if ignore.is_file_ignored(rel) {
+        return true;
+    }
+    let mut cur = rel.parent();
+    while let Some(dir) = cur {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if ignore.is_dir_ignored(dir) {
+            return true;
+        }
+        cur = dir.parent();
+    }
+    false
+}
+
 /// mtime equality with 2-second tolerance. FAT only stores even
 /// seconds, and many copy tools round differently; rsync uses a 1s
 /// window. We mirror that.
@@ -564,5 +600,18 @@ mod tests {
     fn ignore_default_has_no_rules() {
         let m = IgnoreMatcher::default();
         assert!(!m.is_file_ignored(Path::new("anything")));
+    }
+
+    #[test]
+    fn sync_excludes_protects_ignored_files_from_delete() {
+        let m = matcher_from(&["*.log", "target/"]);
+        // A file matched directly by a rule.
+        assert!(sync_excludes(&m, Path::new("deep/nested/app.log")));
+        // A file beneath an ignored directory: `walk_local` prunes the
+        // directory, so the file never reaches the local index and must
+        // not be treated as "missing locally" by --delete.
+        assert!(sync_excludes(&m, Path::new("target/release/qftp")));
+        // An unrelated file stays eligible for deletion.
+        assert!(!sync_excludes(&m, Path::new("src/main.rs")));
     }
 }
