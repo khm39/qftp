@@ -455,9 +455,10 @@ fn do_put_inner(
         std::fs::metadata(local).with_context(|| format!("stat {} for upload", local.display()))?;
     let size = meta.len();
 
-    if offset > size {
-        bail!("resume offset {offset} is past local file size {size}; refusing");
-    }
+    // The resume offset was probed against an earlier `metadata()`
+    // snapshot; if the local file shrank since then, fall back to a
+    // fresh upload rather than failing the transfer.
+    let offset = if offset > size { 0 } else { offset };
 
     // Streaming BLAKE3: hash incrementally as we read+send,
     // then ship the 32-byte digest as an in-band trailer after the
@@ -592,8 +593,60 @@ fn do_put_inner(
             crate::stats::record_upload(bytes_to_send);
             Ok(())
         }
-        Response::Err(e) => bail!("server refused Put: {} ({:?})", e.message, e.code),
+        Response::Err(e) => {
+            if offset > 0 && e.code == ErrorCode::ChecksumMismatch {
+                // A resumed upload failed verification: the server-side
+                // partial no longer matches the local file. The server
+                // discards the bad partial, so signal the caller to
+                // retry the whole upload from scratch.
+                return Err(anyhow::Error::new(StalePartial));
+            }
+            bail!("server refused Put: {} ({:?})", e.message, e.code)
+        }
         other => bail!("unexpected response to Put: {other:?}"),
+    }
+}
+
+/// Error returned by [`do_put`] when a *resumed* upload (`offset > 0`)
+/// was refused with `ChecksumMismatch` -- the server-side partial no
+/// longer matches the local file. The server discards the stale
+/// partial, so the caller should retry the upload from `offset = 0`.
+#[derive(Debug)]
+pub struct StalePartial;
+
+impl std::fmt::Display for StalePartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server-side partial upload is stale; retry from scratch")
+    }
+}
+
+impl std::error::Error for StalePartial {}
+
+/// Probe the server for a resumable partial upload of `remote`.
+///
+/// An interrupted upload leaves a deterministically named
+/// `<remote>.qftp.partial` temp on the server (see the native server's
+/// `temp_path_for`). A `Stat` on that path reports how many bytes
+/// already landed, which is the offset a resume continues from.
+/// Returns `0` — a fresh upload — for any of: no partial, a partial
+/// that is empty or larger than the local file, or a probe error. An
+/// older server (whose partials carried a random suffix) simply
+/// answers `NotFound`, so this degrades cleanly to a fresh upload.
+pub fn probe_put_resume_offset(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next_stream_id: &mut u64,
+    remote: &str,
+    local_size: u64,
+) -> u64 {
+    let req = Request::Stat {
+        path: format!("{remote}.qftp.partial"),
+    };
+    match crate::proto::request_response(conn, socket, poll, events, next_stream_id, &req) {
+        Ok(Response::FileStat(s)) if !s.is_dir && s.size > 0 && s.size <= local_size => s.size,
+        _ => 0,
     }
 }
 

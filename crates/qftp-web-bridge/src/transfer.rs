@@ -321,10 +321,9 @@ async fn do_put(
         )
         .await;
     }
-    // The native server supports appending to a server-side `.partial`
-    // from a prior session; the random temp-file naming makes that
-    // unreachable in practice, and the web SPA always uploads whole
-    // files, so the bridge only accepts fresh uploads.
+    // Upload resume (continuing a server-side `.partial` from a prior
+    // session) is a native-client feature; the web SPA always uploads
+    // whole files, so the bridge only accepts fresh uploads.
     if offset != 0 {
         return reply_err(
             send,

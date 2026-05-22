@@ -742,19 +742,58 @@ fn run_one_line(
                 }
             } else {
                 for path in locals {
-                    let stream_id = take_stream(next_stream_id);
                     let target = remote.clone().unwrap_or_else(|| {
                         path.file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "uploaded".to_string())
                     });
-                    if let Err(e) = transfer::do_put(
-                        conn, socket, poll, events, stream_id, &path, &target, 0, false,
+                    // Auto-resume an interrupted upload, mirroring the
+                    // way `get` resumes from a partial local file.
+                    let local_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let offset = transfer::probe_put_resume_offset(
+                        conn,
+                        socket,
+                        poll,
+                        events,
+                        next_stream_id,
+                        &target,
+                        local_size,
+                    );
+                    let stream_id = take_stream(next_stream_id);
+                    match transfer::do_put(
+                        conn, socket, poll, events, stream_id, &path, &target, offset, false,
                     ) {
-                        println!("put {} failed: {e}", path.display());
+                        Ok(()) => {}
+                        Err(e)
+                            if offset > 0
+                                && e.downcast_ref::<transfer::StalePartial>().is_some() =>
+                        {
+                            println!(
+                                "put {target}: server partial is stale, re-uploading from scratch"
+                            );
+                            let sid = take_stream(next_stream_id);
+                            if let Err(e2) = transfer::do_put(
+                                conn, socket, poll, events, sid, &path, &target, 0, false,
+                            ) {
+                                println!("put {} failed: {e2}", path.display());
+                            }
+                        }
+                        Err(e) => println!("put {} failed: {e}", path.display()),
                     }
                 }
             }
+        }
+        repl::Command::Mget { pattern, local_dir } => {
+            do_mget(
+                conn,
+                socket,
+                poll,
+                events,
+                next_stream_id,
+                &pattern,
+                local_dir.as_deref(),
+                local_cwd,
+            )?;
         }
     }
     Ok(())
@@ -778,6 +817,123 @@ fn expand_glob(pattern: &str) -> Vec<PathBuf> {
         Ok(paths) => paths.filter_map(|p| p.ok()).collect(),
         Err(_) => vec![PathBuf::from(pattern)],
     }
+}
+
+/// Download every file in one remote directory whose name matches a
+/// glob (`mget`). Unlike `put`'s local glob, the wildcard is expanded
+/// against a server `Ls`, so only the final path component may carry
+/// glob metacharacters; the directory part is taken verbatim.
+#[allow(clippy::too_many_arguments)]
+fn do_mget(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next_stream_id: &mut u64,
+    pattern: &str,
+    local_dir: Option<&str>,
+    local_cwd: &Path,
+) -> Result<()> {
+    let (rdir, fileglob) = match pattern.rfind('/') {
+        Some(i) => (&pattern[..i], &pattern[i + 1..]),
+        None => ("", pattern),
+    };
+    let matcher = match glob::Pattern::new(fileglob) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("mget: invalid pattern '{fileglob}': {e}");
+            return Ok(());
+        }
+    };
+    // Match like a shell glob: `*` must not pick up leading-dot files,
+    // matching the filesystem-walker behaviour of `put`'s local glob.
+    let glob_opts = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..glob::MatchOptions::new()
+    };
+    let local_root = match local_dir {
+        Some(d) => resolve_local(local_cwd, d),
+        None => local_cwd.to_path_buf(),
+    };
+    if let Err(e) = std::fs::create_dir_all(&local_root) {
+        println!("mget: cannot use {}: {e}", local_root.display());
+        return Ok(());
+    }
+
+    let resp = request_response(
+        conn,
+        socket,
+        poll,
+        events,
+        next_stream_id,
+        &Request::Ls {
+            path: rdir.to_string(),
+        },
+    )?;
+    let entries = match resp {
+        Response::DirListing(e) => e,
+        Response::Err(e) => {
+            repl::display_error(&e);
+            return Ok(());
+        }
+        other => {
+            println!("mget: unexpected response listing '{rdir}': {other:?}");
+            return Ok(());
+        }
+    };
+
+    let mut matched = 0usize;
+    let mut ok = 0usize;
+    let mut skipped = 0usize;
+    for entry in entries {
+        if entry.is_dir || !matcher.matches_with(&entry.name, glob_opts) {
+            continue;
+        }
+        // A malicious server can return entry names containing `..` or
+        // separators; reject them lexically before they reach a path.
+        if !qftp_common::protocol::safe_entry_name(&entry.name) {
+            tracing::warn!(name = %entry.name, "mget: skipping unsafe entry name");
+            continue;
+        }
+        matched += 1;
+        let local_child = local_root.join(&entry.name);
+        // Skip an existing local destination rather than auto-resuming
+        // onto it: `do_get` would append to whatever bytes are there,
+        // and a checksum mismatch would then delete the file -- so a
+        // same-named but unrelated local file would be destroyed.
+        if local_child.exists() {
+            println!("mget: skipping {} (local file exists)", entry.name);
+            skipped += 1;
+            continue;
+        }
+        let remote_child = if rdir.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{rdir}/{}", entry.name)
+        };
+        let stream_id = take_stream(next_stream_id);
+        match transfer::do_get(
+            conn,
+            socket,
+            poll,
+            events,
+            stream_id,
+            &remote_child,
+            &local_child,
+        ) {
+            Ok(()) => ok += 1,
+            Err(e) => println!("mget: {remote_child} failed: {e}"),
+        }
+    }
+    if matched == 0 {
+        println!("mget: no remote files match '{pattern}'");
+    } else {
+        println!(
+            "mget: downloaded {ok}/{matched} file(s) to {} ({skipped} skipped)",
+            local_root.display()
+        );
+    }
+    Ok(())
 }
 
 /// Walk the remote directory tree, downloading every file under `remote`

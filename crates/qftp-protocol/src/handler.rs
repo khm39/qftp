@@ -321,6 +321,18 @@ pub fn acl_reject(user: &User, req: &Request) -> Option<Response> {
 }
 
 /// Handle a single FTP request, returning the appropriate response.
+/// True when `path`'s final component is a server-internal upload temp
+/// (`*.qftp.partial`). These files are created, resumed, and swept by
+/// the server; a client must not rename or delete one out from under an
+/// in-flight upload, and they are hidden from `Ls`.
+pub fn is_upload_temp(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.contains(".qftp.partial"))
+        .unwrap_or(false)
+}
+
 pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response {
     match req {
         Request::Pwd => {
@@ -371,6 +383,20 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 Ok(e) => e,
                                 Err(e) => return err(io_code(&e), format!("Read dir error: {e}")),
                             };
+                            // into_string() is a zero-copy OsString -> String
+                            // move for the UTF-8 common case; fall back to
+                            // lossy only for non-UTF-8.
+                            let name = entry
+                                .file_name()
+                                .into_string()
+                                .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+                            // Hide in-flight / aborted upload temp files
+                            // (`<name>.qftp.partial[.*]`): they are server
+                            // bookkeeping, not listable content, and would
+                            // otherwise be pulled down by `mget` / `get -r`.
+                            if name.contains(".qftp.partial") {
+                                continue;
+                            }
                             let meta = match entry.metadata() {
                                 Ok(m) => m,
                                 Err(e) => return err(io_code(&e), format!("Metadata error: {e}")),
@@ -382,13 +408,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
                             listing.push(DirEntry {
-                                // into_string() is a zero-copy OsString ->
-                                // String move for the UTF-8 common case;
-                                // fall back to lossy only for non-UTF-8.
-                                name: entry
-                                    .file_name()
-                                    .into_string()
-                                    .unwrap_or_else(|os| os.to_string_lossy().into_owned()),
+                                name,
                                 is_dir: meta.is_dir(),
                                 size: meta.len(),
                                 modified,
@@ -430,20 +450,34 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             Err(e) => Response::Err(e),
         },
 
-        Request::Rm { path } => match resolve(cwd, root, path) {
-            Ok(target) => {
-                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
-                    return Response::Err(e);
-                }
-                match fs::remove_file(&target) {
-                    Ok(()) => Response::Ok,
-                    Err(e) => err(io_code(&e), format!("rm failed: {e}")),
-                }
+        Request::Rm { path } => {
+            if is_upload_temp(path) {
+                return err(
+                    ErrorCode::PermissionDenied,
+                    "cannot remove a server-internal upload temp file",
+                );
             }
-            Err(e) => Response::Err(e),
-        },
+            match resolve(cwd, root, path) {
+                Ok(target) => {
+                    if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
+                        return Response::Err(e);
+                    }
+                    match fs::remove_file(&target) {
+                        Ok(()) => Response::Ok,
+                        Err(e) => err(io_code(&e), format!("rm failed: {e}")),
+                    }
+                }
+                Err(e) => Response::Err(e),
+            }
+        }
 
         Request::Rename { from, to } => {
+            if is_upload_temp(from) || is_upload_temp(to) {
+                return err(
+                    ErrorCode::PermissionDenied,
+                    "cannot rename a server-internal upload temp file",
+                );
+            }
             let src = match resolve(cwd, root, from) {
                 Ok(p) => p,
                 Err(e) => return Response::Err(e),

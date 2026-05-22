@@ -25,8 +25,8 @@ Pre-1.0, but functionally complete for the supported feature set:
 - Streaming upload and download (BufReader / BufWriter; the server's
   peak RAM use does not scale with file size).
 - Resume for both directions. Get auto-resumes from the local file's
-  current length; Put can specify an offset against the server's
-  `.qftp.partial` temp.
+  current length; Put auto-resumes by probing the server's
+  `<name>.qftp.partial` temp and continuing from where it stopped.
 - BLAKE3 integrity. The server emits a 32-byte trailer after Get
   bodies; the client computes the matching hash and refuses to keep a
   corrupted local file. For Put, the client commits to a BLAKE3 in the
@@ -55,6 +55,7 @@ qftp-client --trust-on-first-use qftp://localhost:4433
 qftp> ls
 qftp> get -r remote-dir local-dir
 qftp> put -r local-dir remote-dir
+qftp> mget '*.log' ./logs
 qftp> quit
 ```
 
@@ -192,7 +193,7 @@ legacy flags / defaults.
 It is a separate binary that runs alongside `qftp-server`, shares the
 same `--root` and `users.toml`, and ships a single-page app: directory
 browsing, drag-and-drop upload, download, delete, and rename, all with
-progress bars.
+progress bars and end-to-end BLAKE3 integrity checks.
 
 ```
 qftp-web-bridge \

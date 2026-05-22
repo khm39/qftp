@@ -7,7 +7,7 @@
 //! from it.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -70,6 +70,62 @@ impl Default for TrailerBuf {
     }
 }
 
+/// Incremental re-hash of a resumed upload's on-disk prefix.
+///
+/// A resume continues an existing `.qftp.partial`; the server must feed
+/// that prefix through BLAKE3 before the new body bytes so the trailer
+/// check still covers the whole file. Doing it in one synchronous pass
+/// would block the event loop for the length of the prefix (up to
+/// `MAX_FILE_SIZE`), so the prefix is hashed a slice at a time, driven
+/// from the main loop. `remaining` counts bytes still to read.
+pub struct ResumeRehash {
+    pub reader: BufReader<File>,
+    pub remaining: u64,
+    /// Body bytes that arrived in the same read as the Put request.
+    /// They must be hashed *after* the prefix, so they are held here
+    /// until the re-hash finishes rather than hashed on arrival.
+    pub pending_body: Vec<u8>,
+}
+
+/// RAII claim on an upload destination path.
+///
+/// The `.qftp.partial` temp name is deterministic, so two concurrent
+/// Puts to the same destination would otherwise open and interleave
+/// their writes into one file -- and since each side's BLAKE3 is
+/// computed over the bytes *it* sent (not the file content), the loser
+/// could even commit a corrupt file that passed verification.
+/// `start_put` takes a claim before accepting a Put; while it is held,
+/// a second Put to the same path is refused. The claim lives inside
+/// `ReadingFileData`, so it is released whenever the stream ends --
+/// commit, abort, or error.
+pub struct UploadClaim {
+    owner: Arc<User>,
+    path: PathBuf,
+}
+
+impl UploadClaim {
+    /// Claim `path` for `user`. Returns `None` when another upload to
+    /// the same path is already in progress.
+    pub fn try_claim(user: Arc<User>, path: PathBuf) -> Option<UploadClaim> {
+        let claimed = user
+            .active_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone());
+        claimed.then(|| UploadClaim { owner: user, path })
+    }
+}
+
+impl Drop for UploadClaim {
+    fn drop(&mut self) {
+        self.owner
+            .active_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.path);
+    }
+}
+
 /// Per-stream state on the server side.
 ///
 /// The `Drop` impl on `ReadingFileData` is what guarantees we never leak
@@ -101,6 +157,23 @@ pub enum StreamState {
         /// abort; the commit path consumes them and converts the
         /// reservation into `used_bytes`.
         reserved_bytes: u64,
+        /// Bytes already on disk and already counted in `used_bytes`
+        /// when this stream started -- i.e. the resume `offset` (0 for
+        /// a fresh upload). On a checksum mismatch the partial is
+        /// deleted, so the mismatch path must refund these from
+        /// `used_bytes` or they leak against the user's quota.
+        prior_bytes: u64,
+        /// `Some` while a resumed upload's existing prefix is still
+        /// being re-hashed (see [`ResumeRehash`]); `None` for a fresh
+        /// upload or once the prefix is fully hashed. Body bytes are
+        /// not consumed until this is `None`.
+        rehash: Option<ResumeRehash>,
+        /// RAII claim on the destination path; refuses a second
+        /// concurrent Put to the same path. Released when this state
+        /// drops (commit, abort, or error). Held purely for its
+        /// `Drop`, never read.
+        #[allow(dead_code)]
+        claim: UploadClaim,
         /// Back-reference to the user whose counters we mutate. We
         /// can't share the connection's Arc<User> directly here
         /// because the StreamState is stored inside the connection;
@@ -132,32 +205,138 @@ pub enum StreamState {
 
 impl Drop for StreamState {
     fn drop(&mut self) {
+        // An aborted upload leaves its `.qftp.partial` temp on disk on
+        // purpose: a later session resumes it by sending an `offset`.
+        // To keep that from becoming a quota bypass, the bytes already
+        // written this session are moved out of the in-flight
+        // reservation and into `used_bytes`, so they keep counting
+        // against the user's quota until the partial is either resumed
+        // (the resume's commit accounts for the whole file) or
+        // truncated by a fresh Put to the same path (which refunds
+        // them — see `server::start_put`).
+        //
+        // This runs on every abort path — explicit StreamState::Done
+        // replacement, connection drop, or panic unwind.
         if let StreamState::ReadingFileData {
-            temp_path,
             completed,
+            remaining,
             reserved_bytes,
+            prior_bytes,
+            writer,
+            temp_path,
             owner,
             ..
         } = self
         {
             if !*completed {
-                // Release the in-flight reservation so the
-                // user's quota can recover. This runs on every abort
-                // path — explicit StreamState::Done replacement,
-                // connection drop, or panic unwind.
                 owner
                     .in_flight_bytes
                     .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-                if let Err(e) = std::fs::remove_file(&temp_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(
-                            path = %temp_path.display(),
-                            error = %e,
-                            "failed to clean up partial upload"
-                        );
-                    }
+                // Flush the buffered writer, then charge the bytes
+                // actually on disk this session -- the file size minus
+                // the prefix a prior session already counted. Counting
+                // the real file rather than the logical write_all total
+                // keeps `used_bytes` correct even if a buffered write
+                // never reached disk.
+                let _ = writer.flush();
+                let written = match std::fs::metadata(&*temp_path) {
+                    Ok(m) => m.len().saturating_sub(*prior_bytes),
+                    Err(_) => reserved_bytes.saturating_sub(*remaining),
+                };
+                if written > 0 {
+                    owner.used_bytes.fetch_add(written, Ordering::Relaxed);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::user::{Permissions, User};
+    use std::sync::atomic::AtomicU64;
+
+    fn test_user() -> Arc<User> {
+        Arc::new(User {
+            name: "t".to_string(),
+            home: PathBuf::from("/tmp"),
+            permissions: Permissions::full(),
+            quota_bytes: Some(1_000_000),
+            used_bytes: AtomicU64::new(0),
+            in_flight_bytes: AtomicU64::new(0),
+            active_uploads: std::sync::Mutex::new(std::collections::HashSet::new()),
+        })
+    }
+
+    fn reading_state(
+        user: Arc<User>,
+        temp: PathBuf,
+        reserved: u64,
+        remaining: u64,
+        completed: bool,
+    ) -> StreamState {
+        let mut f = File::create(&temp).unwrap();
+        // Put `reserved - remaining` bytes on disk so the Drop impl's
+        // metadata-based accounting sees what the test simulates as
+        // "received this session".
+        let received = reserved.saturating_sub(remaining);
+        f.write_all(&vec![0u8; received as usize]).unwrap();
+        let claim = UploadClaim::try_claim(Arc::clone(&user), temp.clone()).unwrap();
+        StreamState::ReadingFileData {
+            final_path: temp.with_extension("final"),
+            temp_path: temp,
+            writer: BufWriter::new(f),
+            remaining,
+            mode: 0o644,
+            completed,
+            hasher: blake3::Hasher::new(),
+            expected_checksum: None,
+            trailer_buf: None,
+            reserved_bytes: reserved,
+            prior_bytes: 0,
+            rehash: None,
+            claim,
+            owner: user,
+        }
+    }
+
+    #[test]
+    fn abort_moves_written_bytes_into_used() {
+        // An interrupted upload must not silently drop the bytes it
+        // already wrote: they stay charged against the user's quota
+        // (in `used_bytes`) so an abort loop can't bypass the limit.
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        user.in_flight_bytes.fetch_add(1000, Ordering::Relaxed);
+        // Declared 1000 new bytes, 600 received (remaining 400), abort.
+        let state = reading_state(Arc::clone(&user), dir.path().join("f"), 1000, 400, false);
+        drop(state);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 600);
+    }
+
+    #[test]
+    fn abort_before_any_bytes_only_releases_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        user.in_flight_bytes.fetch_add(1000, Ordering::Relaxed);
+        let state = reading_state(Arc::clone(&user), dir.path().join("f"), 1000, 1000, false);
+        drop(state);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn completed_upload_drop_is_a_noop() {
+        // The commit path already settled the counters; Drop must not
+        // touch them again when `completed` is set.
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        user.in_flight_bytes.fetch_add(1000, Ordering::Relaxed);
+        let state = reading_state(Arc::clone(&user), dir.path().join("f"), 1000, 0, true);
+        drop(state);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 1000);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
     }
 }

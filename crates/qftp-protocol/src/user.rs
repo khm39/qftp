@@ -8,10 +8,11 @@
 //! rejected with `Unauthorized` rather than silently downgraded to
 //! anonymous.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -131,6 +132,11 @@ pub struct User {
     /// completion path subtracts them (and adds to `used_bytes` on
     /// success). This closes the parallel-Put bypass.
     pub in_flight_bytes: AtomicU64,
+    /// Destination paths with an upload currently in progress. The
+    /// `.qftp.partial` temp name is deterministic, so two concurrent
+    /// Puts to the same path would share one temp; `UploadClaim` (see
+    /// `stream.rs`) uses this set to refuse the second.
+    pub active_uploads: Mutex<HashSet<PathBuf>>,
 }
 
 impl User {
@@ -147,6 +153,60 @@ impl User {
 /// initialize a user's cached `used_bytes` at startup, and (until
 /// the cache lands) for `Request::Quota` replies. We deliberately
 /// skip non-regular files so the number matches `du -b --apparent-size`.
+/// Age past which an aborted `.qftp.partial` is treated as abandoned
+/// and removed at startup. A genuine resume happens far sooner; a
+/// partial older than this is leaked disk no client will reclaim.
+const STALE_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delete abandoned upload temp files (`*.qftp.partial`) under `root`
+/// whose last-modified time is older than [`STALE_PARTIAL_AGE`].
+///
+/// An interrupted upload's partial is kept on disk so a later session
+/// can resume it; nothing else removes it except a fresh Put to the
+/// same path. Without this sweep, partials for paths never revisited
+/// would accumulate forever (a slow disk leak for an unlimited-quota
+/// user). Called once at startup, before `walk_size` primes the quota
+/// cache, so the removed bytes are simply never counted -- and a still
+/// fresh partial (a recent abort a client may yet resume) is left be.
+pub fn sweep_stale_partials(root: &Path) {
+    let now = std::time::SystemTime::now();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let is_partial = entry
+                .file_name()
+                .to_str()
+                .map(|n| n.contains(".qftp.partial"))
+                .unwrap_or(false);
+            if !is_partial {
+                continue;
+            }
+            let abandoned = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map(|age| age > STALE_PARTIAL_AGE)
+                .unwrap_or(false);
+            if abandoned {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 pub fn walk_size(root: &Path) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut count = 0u64;
@@ -195,6 +255,7 @@ impl UserDirectory {
     /// **read-only** by default; operators wanting writable anonymous
     /// access must declare it explicitly via `users.toml`.
     pub fn default_anonymous(global_root: &Path) -> Self {
+        sweep_stale_partials(global_root);
         let anon = Arc::new(User {
             name: "anonymous".to_string(),
             home: global_root.to_path_buf(),
@@ -202,6 +263,7 @@ impl UserDirectory {
             quota_bytes: None,
             used_bytes: AtomicU64::new(0),
             in_flight_bytes: AtomicU64::new(0),
+            active_uploads: Mutex::new(HashSet::new()),
         });
         Self {
             by_name: HashMap::new(),
@@ -279,8 +341,10 @@ impl UserDirectory {
         };
 
         let build_user = |spec: &UserSpec, home: PathBuf| -> Arc<User> {
-            // Prime the used-bytes cache once at startup so the
-            // hot path (Put) doesn't re-walk the user's home.
+            // Drop abandoned partials before priming the cache so their
+            // bytes are never counted, then prime the used-bytes cache
+            // once so the hot path (Put) doesn't re-walk the home.
+            sweep_stale_partials(&home);
             let (used, _) = walk_size(&home);
             Arc::new(User {
                 name: spec.name.clone(),
@@ -289,6 +353,7 @@ impl UserDirectory {
                 quota_bytes: spec.quota_bytes,
                 used_bytes: AtomicU64::new(used),
                 in_flight_bytes: AtomicU64::new(0),
+                active_uploads: Mutex::new(HashSet::new()),
             })
         };
 
@@ -307,6 +372,7 @@ impl UserDirectory {
                 build_user(spec, home)
             }
             None => {
+                sweep_stale_partials(&canonical_root);
                 let (used, _) = walk_size(&canonical_root);
                 Arc::new(User {
                     name: "anonymous".to_string(),
@@ -315,6 +381,7 @@ impl UserDirectory {
                     quota_bytes: None,
                     used_bytes: AtomicU64::new(used),
                     in_flight_bytes: AtomicU64::new(0),
+                    active_uploads: Mutex::new(HashSet::new()),
                 })
             }
         };
@@ -692,6 +759,7 @@ mod tests {
             quota_bytes: Some(100),
             used_bytes: AtomicU64::new(40),
             in_flight_bytes: AtomicU64::new(0),
+            active_uploads: Mutex::new(HashSet::new()),
         };
         assert_eq!(user.current_usage(), 40);
 

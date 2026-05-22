@@ -110,6 +110,35 @@ async fn put(conn: &Connection, path: &str, body: &[u8], checksum: Option<[u8; 3
     bincode::deserialize(&split_frame(&data).0).expect("decode put response")
 }
 
+/// Upload `body` the way the browser SPA does: declare
+/// `checksum_trailer = true` and append a 32-byte BLAKE3 trailer after
+/// the body on the same stream.
+async fn put_with_trailer(
+    conn: &Connection,
+    path: &str,
+    body: &[u8],
+    trailer: [u8; 32],
+) -> Response {
+    let (mut send, mut recv) = open_bi(conn).await;
+    let req = Request::Put {
+        path: path.to_string(),
+        size: body.len() as u64,
+        mode: 0o644,
+        offset: 0,
+        checksum: None,
+        no_clobber: false,
+        checksum_trailer: true,
+    };
+    send.write_all(&frame(&bincode::serialize(&req).unwrap()))
+        .await
+        .expect("write put header");
+    send.write_all(body).await.expect("write put body");
+    send.write_all(&trailer).await.expect("write put trailer");
+    send.finish().await.expect("finish put");
+    let data = read_to_end(&mut recv).await;
+    bincode::deserialize(&split_frame(&data).0).expect("decode put response")
+}
+
 /// Download `path`; returns the framed response plus the trailing
 /// bytes (body + 32-byte BLAKE3 trailer).
 async fn get(conn: &Connection, path: &str) -> (Response, Vec<u8>) {
@@ -337,6 +366,39 @@ async fn end_to_end_webtransport() {
     assert!(
         !root.join("alice/sub/bad.bin").exists(),
         "a checksum-failed upload must not be committed"
+    );
+
+    // A streamed BLAKE3 trailer -- the path the browser SPA uses for
+    // every upload -- must verify and commit.
+    expect_ok(
+        put_with_trailer(&alice, "/sub/trailer.bin", &body, digest).await,
+        "put with valid streamed trailer",
+    );
+    assert_eq!(
+        std::fs::read(root.join("alice/sub/trailer.bin")).unwrap(),
+        body,
+        "trailer-verified upload must land on disk"
+    );
+    // A wrong streamed trailer must be refused like a wrong header
+    // checksum, and must not leave a file behind.
+    let code = expect_err(
+        put_with_trailer(&alice, "/sub/bad-trailer.bin", &body, [0u8; 32]).await,
+        "put with wrong streamed trailer",
+    );
+    assert_eq!(code, ErrorCode::ChecksumMismatch);
+    assert!(
+        !root.join("alice/sub/bad-trailer.bin").exists(),
+        "a trailer-checksum-failed upload must not be committed"
+    );
+    expect_ok(
+        op(
+            &alice,
+            &Request::Rm {
+                path: "/sub/trailer.bin".into(),
+            },
+        )
+        .await,
+        "rm trailer.bin",
     );
 
     // rename / rm / rmdir

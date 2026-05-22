@@ -41,7 +41,9 @@ use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
 use crate::retry::RetryKey;
 use qftp_protocol::handler::{self, err, io_code};
-use qftp_protocol::stream::{StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
+use qftp_protocol::stream::{
+    ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+};
 use qftp_protocol::user::{self, User, UserDirectory};
 
 /// Which Request variants are safe to serve while the connection is
@@ -205,6 +207,12 @@ fn run_handler(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
     // can't go through the generic handler (which never sees the
     // deleted file's size). Everything else is plain handle_request.
     if let Request::Rm { path } = req {
+        if handler::is_upload_temp(path) {
+            return err(
+                ErrorCode::PermissionDenied,
+                "cannot remove a server-internal upload temp file",
+            );
+        }
         match handler::resolve(cwd, &user.home, path) {
             Ok(target) => {
                 // Parent-dir symlink TOCTOU re-check.
@@ -382,10 +390,25 @@ pub fn run(
         }
 
         let shortest_timeout = connections.values().filter_map(|c| c.conn.timeout()).min();
-        let poll_timeout = match (closing, shortest_timeout) {
-            (true, t) => Some(t.unwrap_or(Duration::from_millis(250))),
-            (false, Some(t)) => Some(t),
-            (false, None) => None,
+        // A resumed Put re-hashing its on-disk prefix has pure local
+        // work to do that no network event will wake the loop for; spin
+        // at a zero timeout until that re-hash finishes.
+        let rehash_pending = connections.values().any(|c| {
+            c.streams.values().any(|s| {
+                matches!(
+                    s,
+                    StreamState::ReadingFileData {
+                        rehash: Some(_),
+                        ..
+                    }
+                )
+            })
+        });
+        let poll_timeout = match (closing, rehash_pending, shortest_timeout) {
+            (true, _, t) => Some(t.unwrap_or(Duration::from_millis(250))),
+            (false, true, _) => Some(Duration::ZERO),
+            (false, false, Some(t)) => Some(t),
+            (false, false, None) => None,
         };
         poll.poll(&mut events, poll_timeout)
             .context("poll failed")?;
@@ -488,6 +511,7 @@ pub fn run(
                 &mut readable_ids,
                 server_config.mtls_required,
             )?;
+            drive_rehash_streams(ctx, &mut buf, &metrics)?;
             drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)?;
             flush_egress(&mut ctx.conn, &socket)?;
         }
@@ -1215,6 +1239,44 @@ fn drive_sending_streams(
     Ok(())
 }
 
+/// Advance the prefix re-hash of any resumed Put whose `rehash` is
+/// still `Some`. Driven every main-loop iteration (the poll timeout is
+/// forced to zero while any exist) so the re-hash makes progress
+/// without waiting on network events, since it is pure local I/O.
+fn drive_rehash_streams(
+    ctx: &mut ConnectionContext,
+    scratch: &mut [u8],
+    metrics: &Metrics,
+) -> Result<()> {
+    let ids: Vec<u64> = ctx
+        .streams
+        .iter()
+        .filter(|(_, s)| {
+            matches!(
+                s,
+                StreamState::ReadingFileData {
+                    rehash: Some(_),
+                    ..
+                }
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for stream_id in ids {
+        let Some(state) = ctx.streams.get_mut(&stream_id) else {
+            continue;
+        };
+        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, scratch, metrics)? {
+            if matches!(resp, Response::Err(_)) {
+                metrics.inc_requests_failed();
+            }
+            send_message(&mut ctx.conn, stream_id, &resp)?;
+            *state = StreamState::Done;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SendOutcome {
     Blocked,
@@ -1397,53 +1459,183 @@ fn start_put(
         fail_stream(ctx, stream_id, metrics, err(code, msg))
     };
 
-    if size > MAX_FILE_SIZE {
+    // The final file is `offset + size` bytes; check the resumed total,
+    // not just this round's body, so resume can't append past the cap.
+    let final_size = offset.saturating_add(size);
+    if final_size > MAX_FILE_SIZE {
         return send_err(
             ctx,
             ErrorCode::FileTooLarge,
-            format!(
-                "Upload too large: {} bytes (max {} bytes)",
-                size, MAX_FILE_SIZE
-            ),
+            format!("Upload too large: {final_size} bytes (max {MAX_FILE_SIZE} bytes)"),
         );
     }
-    // Resume (offset > 0) is not supported. `temp_path_for` mints a
-    // fresh random suffix on every call, so a resume can never locate
-    // the prior session's `.partial` -- the old code path always failed
-    // deep inside with `InvalidRange`. A deterministic temp name would
-    // make resume work but would reintroduce the upload-blocking
-    // file-planting DoS the random suffix exists to prevent, so we
-    // reject here instead, matching the web bridge's behaviour.
-    if offset > 0 {
+
+    let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
+        Ok(p) => p,
+        Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
+    };
+    // Parent-dir symlink TOCTOU re-check. The temp file is opened with
+    // O_NOFOLLOW, which protects the *leaf* but not the intermediate
+    // components -- a parent swapped to a symlink between resolve_parent
+    // and open would still be traversed by the kernel.
+    if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, &ctx.user.home) {
+        send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
+        metrics.inc_requests_failed();
+        ctx.streams.insert(stream_id, StreamState::Done);
+        return Ok(());
+    }
+    // Enforce client-requested overwrite refusal. lstat (not stat) so a
+    // planted symlink at `final_path` counts as "exists" -- otherwise an
+    // attacker who could plant a dangling symlink could bypass
+    // --no-clobber by aiming it at /nonexistent.
+    if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
         return send_err(
             ctx,
-            ErrorCode::Unsupported,
-            "upload resume (offset > 0) is not supported".to_string(),
+            ErrorCode::AlreadyExists,
+            format!("path already exists (no_clobber): {path}"),
         );
     }
-    // Quota enforcement. Reserve the bytes against `in_flight_bytes`
-    // *first*, then check the total. A check-then-reserve sequence
-    // races: two concurrent Puts can both pass the check before
-    // either reservation lands and together overshoot the limit.
-    // Reserving first guarantees a concurrent Put always observes our
-    // bytes in its own check.
+    // Claim the destination so a second concurrent Put to the same path
+    // can't share -- and corrupt -- the one deterministically named
+    // temp. The claim is a local until it moves into `ReadingFileData`;
+    // an early return before then drops it and frees the path.
+    let claim = match UploadClaim::try_claim(Arc::clone(&ctx.user), final_path.clone()) {
+        Some(c) => c,
+        None => {
+            return send_err(
+                ctx,
+                ErrorCode::AlreadyExists,
+                format!("an upload to this path is already in progress: {path}"),
+            );
+        }
+    };
+    let temp_path = temp_path_for(&final_path);
+
+    // Open the deterministically named resumable temp file *before* the
+    // quota check, so a fresh Put can refund a stale partial's bytes
+    // first -- otherwise re-uploading a file whose earlier attempt
+    // aborted near the quota limit would be rejected for the very bytes
+    // it is about to replace.
+    //   * Fresh upload (offset == 0): create-or-reuse. A leftover
+    //     partial is truncated and reused; its bytes were charged to
+    //     `used_bytes` on that abort, so refund them. `prior_bytes` is
+    //     0 -- nothing on disk is pre-accounted for this stream.
+    //   * Resume (offset > 0): the temp must already exist and hold
+    //     exactly `offset` bytes; re-hash that prefix so the BLAKE3
+    //     trailer check still covers the whole file. `prior_bytes` is
+    //     `offset`: those bytes are already counted in `used_bytes`.
+    let (file, hasher, prior_bytes, rehash) = if offset == 0 {
+        let f = match open_temp(&temp_path, false) {
+            Ok(f) => f,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to create upload temp file: {e}"),
+                );
+            }
+        };
+        let stale = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if stale > 0 {
+            ctx.user
+                .used_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                    Some(u.saturating_sub(stale))
+                })
+                .ok();
+        }
+        // Truncate unconditionally: a reused file (a stale partial, or
+        // one a local user planted at the predictable path) must not
+        // leave trailing bytes past the new body.
+        if let Err(e) = f.set_len(0) {
+            return send_err(
+                ctx,
+                io_code(&e),
+                format!("Failed to truncate upload temp file: {e}"),
+            );
+        }
+        // Re-assert 0o600: the O_CREAT mode is ignored when the file
+        // already existed, so a reused/planted temp could otherwise
+        // keep a looser mode and expose the in-progress body.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+        (f, blake3::Hasher::new(), 0u64, None)
+    } else {
+        let mut f = match open_temp(&temp_path, true) {
+            Ok(f) => f,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    ErrorCode::InvalidRange,
+                    format!("no resumable partial upload to continue: {e}"),
+                );
+            }
+        };
+        let have = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        if have != offset {
+            return send_err(
+                ctx,
+                ErrorCode::InvalidRange,
+                format!("resume offset {offset} does not match partial length {have}"),
+            );
+        }
+        // Position the write handle to append after the prefix.
+        if let Err(e) = std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset)) {
+            return send_err(
+                ctx,
+                io_code(&e),
+                format!("Failed to seek partial upload: {e}"),
+            );
+        }
+        // Re-hash the [0, offset) prefix incrementally through a second
+        // handle, so a large partial doesn't block the event loop with
+        // one synchronous pass (driven by `drive_rehash_streams`). The
+        // hasher starts empty and is filled before any body byte.
+        let rehash_handle = match open_temp(&temp_path, true) {
+            Ok(h) => h,
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to reopen partial for re-hash: {e}"),
+                );
+            }
+        };
+        let rehash = ResumeRehash {
+            reader: std::io::BufReader::with_capacity(FILE_CHUNK_SIZE, rehash_handle),
+            remaining: offset,
+            pending_body: Vec::new(),
+        };
+        (f, blake3::Hasher::new(), offset, Some(rehash))
+    };
+
+    // In-flight reservation, then quota check. `used_bytes` now
+    // reflects reality: a fresh Put refunded any stale partial above,
+    // and a resume's `offset` bytes are legitimately still counted.
+    // `size` is the post-offset body the client is about to send.
     //
-    // The reservation is unconditional so abort/disconnect bookkeeping
-    // is symmetric regardless of whether the user has a configured
-    // quota; the value only matters for limited users but the counter
-    // is cheap. The guard releases the reservation on every
-    // early-return path below; it is disarmed once `ReadingFileData`
-    // (which owns the reservation via its Drop) is constructed.
-    let new_bytes = size.saturating_sub(offset);
+    // Reserve *before* checking: a check-then-reserve sequence races --
+    // two concurrent Puts could both pass the check before either
+    // reservation lands and together overshoot the limit. Reserving
+    // first means a concurrent Put always sees our bytes in its check.
+    let new_bytes = size;
     let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
     if let Some(limit) = ctx.user.quota_bytes {
         let used = ctx.user.used_bytes.load(Ordering::Relaxed);
-        // `in_flight` already includes the reservation we just made.
+        // `in_flight` already includes the reservation just made.
         let in_flight = ctx.user.in_flight_bytes.load(Ordering::Relaxed);
         let projected = used.saturating_add(in_flight);
         if projected > limit {
-            // `reservation` is still armed: it releases `new_bytes`
-            // when it drops on return.
+            // `reservation` is still armed -- it releases `new_bytes`
+            // on return. A fresh Put truncated its temp to empty;
+            // remove it so a rejected upload leaves no litter. A
+            // resume's temp is the user's own partial -- leave it.
+            if offset == 0 {
+                let _ = fs::remove_file(&temp_path);
+            }
             return send_err(
                 ctx,
                 ErrorCode::QuotaExceeded,
@@ -1451,57 +1643,11 @@ fn start_put(
             );
         }
     }
-    let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
-        Ok(p) => p,
-        Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
-    };
-    // Parent-dir symlink TOCTOU re-check. The temp file is
-    // opened with O_NOFOLLOW, which protects the *leaf* but not the
-    // intermediate components -- a parent that was swapped to a
-    // symlink between resolve_parent and open would still be
-    // traversed by the kernel and land the temp under the symlink
-    // target.
-    if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, &ctx.user.home) {
-        // `reservation` releases the in-flight bytes on return since
-        // we never opened the temp file.
-        send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
-        metrics.inc_requests_failed();
-        ctx.streams.insert(stream_id, StreamState::Done);
-        return Ok(());
-    }
-    // Enforce client-requested overwrite refusal. lstat (not
-    // stat) so a planted symlink at `final_path` counts as
-    // "exists" -- otherwise an attacker who could plant a dangling
-    // symlink could bypass --no-clobber by aiming it at /nonexistent.
-    if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
-        // `reservation` releases the in-flight bytes on return.
-        return send_err(
-            ctx,
-            ErrorCode::AlreadyExists,
-            format!("path already exists (no_clobber): {path}"),
-        );
-    }
-    let temp_path = temp_path_for(&final_path, stream_id);
-
-    // Fresh upload: create a new temp file. Resume (offset > 0) was
-    // rejected above, so this is the only case.
-    let f = match open_temp_no_follow(&temp_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return send_err(
-                ctx,
-                io_code(&e),
-                format!("Failed to create upload temp file: {e}"),
-            );
-        }
-    };
-    let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, f);
-    let hasher = blake3::Hasher::new();
+    let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, file);
 
     // The reservation is now owned by `ReadingFileData`'s Drop (via
     // `reserved_bytes`); disarm the guard so the bytes aren't released
-    // twice. Every failure path below this point goes through a
-    // `ReadingFileData` value whose Drop returns the reservation.
+    // twice.
     reservation.disarm();
     let mut new_state = StreamState::ReadingFileData {
         final_path,
@@ -1518,6 +1664,9 @@ fn start_put(
             None
         },
         reserved_bytes: new_bytes,
+        prior_bytes,
+        rehash,
+        claim,
         owner: Arc::clone(&ctx.user),
     };
     if !leftover.is_empty() {
@@ -1525,6 +1674,7 @@ fn start_put(
             writer,
             remaining,
             hasher,
+            rehash,
             ..
         } = &mut new_state
         {
@@ -1536,17 +1686,25 @@ fn start_put(
                     err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
                 );
             }
-            if let Err(e) = writer.write_all(&leftover) {
-                return fail_stream(
-                    ctx,
-                    stream_id,
-                    metrics,
-                    err(ErrorCode::Internal, format!("Failed to write file: {e}")),
-                );
+            if let Some(rh) = rehash {
+                // Resume: the prefix isn't hashed yet, so these body
+                // bytes can't be hashed in order now. Hold them; the
+                // re-hash completion path in `drive_put` writes and
+                // hashes them once the prefix is done.
+                rh.pending_body = leftover;
+            } else {
+                if let Err(e) = writer.write_all(&leftover) {
+                    return fail_stream(
+                        ctx,
+                        stream_id,
+                        metrics,
+                        err(ErrorCode::Internal, format!("Failed to write file: {e}")),
+                    );
+                }
+                hasher.update(&leftover);
+                *remaining -= leftover.len() as u64;
+                metrics.add_bytes_received(leftover.len() as u64);
             }
-            hasher.update(&leftover);
-            *remaining -= leftover.len() as u64;
-            metrics.add_bytes_received(leftover.len() as u64);
         }
     }
     ctx.streams.insert(stream_id, new_state);
@@ -1582,11 +1740,67 @@ fn drive_put(
         expected_checksum,
         trailer_buf,
         reserved_bytes,
+        prior_bytes,
+        rehash,
         owner,
+        ..
     } = state
     else {
         return Ok(None);
     };
+
+    // Resume re-hash phase: feed one bounded slice of the existing
+    // partial's prefix through BLAKE3 per call. Spreading it over many
+    // calls keeps a large partial from stalling the event loop. Body
+    // bytes are left buffered in the QUIC stream until this is done.
+    if rehash.is_some() {
+        let rh = rehash.as_mut().unwrap();
+        let want = (rh.remaining as usize).min(tmp.len());
+        let n = match std::io::Read::read(&mut rh.reader, &mut tmp[..want]) {
+            Ok(0) => {
+                return Ok(Some(err(
+                    ErrorCode::Internal,
+                    "partial upload shrank during resume re-hash",
+                )));
+            }
+            Ok(n) => n,
+            Err(e) => {
+                return Ok(Some(err(
+                    io_code(&e),
+                    format!("resume re-hash read failed: {e}"),
+                )));
+            }
+        };
+        hasher.update(&tmp[..n]);
+        rh.remaining -= n as u64;
+        if rh.remaining > 0 {
+            return Ok(None);
+        }
+        // Prefix fully hashed. Hash the body bytes that arrived with the
+        // request (held back so they followed the prefix in hash
+        // order), write them to disk, then fall through to the body
+        // phase on the next call.
+        let pending = std::mem::take(&mut rh.pending_body);
+        *rehash = None;
+        if !pending.is_empty() {
+            if pending.len() as u64 > *remaining {
+                return Ok(Some(err(
+                    ErrorCode::UploadOverflow,
+                    "Upload exceeded declared size",
+                )));
+            }
+            if let Err(e) = writer.write_all(&pending) {
+                return Ok(Some(err(
+                    ErrorCode::Internal,
+                    format!("Failed to write file: {e}"),
+                )));
+            }
+            hasher.update(&pending);
+            *remaining -= pending.len() as u64;
+            metrics.add_bytes_received(pending.len() as u64);
+        }
+        return Ok(None);
+    }
 
     // Phase A: drain body bytes until `remaining == 0`. Anything past
     // the body in the same recv goes into the trailer buffer when
@@ -1686,11 +1900,10 @@ fn drive_put(
                 format!("Failed to flush file: {e}"),
             )));
         }
-        // Verify checksum before rename. If it mismatches we leave the
-        // temp in place for the Drop impl to clean up and refuse the
-        // upload -- never reveal a corrupted body at `final_path`.
-        // Trailer takes precedence over the legacy header checksum
-        // when both are present (defensive; client shouldn't set both).
+        // Verify checksum before rename -- never reveal a corrupted
+        // body at `final_path`. Trailer takes precedence over the
+        // legacy header checksum when both are present (defensive;
+        // client shouldn't set both).
         let expected: Option<[u8; 32]> = trailer_buf
             .as_ref()
             .filter(|b| b.is_full())
@@ -1699,6 +1912,28 @@ fn drive_put(
         if let Some(expected) = expected {
             let got = *hasher.finalize().as_bytes();
             if got != expected {
+                // The bytes on disk are known-corrupt; a resume would
+                // re-hash the same temp and fail forever. Remove it so
+                // the next upload starts fresh (mirrors `do_get`
+                // deleting a corrupt download). Settle the reservation
+                // and mark the stream done so the abort path in
+                // `StreamState`'s Drop doesn't also account for it.
+                let _ = fs::remove_file(temp_path);
+                owner
+                    .in_flight_bytes
+                    .fetch_sub(*reserved_bytes, Ordering::Relaxed);
+                // The partial is being deleted. Refund the prefix bytes
+                // a prior aborted session charged to `used_bytes`, or
+                // they leak permanently against the user's quota.
+                if *prior_bytes > 0 {
+                    owner
+                        .used_bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                            Some(u.saturating_sub(*prior_bytes))
+                        })
+                        .ok();
+                }
+                *completed = true;
                 return Ok(Some(err(
                     ErrorCode::ChecksumMismatch,
                     "Upload checksum verification failed",
@@ -1749,43 +1984,49 @@ fn apply_mode(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 fn apply_mode(_path: &Path, _mode: u32) {}
 
-fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
+/// Open the resumable Put temp file at `path`.
+///
+/// `resume == false` (fresh upload): the file is created if absent and
+/// opened read+write; the caller truncates it after refunding any stale
+/// partial's bytes. `resume == true`: the file must already exist and
+/// be a regular file; it is opened read+write without `O_CREAT` so a
+/// vanished partial fails cleanly rather than starting a blank upload.
+///
+/// `O_NOFOLLOW` is set in both cases so a symlink planted at the
+/// predictable temp path can never redirect the open. The 0o600 create
+/// mode keeps an in-progress partial unreadable by other local users
+/// (daemon umask, typically 0o022, would otherwise land it at 0o644).
+fn open_temp(path: &Path, resume: bool) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    // 0o600 + O_NOFOLLOW so the in-flight `.qftp.partial.*` file
-    // is never readable by other local users on a multi-user host.
-    // Without the explicit mode, daemon umask (typically 0o022)
-    // would land the file at 0o644 = world-readable until
-    // apply_mode runs on the renamed final_path.
-    qftp_common::fs_safe::apply_owner_only_no_follow(&mut opts).open(path)
+    opts.read(true).write(true);
+    if resume {
+        qftp_common::fs_safe::require_regular_file(path)?;
+        qftp_common::fs_safe::apply_no_follow(&mut opts);
+    } else {
+        opts.create(true);
+        qftp_common::fs_safe::apply_owner_only_no_follow(&mut opts);
+    }
+    opts.open(path)
 }
 
-fn temp_path_for(final_path: &Path, stream_id: u64) -> PathBuf {
-    // Append 8 bytes (16 hex chars) of cryptographic randomness
-    // to the temp name so a colluding user on the same writable
-    // directory can't plant a regular file at the predicted path
-    // and block legitimate uploads. The pid + stream_id form is
-    // kept for diagnostic value; the random suffix is what
-    // collapses the planting attack to ~2^64.
-    let mut rand_bytes = [0u8; 8];
-    use ring::rand::SecureRandom as _;
-    // A swallowed RNG failure here would leave an all-zero suffix and
-    // defeat the anti-planting defense above, so fail loudly instead.
-    ring::rand::SystemRandom::new()
-        .fill(&mut rand_bytes)
-        .expect("system RNG failed");
-    let suffix = qftp_common::util::to_hex(&rand_bytes);
-
+/// Compose the deterministic resumable-upload temp path for
+/// `final_path`: `<dir>/<filename>.qftp.partial`.
+///
+/// The name is intentionally predictable. An interrupted upload leaves
+/// its partial here, and a later session resumes it by sending an
+/// `offset`; the server has only the destination path to reconstruct
+/// the temp name from, so it cannot depend on a random suffix.
+///
+/// The anti-planting defence therefore moved from the name to the open
+/// mode (see [`open_temp`]): a fresh Put truncates and reuses whatever
+/// regular file sits at this path, and `O_NOFOLLOW` rejects a planted
+/// symlink.
+fn temp_path_for(final_path: &Path) -> PathBuf {
     let mut name = final_path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
-    name.push(format!(
-        ".qftp.partial.{}.{}.{}",
-        std::process::id(),
-        stream_id,
-        suffix,
-    ));
+    name.push(".qftp.partial");
     final_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -1864,9 +2105,37 @@ mod tests {
         // Force a permissive umask so the bug would be observable
         // without the explicit mode call.
         let _restore = UmaskGuard(unsafe { libc::umask(0o000) });
-        let f = open_temp_no_follow(&path).expect("temp create");
+        let f = open_temp(&path, false).expect("temp create");
         drop(f);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "temp file mode was {mode:o}, expected 0o600");
+    }
+
+    #[test]
+    fn temp_path_for_is_deterministic_and_a_sibling() {
+        // Resume relies on the same destination always mapping to the
+        // same partial path, so two calls must agree.
+        let target = Path::new("/srv/data/report.bin");
+        let a = temp_path_for(target);
+        let b = temp_path_for(target);
+        assert_eq!(a, b, "temp_path_for must be deterministic for resume");
+        assert_eq!(a.parent(), target.parent());
+        assert_eq!(
+            a.file_name().unwrap().to_str().unwrap(),
+            "report.bin.qftp.partial"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_temp_resume_requires_an_existing_partial() {
+        // A resume open must fail when there is no partial to continue
+        // rather than silently creating a blank one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.partial");
+        assert!(open_temp(&path, true).is_err());
+        // A fresh open creates it; a following resume open then works.
+        drop(open_temp(&path, false).expect("fresh open"));
+        assert!(open_temp(&path, true).is_ok());
     }
 }

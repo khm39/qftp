@@ -8,9 +8,12 @@
  * The bincode payload itself is little-endian, fixed-int encoded --
  * see crates/qftp-common/src/protocol.rs for the message definitions.
  *
- * Note: the bridge always appends a 32-byte BLAKE3 trailer after a Get
- * body. This client reads and discards it; in-browser BLAKE3
- * verification is a planned follow-up (needs a WASM/JS BLAKE3).
+ * Get and Put bodies carry a 32-byte BLAKE3 trailer for end-to-end
+ * integrity, exactly as the native qftp client does. BLAKE3 is
+ * computed in-browser by blake3.js (loaded before this script): a
+ * download is rejected if the trailer doesn't match the received
+ * bytes, and an upload appends a trailer the server verifies before
+ * it commits the file.
  */
 
 // ---------------------------------------------------------------------
@@ -88,7 +91,7 @@ function encodeRequest(req) {
       w.u64(req.offset || 0);
       w.u8(0); // checksum: None (header-checksum path unused by the web client)
       w.bool(req.noClobber || false);
-      w.bool(false); // checksum_trailer: off
+      w.bool(true); // checksum_trailer: a 32-byte BLAKE3 trailer follows the body
       break;
     case "Mkdir": w.u32(5); w.str(req.path); break;
     case "Rmdir": w.u32(6); w.str(req.path); break;
@@ -264,17 +267,25 @@ class Qftp {
     if (resp.type !== "FileReady") throw new Error("unexpected reply to Get");
 
     const total = Number(resp.size);
+    const hasher = new Blake3();
     const chunks = [];
     let got = 0;
     while (got < total) {
       const chunk = await bs.readSome(Math.min(CHUNK, total - got));
       if (!chunk) throw new Error("stream ended before the file body completed");
+      hasher.update(chunk);
       chunks.push(chunk);
       got += chunk.length;
       onProgress(got, total);
     }
     if (resp.checksumFollows) {
-      await bs.readExact(32); // BLAKE3 trailer; verification is a follow-up
+      const trailer = await bs.readExact(32);
+      const digest = hasher.digest();
+      for (let i = 0; i < 32; i++) {
+        if (trailer[i] !== digest[i]) {
+          throw new Error("BLAKE3 checksum mismatch: the download is corrupt");
+        }
+      }
     }
     return new Blob(chunks);
   }
@@ -287,15 +298,21 @@ class Qftp {
       type: "Put", path, size, mode: 0o644, offset: 0, noClobber: false,
     })));
 
+    // Hash the body as it streams so the server can verify integrity
+    // end-to-end; the 32-byte BLAKE3 trailer follows the body on the
+    // same stream, matching the native client's wire format.
+    const hasher = new Blake3();
     const reader = file.stream().getReader();
     let sent = 0;
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
+      hasher.update(value);
       await writer.write(value);
       sent += value.length;
       onProgress(sent, size);
     }
+    await writer.write(hasher.digest());
     await writer.close();
 
     const bs = new ByteStream(stream.readable);

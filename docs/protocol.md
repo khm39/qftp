@@ -62,8 +62,8 @@ server -> client : Response::Ok | Response::Err(...)
 ```
 
 - `size` is the number of body bytes the client is about to send (post-offset).
-- `offset` enables append-style resume. When `offset > 0` the server validates that an existing temp file already has exactly that many bytes; if not, it returns `ErrorCode::InvalidRange`. The temp lives next to the eventual destination so the final `rename` is atomic, and is named `<final-filename>.qftp.partial.<server-pid>.<stream-id>` (e.g. uploading `dump.bin` from stream 4 of server pid 17654 lands at `dump.bin.qftp.partial.17654.4` first).
-- `checksum` (BLAKE3 of the full file, not just the bytes being sent this round) is verified after the last byte. On mismatch the temp is left for the Drop cleanup and the response carries `ErrorCode::ChecksumMismatch`.
+- `offset` enables append-style resume. The interrupted upload's partial lives next to the eventual destination as `<final-filename>.qftp.partial` (so the final `rename` stays atomic) and is kept on disk across a disconnect. The name is deterministic — derived only from the destination — so a later session can find it: a client `Stat`s that path to learn how many bytes already landed and sends that count as `offset` (the native client does this automatically). When `offset > 0` the server opens the existing partial, requires it to be exactly `offset` bytes long (`ErrorCode::InvalidRange` otherwise), re-hashes that prefix into the running BLAKE3, and appends. A fresh Put (`offset == 0`) truncates and reuses any stale partial at that path.
+- `checksum` (BLAKE3 of the full file, not just the bytes being sent this round) is verified after the last byte. On mismatch the temp is removed — a corrupt partial would only fail the same check on every resume — and the response carries `ErrorCode::ChecksumMismatch`.
 
 Upon success, the server `rename`s the temp into place atomically and applies `mode` (Unix only).
 

@@ -18,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_JS: &str = include_str!("../../../web/app.js");
+const BLAKE3_JS: &str = include_str!("../../../web/blake3.js");
 const STYLE_CSS: &str = include_str!("../../../web/style.css");
 
 /// Largest request head we will buffer. We only ever read the request
@@ -51,6 +52,10 @@ fn route(target: &str) -> Option<StaticFile> {
         "/app.js" => Some(StaticFile {
             content_type: "text/javascript; charset=utf-8",
             body: APP_JS.as_bytes(),
+        }),
+        "/blake3.js" => Some(StaticFile {
+            content_type: "text/javascript; charset=utf-8",
+            body: BLAKE3_JS.as_bytes(),
         }),
         "/style.css" => Some(StaticFile {
             content_type: "text/css; charset=utf-8",
@@ -196,6 +201,14 @@ mod tests {
     fn serves_app_js_with_query_string() {
         let resp = build_response("GET /app.js?v=2 HTTP/1.1", CFG);
         assert!(head_of(&resp).contains("text/javascript"));
+    }
+
+    #[test]
+    fn serves_blake3_js() {
+        let resp = build_response("GET /blake3.js HTTP/1.1", CFG);
+        let head = head_of(&resp);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(head.contains("text/javascript"), "{head}");
     }
 
     #[test]

@@ -10,6 +10,27 @@ is what we will bump to signal an intentional wire break.
 
 ### Added
 
+- **`mget` — remote wildcard download.** `mget <glob> [local-dir]`
+  lists a remote directory and downloads every file whose name matches
+  the glob, the download counterpart to `put`'s existing client-side
+  glob expansion. `mput` is added as an alias of `put` so FTP-familiar
+  muscle memory works. (#175)
+- **End-to-end integrity for the browser client.** The web SPA now
+  computes BLAKE3 in-browser (a small pure-JS implementation,
+  `web/blake3.js`): downloads verify the server's trailer and reject a
+  corrupt file, and uploads append a BLAKE3 trailer the bridge verifies
+  before committing. Previously browser transfers had no end-to-end
+  integrity check while native transfers did.
+- **Working upload resume.** An interrupted `put` now leaves a
+  deterministically named `<name>.qftp.partial` on the server; the
+  next `put` of the same file probes that temp with `Stat` and resumes
+  from where it stopped, mirroring `get`'s download resume. Previously
+  the random temp-file suffix made the server-side resume path
+  unreachable, so `offset > 0` was rejected outright. The bytes in an
+  aborted upload's partial are charged to the user's quota until the
+  partial is resumed or replaced, so an abort loop can't bypass the
+  limit.
+
 - **WebTransport bridge (`qftp-web-bridge`).** A new standalone binary
   that serves qftp to browsers over WebTransport (HTTP/3). It runs
   alongside `qftp-server` (same `--root` and `users.toml`), carries

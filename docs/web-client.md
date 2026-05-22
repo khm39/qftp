@@ -92,12 +92,23 @@ session is served as the anonymous (read-only) user, mirroring
 Tokens must be URL-safe and high-entropy -- they are the only secret
 gating access over this transport.
 
+## Integrity
+
+The SPA verifies transfers end-to-end with BLAKE3, exactly as the
+native client does. BLAKE3 is computed in-browser by a small pure-JS
+implementation (`web/blake3.js`, served at `/blake3.js`):
+
+- **Download:** the 32-byte trailer the bridge appends after the body
+  is checked against the hash of the received bytes; a mismatch aborts
+  the download.
+- **Upload:** the SPA hashes the file as it streams and appends the
+  same 32-byte trailer, which the bridge verifies before it commits the
+  file. A corrupt upload is refused with `ChecksumMismatch`.
+
+`web/blake3.test.js` pins the JS implementation against digests from
+the Rust `blake3` crate (`node web/blake3.test.js`).
+
 ## Limitations
 
 - **Upload resume is not supported** by the bridge; the SPA uploads
-  whole files (`offset = 0`).
-- **In-browser BLAKE3 verification is not implemented yet.** The
-  bridge still streams the 32-byte BLAKE3 trailer after every download
-  (identical wire format to the native protocol); the SPA currently
-  reads and discards it. Verifying it in the browser needs a
-  WASM/JS BLAKE3 and is a planned follow-up.
+  whole files (`offset = 0`). Resume is a native-client feature.
