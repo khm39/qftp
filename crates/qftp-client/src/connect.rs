@@ -101,11 +101,21 @@ pub fn establish(
     // handles both numeric literals (`127.0.0.1:4433`, `[::1]:4433`)
     // and DNS names; a plain `str::parse::<SocketAddr>()` would only
     // accept numeric literals and reject every hostname.
-    let peer_addr = spec
+    let resolved: Vec<_> = spec
         .host
         .to_socket_addrs()
         .with_context(|| format!("{context_label}: cannot resolve host {}", spec.host))?
-        .next()
+        .collect();
+    // Prefer an IPv4 address. The client socket was historically
+    // IPv4-only; a dual-stack name (e.g. `localhost`) often lists its
+    // IPv6 address first, and IPv4 is the most broadly reachable. Fall
+    // back to IPv6 only when that is all the name resolves to, so
+    // IPv6-only hosts still work.
+    let peer_addr = resolved
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| resolved.first())
+        .copied()
         .ok_or_else(|| {
             anyhow!(
                 "{context_label}: host {} resolved to no addresses",
