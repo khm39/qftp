@@ -10,6 +10,12 @@ is what we will bump to signal an intentional wire break.
 
 ### Added
 
+- **End-to-end integrity for the browser client.** The web SPA now
+  computes BLAKE3 in-browser (a small pure-JS implementation,
+  `web/blake3.js`): downloads verify the server's trailer and reject a
+  corrupt file, and uploads append a BLAKE3 trailer the bridge verifies
+  before committing. Previously browser transfers had no end-to-end
+  integrity check while native transfers did.
 - **Working upload resume.** An interrupted `put` now leaves a
   deterministically named `<name>.qftp.partial` on the server; the
   next `put` of the same file probes that temp with `Stat` and resumes

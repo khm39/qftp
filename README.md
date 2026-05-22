@@ -192,7 +192,7 @@ legacy flags / defaults.
 It is a separate binary that runs alongside `qftp-server`, shares the
 same `--root` and `users.toml`, and ships a single-page app: directory
 browsing, drag-and-drop upload, download, delete, and rename, all with
-progress bars.
+progress bars and end-to-end BLAKE3 integrity checks.
 
 ```
 qftp-web-bridge \
