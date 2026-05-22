@@ -96,6 +96,32 @@ is what we will bump to signal an intentional wire break.
   *gauge*, not a counter. (Pre-existing fix; calling out so
   dashboards know what to expect.)
 
+### Fixed
+
+- **Resumed downloads no longer fail integrity verification.** On a
+  resumed `get` the client hashed the *whole* local file while the
+  server's trailer covers only the streamed `[offset..]` suffix (as
+  `docs/protocol.md` specifies), so the BLAKE3 check always mismatched
+  and the partial file was deleted -- resume was completely broken. The
+  client now hashes only the bytes it receives. (#178)
+- **The client can connect to hostnames again.** Connection setup fed
+  `host:port` straight to `str::parse::<SocketAddr>()`, which only
+  accepts numeric IP literals, so every DNS name was rejected. The host
+  is now resolved via `ToSocketAddrs`, and the local socket is bound in
+  the resolved address family. (#179)
+- **Resumed uploads now commit when the whole body arrives at once.**
+  After the server finished re-hashing a resumed upload's prefix it
+  returned early; if the entire post-offset body had arrived in the
+  initial request burst the stream had no more readable data, so the
+  upload never reached the commit phase and stalled until the
+  connection timed out. The re-hash completion path now falls through
+  into the body phase. (#180)
+- **A stale server-side partial now triggers a clean retry.** A resumed
+  `put` whose partial had vanished or changed length was refused with
+  `InvalidRange`, but the client only treated `ChecksumMismatch` as a
+  stale partial, so the upload hard-failed instead of restarting from
+  scratch. Both codes now trigger the retry-from-zero path. (#181)
+
 ### Security
 
 - Stateless retry (`--require-retry`) prevents source-address spoofing

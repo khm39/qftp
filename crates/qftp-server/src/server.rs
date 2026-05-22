@@ -1801,8 +1801,8 @@ fn drive_put(
         }
         // Prefix fully hashed. Hash the body bytes that arrived with the
         // request (held back so they followed the prefix in hash
-        // order), write them to disk, then fall through to the body
-        // phase on the next call.
+        // order), write them to disk, then continue into the body
+        // phase (Phase A) below.
         let pending = std::mem::take(&mut rh.pending_body);
         *rehash = None;
         if !pending.is_empty() {
@@ -1822,7 +1822,10 @@ fn drive_put(
             *remaining -= pending.len() as u64;
             metrics.add_bytes_received(pending.len() as u64);
         }
-        return Ok(None);
+        // Deliberately fall through into Phase A rather than returning:
+        // if `pending` already held the whole body, the stream has no
+        // more readable data and no later `drive_put` call would come,
+        // so the upload would never reach Phase B / commit (#180).
     }
 
     // Phase A: drain body bytes until `remaining == 0`. Anything past

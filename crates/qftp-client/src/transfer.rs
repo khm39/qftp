@@ -241,34 +241,15 @@ fn do_get_inner(
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;
 
-    // When resuming, the server's BLAKE3 trailer is computed
-    // over the whole file (server side has no resume concept on its
-    // hashing path). Feed the existing on-disk prefix into the hasher
-    // before we start consuming network bytes so the trailer check
-    // covers prefix tampering as well as new-byte tampering. Without
-    // this, an attacker who modified the partial file would land a
-    // passing checksum on a corrupt result.
+    // The server's BLAKE3 trailer certifies exactly the bytes it
+    // streams. On a resumed Get (`offset > 0`) it seeks to `offset` and
+    // hashes only the `[offset..]` suffix it sends -- not the whole
+    // file. So the client hashes only the bytes it receives. Feeding
+    // the on-disk prefix in here would compute a whole-file hash that
+    // can never match the server's suffix trailer, failing every
+    // resumed download.
     let mut hasher = blake3::Hasher::new();
     if resume_offset > 0 {
-        // Hash the prefix straight from the O_NOFOLLOW handle we'll
-        // write through: a second open-by-path would cost an extra
-        // syscall and reopen without the symlink guard.
-        let mut buf = [0u8; CHUNK];
-        let mut left = resume_offset;
-        while left > 0 {
-            let want = (left as usize).min(buf.len());
-            let n = file
-                .read(&mut buf[..want])
-                .with_context(|| format!("read resume prefix from {}", local.display()))?;
-            if n == 0 {
-                bail!(
-                    "partial file shorter than advertised offset {resume_offset}; \
-                     remove it and retry (#116)"
-                );
-            }
-            hasher.update(&buf[..n]);
-            left -= n as u64;
-        }
         file.seek(SeekFrom::Start(resume_offset))
             .with_context(|| format!("seeking to {resume_offset}"))?;
     }
@@ -594,11 +575,10 @@ fn do_put_inner(
             Ok(())
         }
         Response::Err(e) => {
-            if offset > 0 && e.code == ErrorCode::ChecksumMismatch {
-                // A resumed upload failed verification: the server-side
-                // partial no longer matches the local file. The server
-                // discards the bad partial, so signal the caller to
-                // retry the whole upload from scratch.
+            if is_stale_partial(offset, e.code) {
+                // The resumed upload was refused because the server-side
+                // partial is stale; signal the caller to retry the
+                // whole upload from scratch.
                 return Err(anyhow::Error::new(StalePartial));
             }
             bail!("server refused Put: {} ({:?})", e.message, e.code)
@@ -608,9 +588,10 @@ fn do_put_inner(
 }
 
 /// Error returned by [`do_put`] when a *resumed* upload (`offset > 0`)
-/// was refused with `ChecksumMismatch` -- the server-side partial no
-/// longer matches the local file. The server discards the stale
-/// partial, so the caller should retry the upload from `offset = 0`.
+/// was refused because the server-side partial is stale -- either its
+/// bytes no longer match the local file (`ChecksumMismatch`) or it has
+/// vanished / changed length (`InvalidRange`). The caller should retry
+/// the upload from `offset = 0`.
 #[derive(Debug)]
 pub struct StalePartial;
 
@@ -621,6 +602,15 @@ impl std::fmt::Display for StalePartial {
 }
 
 impl std::error::Error for StalePartial {}
+
+/// True when a refused resumed upload should be retried from scratch.
+/// The server-side partial is stale: its bytes mismatch the local file
+/// (`ChecksumMismatch`), or it vanished / changed length so the resume
+/// offset no longer lines up (`InvalidRange`). A non-resume upload
+/// (`offset == 0`) is never stale -- there is no partial to retry past.
+fn is_stale_partial(offset: u64, code: ErrorCode) -> bool {
+    offset > 0 && matches!(code, ErrorCode::ChecksumMismatch | ErrorCode::InvalidRange)
+}
 
 /// Probe the server for a resumable partial upload of `remote`.
 ///
@@ -721,5 +711,20 @@ mod tests {
         );
         // Reset for the next test.
         BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stale_partial_only_for_resumed_uploads() {
+        // A resumed upload (offset > 0) refused for a stale-partial
+        // reason -- mismatching bytes, or a vanished / wrong-length
+        // partial -- should retry the whole upload from scratch.
+        assert!(is_stale_partial(100, ErrorCode::ChecksumMismatch));
+        assert!(is_stale_partial(100, ErrorCode::InvalidRange));
+        // A fresh upload (offset == 0) has no partial to retry past,
+        // and an unrelated error is a real failure either way.
+        assert!(!is_stale_partial(0, ErrorCode::ChecksumMismatch));
+        assert!(!is_stale_partial(0, ErrorCode::InvalidRange));
+        assert!(!is_stale_partial(100, ErrorCode::NotFound));
+        assert!(!is_stale_partial(100, ErrorCode::PermissionDenied));
     }
 }
