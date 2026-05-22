@@ -11,7 +11,7 @@ authors.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
-quiche = "0.22"
+quiche = "0.24"
 tracing = "0.1"
 mio = { version = "1", features = ["net", "os-poll"] }
 anyhow = "1"
