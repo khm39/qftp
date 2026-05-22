@@ -749,8 +749,7 @@ fn run_one_line(
                     });
                     // Auto-resume an interrupted upload, mirroring the
                     // way `get` resumes from a partial local file.
-                    let local_size =
-                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let local_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     let offset = transfer::probe_put_resume_offset(
                         conn,
                         socket,
@@ -784,10 +783,7 @@ fn run_one_line(
                 }
             }
         }
-        repl::Command::Mget {
-            pattern,
-            local_dir,
-        } => {
+        repl::Command::Mget { pattern, local_dir } => {
             do_mget(
                 conn,
                 socket,
@@ -827,6 +823,7 @@ fn expand_glob(pattern: &str) -> Vec<PathBuf> {
 /// glob (`mget`). Unlike `put`'s local glob, the wildcard is expanded
 /// against a server `Ls`, so only the final path component may carry
 /// glob metacharacters; the directory part is taken verbatim.
+#[allow(clippy::too_many_arguments)]
 fn do_mget(
     conn: &mut quiche::Connection,
     socket: &mio::net::UdpSocket,
