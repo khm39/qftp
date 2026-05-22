@@ -41,7 +41,9 @@ use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
 use crate::retry::RetryKey;
 use qftp_protocol::handler::{self, err, io_code};
-use qftp_protocol::stream::{StreamState, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
+use qftp_protocol::stream::{
+    ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+};
 use qftp_protocol::user::{self, User, UserDirectory};
 
 /// Which Request variants are safe to serve while the connection is
@@ -375,10 +377,25 @@ pub fn run(
         }
 
         let shortest_timeout = connections.values().filter_map(|c| c.conn.timeout()).min();
-        let poll_timeout = match (closing, shortest_timeout) {
-            (true, t) => Some(t.unwrap_or(Duration::from_millis(250))),
-            (false, Some(t)) => Some(t),
-            (false, None) => None,
+        // A resumed Put re-hashing its on-disk prefix has pure local
+        // work to do that no network event will wake the loop for; spin
+        // at a zero timeout until that re-hash finishes.
+        let rehash_pending = connections.values().any(|c| {
+            c.streams.values().any(|s| {
+                matches!(
+                    s,
+                    StreamState::ReadingFileData {
+                        rehash: Some(_),
+                        ..
+                    }
+                )
+            })
+        });
+        let poll_timeout = match (closing, rehash_pending, shortest_timeout) {
+            (true, _, t) => Some(t.unwrap_or(Duration::from_millis(250))),
+            (false, true, _) => Some(Duration::ZERO),
+            (false, false, Some(t)) => Some(t),
+            (false, false, None) => None,
         };
         poll.poll(&mut events, poll_timeout)
             .context("poll failed")?;
@@ -480,6 +497,7 @@ pub fn run(
                 &handler_pool,
                 &mut readable_ids,
             )?;
+            drive_rehash_streams(ctx, &mut buf, &metrics)?;
             drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)?;
             flush_egress(&mut ctx.conn, &socket)?;
         }
@@ -1172,6 +1190,44 @@ fn drive_sending_streams(
     Ok(())
 }
 
+/// Advance the prefix re-hash of any resumed Put whose `rehash` is
+/// still `Some`. Driven every main-loop iteration (the poll timeout is
+/// forced to zero while any exist) so the re-hash makes progress
+/// without waiting on network events, since it is pure local I/O.
+fn drive_rehash_streams(
+    ctx: &mut ConnectionContext,
+    scratch: &mut [u8],
+    metrics: &Metrics,
+) -> Result<()> {
+    let ids: Vec<u64> = ctx
+        .streams
+        .iter()
+        .filter(|(_, s)| {
+            matches!(
+                s,
+                StreamState::ReadingFileData {
+                    rehash: Some(_),
+                    ..
+                }
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for stream_id in ids {
+        let Some(state) = ctx.streams.get_mut(&stream_id) else {
+            continue;
+        };
+        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, scratch, metrics)? {
+            if matches!(resp, Response::Err(_)) {
+                metrics.inc_requests_failed();
+            }
+            send_message(&mut ctx.conn, stream_id, &resp)?;
+            *state = StreamState::Done;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SendOutcome {
     Blocked,
@@ -1390,6 +1446,20 @@ fn start_put(
             format!("path already exists (no_clobber): {path}"),
         );
     }
+    // Claim the destination so a second concurrent Put to the same path
+    // can't share -- and corrupt -- the one deterministically named
+    // temp. The claim is a local until it moves into `ReadingFileData`;
+    // an early return before then drops it and frees the path.
+    let claim = match UploadClaim::try_claim(Arc::clone(&ctx.user), final_path.clone()) {
+        Some(c) => c,
+        None => {
+            return send_err(
+                ctx,
+                ErrorCode::AlreadyExists,
+                format!("an upload to this path is already in progress: {path}"),
+            );
+        }
+    };
     let temp_path = temp_path_for(&final_path);
 
     // Open the deterministically named resumable temp file *before* the
@@ -1405,7 +1475,7 @@ fn start_put(
     //     exactly `offset` bytes; re-hash that prefix so the BLAKE3
     //     trailer check still covers the whole file. `prior_bytes` is
     //     `offset`: those bytes are already counted in `used_bytes`.
-    let (file, hasher, prior_bytes) = if offset == 0 {
+    let (file, hasher, prior_bytes, rehash) = if offset == 0 {
         let f = match open_temp(&temp_path, false) {
             Ok(f) => f,
             Err(e) => {
@@ -1443,7 +1513,7 @@ fn start_put(
             use std::os::unix::fs::PermissionsExt;
             let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
         }
-        (f, blake3::Hasher::new(), 0u64)
+        (f, blake3::Hasher::new(), 0u64, None)
     } else {
         let mut f = match open_temp(&temp_path, true) {
             Ok(f) => f,
@@ -1463,22 +1533,34 @@ fn start_put(
                 format!("resume offset {offset} does not match partial length {have}"),
             );
         }
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; FILE_CHUNK_SIZE];
-        let mut left = offset;
-        while left > 0 {
-            let want = (left as usize).min(buf.len());
-            if let Err(e) = f.read_exact(&mut buf[..want]) {
+        // Position the write handle to append after the prefix.
+        if let Err(e) = std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset)) {
+            return send_err(
+                ctx,
+                io_code(&e),
+                format!("Failed to seek partial upload: {e}"),
+            );
+        }
+        // Re-hash the [0, offset) prefix incrementally through a second
+        // handle, so a large partial doesn't block the event loop with
+        // one synchronous pass (driven by `drive_rehash_streams`). The
+        // hasher starts empty and is filled before any body byte.
+        let rehash_handle = match open_temp(&temp_path, true) {
+            Ok(h) => h,
+            Err(e) => {
                 return send_err(
                     ctx,
                     io_code(&e),
-                    format!("Failed to re-hash partial upload: {e}"),
+                    format!("Failed to reopen partial for re-hash: {e}"),
                 );
             }
-            hasher.update(&buf[..want]);
-            left -= want as u64;
-        }
-        (f, hasher, offset)
+        };
+        let rehash = ResumeRehash {
+            reader: std::io::BufReader::with_capacity(FILE_CHUNK_SIZE, rehash_handle),
+            remaining: offset,
+            pending_body: Vec::new(),
+        };
+        (f, blake3::Hasher::new(), offset, Some(rehash))
     };
 
     // Quota pre-check + in-flight reservation. `used_bytes` now reflects
@@ -1530,6 +1612,8 @@ fn start_put(
         },
         reserved_bytes: new_bytes,
         prior_bytes,
+        rehash,
+        claim,
         owner: Arc::clone(&ctx.user),
     };
     if !leftover.is_empty() {
@@ -1537,6 +1621,7 @@ fn start_put(
             writer,
             remaining,
             hasher,
+            rehash,
             ..
         } = &mut new_state
         {
@@ -1548,17 +1633,25 @@ fn start_put(
                     err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
                 );
             }
-            if let Err(e) = writer.write_all(&leftover) {
-                return fail_stream(
-                    ctx,
-                    stream_id,
-                    metrics,
-                    err(ErrorCode::Internal, format!("Failed to write file: {e}")),
-                );
+            if let Some(rh) = rehash {
+                // Resume: the prefix isn't hashed yet, so these body
+                // bytes can't be hashed in order now. Hold them; the
+                // re-hash completion path in `drive_put` writes and
+                // hashes them once the prefix is done.
+                rh.pending_body = leftover;
+            } else {
+                if let Err(e) = writer.write_all(&leftover) {
+                    return fail_stream(
+                        ctx,
+                        stream_id,
+                        metrics,
+                        err(ErrorCode::Internal, format!("Failed to write file: {e}")),
+                    );
+                }
+                hasher.update(&leftover);
+                *remaining -= leftover.len() as u64;
+                metrics.add_bytes_received(leftover.len() as u64);
             }
-            hasher.update(&leftover);
-            *remaining -= leftover.len() as u64;
-            metrics.add_bytes_received(leftover.len() as u64);
         }
     }
     ctx.streams.insert(stream_id, new_state);
@@ -1595,11 +1688,66 @@ fn drive_put(
         trailer_buf,
         reserved_bytes,
         prior_bytes,
+        rehash,
         owner,
+        ..
     } = state
     else {
         return Ok(None);
     };
+
+    // Resume re-hash phase: feed one bounded slice of the existing
+    // partial's prefix through BLAKE3 per call. Spreading it over many
+    // calls keeps a large partial from stalling the event loop. Body
+    // bytes are left buffered in the QUIC stream until this is done.
+    if rehash.is_some() {
+        let rh = rehash.as_mut().unwrap();
+        let want = (rh.remaining as usize).min(tmp.len());
+        let n = match std::io::Read::read(&mut rh.reader, &mut tmp[..want]) {
+            Ok(0) => {
+                return Ok(Some(err(
+                    ErrorCode::Internal,
+                    "partial upload shrank during resume re-hash",
+                )));
+            }
+            Ok(n) => n,
+            Err(e) => {
+                return Ok(Some(err(
+                    io_code(&e),
+                    format!("resume re-hash read failed: {e}"),
+                )));
+            }
+        };
+        hasher.update(&tmp[..n]);
+        rh.remaining -= n as u64;
+        if rh.remaining > 0 {
+            return Ok(None);
+        }
+        // Prefix fully hashed. Hash the body bytes that arrived with the
+        // request (held back so they followed the prefix in hash
+        // order), write them to disk, then fall through to the body
+        // phase on the next call.
+        let pending = std::mem::take(&mut rh.pending_body);
+        *rehash = None;
+        if !pending.is_empty() {
+            if pending.len() as u64 > *remaining {
+                return Ok(Some(err(
+                    ErrorCode::UploadOverflow,
+                    "Upload exceeded declared size",
+                )));
+            }
+            if let Err(e) = writer.write_all(&pending) {
+                return Ok(Some(err(
+                    ErrorCode::Internal,
+                    format!("Failed to write file: {e}"),
+                )));
+            }
+            hasher.update(&pending);
+            *remaining -= pending.len() as u64;
+            metrics.add_bytes_received(pending.len() as u64);
+        }
+        return Ok(None);
+    }
 
     // Phase A: drain body bytes until `remaining == 0`. Anything past
     // the body in the same recv goes into the trailer buffer when

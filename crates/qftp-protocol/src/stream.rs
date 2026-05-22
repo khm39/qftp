@@ -7,7 +7,7 @@
 //! from it.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -70,6 +70,62 @@ impl Default for TrailerBuf {
     }
 }
 
+/// Incremental re-hash of a resumed upload's on-disk prefix.
+///
+/// A resume continues an existing `.qftp.partial`; the server must feed
+/// that prefix through BLAKE3 before the new body bytes so the trailer
+/// check still covers the whole file. Doing it in one synchronous pass
+/// would block the event loop for the length of the prefix (up to
+/// `MAX_FILE_SIZE`), so the prefix is hashed a slice at a time, driven
+/// from the main loop. `remaining` counts bytes still to read.
+pub struct ResumeRehash {
+    pub reader: BufReader<File>,
+    pub remaining: u64,
+    /// Body bytes that arrived in the same read as the Put request.
+    /// They must be hashed *after* the prefix, so they are held here
+    /// until the re-hash finishes rather than hashed on arrival.
+    pub pending_body: Vec<u8>,
+}
+
+/// RAII claim on an upload destination path.
+///
+/// The `.qftp.partial` temp name is deterministic, so two concurrent
+/// Puts to the same destination would otherwise open and interleave
+/// their writes into one file -- and since each side's BLAKE3 is
+/// computed over the bytes *it* sent (not the file content), the loser
+/// could even commit a corrupt file that passed verification.
+/// `start_put` takes a claim before accepting a Put; while it is held,
+/// a second Put to the same path is refused. The claim lives inside
+/// `ReadingFileData`, so it is released whenever the stream ends --
+/// commit, abort, or error.
+pub struct UploadClaim {
+    owner: Arc<User>,
+    path: PathBuf,
+}
+
+impl UploadClaim {
+    /// Claim `path` for `user`. Returns `None` when another upload to
+    /// the same path is already in progress.
+    pub fn try_claim(user: Arc<User>, path: PathBuf) -> Option<UploadClaim> {
+        let claimed = user
+            .active_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone());
+        claimed.then(|| UploadClaim { owner: user, path })
+    }
+}
+
+impl Drop for UploadClaim {
+    fn drop(&mut self) {
+        self.owner
+            .active_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.path);
+    }
+}
+
 /// Per-stream state on the server side.
 ///
 /// The `Drop` impl on `ReadingFileData` is what guarantees we never leak
@@ -107,6 +163,17 @@ pub enum StreamState {
         /// deleted, so the mismatch path must refund these from
         /// `used_bytes` or they leak against the user's quota.
         prior_bytes: u64,
+        /// `Some` while a resumed upload's existing prefix is still
+        /// being re-hashed (see [`ResumeRehash`]); `None` for a fresh
+        /// upload or once the prefix is fully hashed. Body bytes are
+        /// not consumed until this is `None`.
+        rehash: Option<ResumeRehash>,
+        /// RAII claim on the destination path; refuses a second
+        /// concurrent Put to the same path. Released when this state
+        /// drops (commit, abort, or error). Held purely for its
+        /// `Drop`, never read.
+        #[allow(dead_code)]
+        claim: UploadClaim,
         /// Back-reference to the user whose counters we mutate. We
         /// can't share the connection's Arc<User> directly here
         /// because the StreamState is stored inside the connection;
@@ -185,6 +252,7 @@ mod tests {
             quota_bytes: Some(1_000_000),
             used_bytes: AtomicU64::new(0),
             in_flight_bytes: AtomicU64::new(0),
+            active_uploads: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -196,6 +264,7 @@ mod tests {
         completed: bool,
     ) -> StreamState {
         let f = File::create(&temp).unwrap();
+        let claim = UploadClaim::try_claim(Arc::clone(&user), temp.clone()).unwrap();
         StreamState::ReadingFileData {
             final_path: temp.with_extension("final"),
             temp_path: temp,
@@ -208,6 +277,8 @@ mod tests {
             trailer_buf: None,
             reserved_bytes: reserved,
             prior_bytes: 0,
+            rehash: None,
+            claim,
             owner: user,
         }
     }

@@ -8,10 +8,10 @@
 //! rejected with `Unauthorized` rather than silently downgraded to
 //! anonymous.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -131,6 +131,11 @@ pub struct User {
     /// completion path subtracts them (and adds to `used_bytes` on
     /// success). This closes the parallel-Put bypass.
     pub in_flight_bytes: AtomicU64,
+    /// Destination paths with an upload currently in progress. The
+    /// `.qftp.partial` temp name is deterministic, so two concurrent
+    /// Puts to the same path would share one temp; `UploadClaim` (see
+    /// `stream.rs`) uses this set to refuse the second.
+    pub active_uploads: Mutex<HashSet<PathBuf>>,
 }
 
 impl User {
@@ -202,6 +207,7 @@ impl UserDirectory {
             quota_bytes: None,
             used_bytes: AtomicU64::new(0),
             in_flight_bytes: AtomicU64::new(0),
+            active_uploads: Mutex::new(HashSet::new()),
         });
         Self {
             by_name: HashMap::new(),
@@ -289,6 +295,7 @@ impl UserDirectory {
                 quota_bytes: spec.quota_bytes,
                 used_bytes: AtomicU64::new(used),
                 in_flight_bytes: AtomicU64::new(0),
+                active_uploads: Mutex::new(HashSet::new()),
             })
         };
 
@@ -315,6 +322,7 @@ impl UserDirectory {
                     quota_bytes: None,
                     used_bytes: AtomicU64::new(used),
                     in_flight_bytes: AtomicU64::new(0),
+                    active_uploads: Mutex::new(HashSet::new()),
                 })
             }
         };
@@ -644,6 +652,7 @@ mod tests {
             quota_bytes: Some(100),
             used_bytes: AtomicU64::new(40),
             in_flight_bytes: AtomicU64::new(0),
+            active_uploads: Mutex::new(HashSet::new()),
         };
         assert_eq!(user.current_usage(), 40);
 
