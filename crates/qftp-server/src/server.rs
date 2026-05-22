@@ -1542,6 +1542,18 @@ fn start_put(
         Ok(p) => p,
         Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
     };
+    // A path whose final component is not a real file name (it ends in
+    // `..` or `/`) has no leaf for `temp_path_for` to build a temp name
+    // from: `file_name()` is `None`, so the temp would collapse to the
+    // bare `.qftp.partial`, shared by every such upload and impossible
+    // to address via `Ls`/`Rm`. Refuse the Put up front.
+    if final_path.file_name().is_none() {
+        return send_err(
+            ctx,
+            ErrorCode::Malformed,
+            "invalid upload path: no file name".to_string(),
+        );
+    }
     // Parent-dir symlink TOCTOU re-check. The temp file is opened with
     // O_NOFOLLOW, which protects the *leaf* but not the intermediate
     // components -- a parent swapped to a symlink between resolve_parent
@@ -1822,21 +1834,47 @@ fn drive_put(
     // calls keeps a large partial from stalling the event loop. Body
     // bytes are left buffered in the QUIC stream until this is done.
     if rehash.is_some() {
+        // On a resume re-hash read failure the stream is torn down, but
+        // `StreamState`'s Drop runs with `completed == false`: it
+        // releases `reserved_bytes` yet does NOT refund `prior_bytes`
+        // (the `offset` prefix already charged to `used_bytes`) and
+        // does NOT delete the temp. A persistent read error would then
+        // lock those prefix bytes against the user's quota until the
+        // 24h stale sweep. Mirror the checksum-mismatch path: delete
+        // the temp, refund `prior_bytes` to the owner's `used_bytes`,
+        // and mark the stream `completed` so Drop's abort accounting
+        // does not double-count it.
+        let mut abort_rehash = |err_resp: Response| -> Response {
+            let _ = fs::remove_file(&*temp_path);
+            owner
+                .in_flight_bytes
+                .fetch_sub(*reserved_bytes, Ordering::Relaxed);
+            if *prior_bytes > 0 {
+                owner
+                    .used_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                        Some(u.saturating_sub(*prior_bytes))
+                    })
+                    .ok();
+            }
+            *completed = true;
+            err_resp
+        };
         let rh = rehash.as_mut().unwrap();
         let want = (rh.remaining as usize).min(tmp.len());
         let n = match std::io::Read::read(&mut rh.reader, &mut tmp[..want]) {
             Ok(0) => {
-                return Ok(Some(err(
+                return Ok(Some(abort_rehash(err(
                     ErrorCode::Internal,
                     "partial upload shrank during resume re-hash",
-                )));
+                ))));
             }
             Ok(n) => n,
             Err(e) => {
-                return Ok(Some(err(
+                return Ok(Some(abort_rehash(err(
                     io_code(&e),
                     format!("resume re-hash read failed: {e}"),
-                )));
+                ))));
             }
         };
         hasher.update(&tmp[..n]);

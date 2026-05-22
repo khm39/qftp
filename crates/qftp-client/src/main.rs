@@ -814,7 +814,21 @@ fn resolve_local(local_cwd: &Path, p: &str) -> PathBuf {
 
 fn expand_glob(pattern: &str) -> Vec<PathBuf> {
     match glob::glob(pattern) {
-        Ok(paths) => paths.filter_map(|p| p.ok()).collect(),
+        Ok(paths) => {
+            let matches: Vec<PathBuf> = paths.filter_map(|p| p.ok()).collect();
+            if matches.is_empty() {
+                // A real local file whose name literally contains glob
+                // metacharacters (`[`, `]`, `?`, `*`) is interpreted as
+                // a pattern and matches nothing. Fall back to the
+                // literal path when it actually exists on disk so e.g.
+                // `put 'report[2024].txt'` uploads that file.
+                let literal = PathBuf::from(pattern);
+                if std::fs::symlink_metadata(&literal).is_ok() {
+                    return vec![literal];
+                }
+            }
+            matches
+        }
         Err(_) => vec![PathBuf::from(pattern)],
     }
 }
@@ -835,6 +849,11 @@ fn do_mget(
     local_cwd: &Path,
 ) -> Result<()> {
     let (rdir, fileglob) = match pattern.rfind('/') {
+        // A leading-root pattern like `/*.txt` puts the only `/` at
+        // index 0, so `&pattern[..0]` is "". That empty string makes
+        // `Request::Ls` list the remote cwd, not the server root the
+        // `/` asked for -- so list `/` explicitly in that case.
+        Some(0) => ("/", &pattern[1..]),
         Some(i) => (&pattern[..i], &pattern[i + 1..]),
         None => ("", pattern),
     };
@@ -885,14 +904,21 @@ fn do_mget(
     let mut matched = 0usize;
     let mut ok = 0usize;
     let mut skipped = 0usize;
+    let mut unsafe_rejected = 0usize;
     for entry in entries {
         if entry.is_dir || !matcher.matches_with(&entry.name, glob_opts) {
             continue;
         }
         // A malicious server can return entry names containing `..` or
         // separators; reject them lexically before they reach a path.
+        // Surface the rejection on stderr (not just `tracing`) and
+        // count it, so a server that returns *only* unsafe names does
+        // not get reported as a misleading "no remote files match".
+        // The raw name is deliberately not echoed -- it could carry
+        // terminal escape sequences -- only the count is shown.
         if !qftp_common::protocol::safe_entry_name(&entry.name) {
             tracing::warn!(name = %entry.name, "mget: skipping unsafe entry name");
+            unsafe_rejected += 1;
             continue;
         }
         matched += 1;
@@ -901,13 +927,24 @@ fn do_mget(
         // onto it: `do_get` would append to whatever bytes are there,
         // and a checksum mismatch would then delete the file -- so a
         // same-named but unrelated local file would be destroyed.
-        if local_child.exists() {
+        //
+        // Use `symlink_metadata` rather than `Path::exists()`: the
+        // latter follows symlinks, so a symlink named like a matched
+        // entry would report its *target's* presence (a TOCTOU that
+        // either skips a real download or, for a dangling link, slips
+        // past here only to fail the `O_NOFOLLOW` open). The skip
+        // decision must be about the local *name*, which a symlink
+        // itself occupies.
+        if std::fs::symlink_metadata(&local_child).is_ok() {
             println!("mget: skipping {} (local file exists)", entry.name);
             skipped += 1;
             continue;
         }
         let remote_child = if rdir.is_empty() {
             entry.name.clone()
+        } else if rdir == "/" {
+            // Root directory: avoid emitting a doubled `//` separator.
+            format!("/{}", entry.name)
         } else {
             format!("{rdir}/{}", entry.name)
         };
@@ -925,8 +962,22 @@ fn do_mget(
             Err(e) => println!("mget: {remote_child} failed: {e}"),
         }
     }
+    if unsafe_rejected > 0 {
+        eprintln!(
+            "mget: warning: server returned {unsafe_rejected} entry/entries \
+             with unsafe name(s) (contained '..', '/', or other rejected \
+             characters); they were skipped"
+        );
+    }
     if matched == 0 {
-        println!("mget: no remote files match '{pattern}'");
+        if unsafe_rejected > 0 {
+            println!(
+                "mget: no safe remote files match '{pattern}' \
+                 ({unsafe_rejected} unsafe entry/entries rejected -- see warning above)"
+            );
+        } else {
+            println!("mget: no remote files match '{pattern}'");
+        }
     } else {
         println!(
             "mget: downloaded {ok}/{matched} file(s) to {} ({skipped} skipped)",

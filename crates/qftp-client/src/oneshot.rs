@@ -389,8 +389,13 @@ fn run_get(
     if local_exists {
         match clobber {
             ClobberPolicy::NoClobber => {
-                eprintln!("skipping (exists, --no-clobber): {}", local_path.display());
-                return Ok(exit::OK);
+                // A pre-existing local file under --no-clobber may be
+                // either a *complete* download (which we must not
+                // overwrite) or a *partial* left by an interrupted
+                // earlier `get` (which do_get is designed to resume).
+                // The "refuse only if complete" decision needs the
+                // remote size, so it is deferred into the connection
+                // body below where a `Stat` can be issued.
             }
             ClobberPolicy::Interactive => {
                 if !prompt_overwrite(&local_path.display().to_string())? {
@@ -408,7 +413,32 @@ fn run_get(
             }
         }
     }
+    let no_clobber_check = local_exists && matches!(clobber, ClobberPolicy::NoClobber);
     with_connection(&spec, |conn, socket, poll, events, next| {
+        if no_clobber_check {
+            // Probe the remote size: --no-clobber should only refuse
+            // overwriting an *already complete* file, not block
+            // resuming an incomplete partial. Mirrors run_put's Stat
+            // probe.
+            match remote_exists_size(conn, socket, poll, events, next, &r.path)? {
+                Some(remote_size) => {
+                    let local_len = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+                    if local_len >= remote_size {
+                        eprintln!("skipping (exists, --no-clobber): {}", local_path.display());
+                        return Ok(exit::OK);
+                    }
+                    // Local is a shorter partial -- fall through and
+                    // let do_get resume it.
+                }
+                None => {
+                    // Couldn't learn the remote size (server error /
+                    // unexpected response). Be conservative and keep
+                    // the no-clobber refusal rather than overwriting.
+                    eprintln!("skipping (exists, --no-clobber): {}", local_path.display());
+                    return Ok(exit::OK);
+                }
+            }
+        }
         let stream_id = take_stream(next);
         match transfer::do_get(conn, socket, poll, events, stream_id, &r.path, &local_path) {
             Ok(()) => Ok(exit::OK),
@@ -589,6 +619,36 @@ fn remote_exists(
     Ok(match resp {
         Response::FileStat(_) => Some(true),
         Response::Err(e) if matches!(e.code, ErrorCode::NotFound) => Some(false),
+        _ => None,
+    })
+}
+
+/// Probe the size of `path` on the remote via `Stat`. Returns
+/// `Some(size)` for an existing file, `Some(0)` if the file is absent
+/// (`NotFound`), and `None` for any error/response we couldn't
+/// interpret. Used by `run_get` to decide whether a pre-existing local
+/// file under `--no-clobber` is already a complete download.
+fn remote_exists_size(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next: &mut u64,
+    path: &str,
+) -> Result<Option<u64>> {
+    let resp = request_response(
+        conn,
+        socket,
+        poll,
+        events,
+        next,
+        &Request::Stat {
+            path: path.to_string(),
+        },
+    )?;
+    Ok(match resp {
+        Response::FileStat(s) => Some(s.size),
+        Response::Err(e) if matches!(e.code, ErrorCode::NotFound) => Some(0),
         _ => None,
     })
 }

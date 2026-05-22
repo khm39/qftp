@@ -419,19 +419,27 @@ pub fn stream_send_all(
     data: &[u8],
     fin: bool,
 ) -> Result<()> {
+    // Send the body without `fin`. quiche can accept far more than
+    // STREAM_BUF_SIZE in a single `stream_send` (bounded only by the
+    // flow-control window), so the accepted length is only known after
+    // the call -- there is no reliable way to know in advance which
+    // write carries the last byte. Always defer the FIN to an explicit
+    // empty-fin frame after the loop.
     let mut offset = 0;
     while offset < data.len() {
-        let is_last = offset + STREAM_BUF_SIZE >= data.len();
         let written = conn
-            .stream_send(stream_id, &data[offset..], fin && is_last)
+            .stream_send(stream_id, &data[offset..], false)
             .context("stream_send failed")?;
         offset += written;
         if written == 0 {
             anyhow::bail!("stream_send wrote 0 bytes, stream may be blocked");
         }
     }
-    // If data is empty and fin is requested, send a fin-only frame.
-    if data.is_empty() && fin {
+    // Deliver the FIN as a dedicated empty-fin frame once the whole
+    // body has been queued. This covers both the empty-`data` case and
+    // a non-empty body, and guarantees `fin=true` is never passed to a
+    // mid-data `stream_send`.
+    if fin {
         conn.stream_send(stream_id, &[], true)
             .context("stream_send fin failed")?;
     }

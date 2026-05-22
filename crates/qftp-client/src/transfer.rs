@@ -424,8 +424,15 @@ pub fn do_put(
     let result = do_put_inner(
         conn, socket, poll, events, stream_id, local, remote, offset, no_clobber,
     );
-    if result.is_err() {
-        crate::stats::record_failure();
+    if let Err(e) = &result {
+        // A `StalePartial` error is a retry signal for the caller, not
+        // an actual transfer failure -- the caller re-uploads from
+        // scratch. Skip `record_failure` so a resumed upload with a
+        // stale server-side partial doesn't log a spurious failure in
+        // the user-facing stats.
+        if !e.is::<StalePartial>() {
+            crate::stats::record_failure();
+        }
     }
     result
 }

@@ -173,7 +173,16 @@ pub fn resolve_parent(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBu
     let parent = path
         .parent()
         .ok_or_else(|| ErrorResponse::new(ErrorCode::Malformed, "invalid path: no parent"))?;
-    if !parent.is_dir() {
+    // `Path::is_dir` follows a final symlink: a parent swapped to a
+    // symlink-to-directory between `walk_safe` (which lstat'd every
+    // component and rejected symlinks) and this check would slip
+    // through. `symlink_metadata` does NOT traverse a final symlink, so
+    // a symlinked parent reports `is_dir() == false` and is rejected --
+    // matching the crate's "never follow a symlink" posture.
+    let parent_is_dir = std::fs::symlink_metadata(parent)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if !parent_is_dir {
         return Err(ErrorResponse::new(
             ErrorCode::NotFound,
             format!("Parent directory not found: {}", parent.display()),
@@ -326,10 +335,15 @@ pub fn acl_reject(user: &User, req: &Request) -> Option<Response> {
 /// the server; a client must not rename or delete one out from under an
 /// in-flight upload, and they are hidden from `Ls`.
 pub fn is_upload_temp(path: &str) -> bool {
+    // `temp_path_for` builds the temp name as `<final-filename>.qftp.partial`
+    // -- a leaf that ENDS in `.qftp.partial`. A substring match would
+    // wrongly classify legitimate files like `archive.qftp.partial.tar`
+    // as server temps, hiding them from `Ls` and refusing `Rm`/`Rename`.
+    // Match only the exact suffix the server actually produces.
     std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n.contains(".qftp.partial"))
+        .map(|n| n.ends_with(".qftp.partial"))
         .unwrap_or(false)
 }
 
@@ -391,10 +405,14 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 .into_string()
                                 .unwrap_or_else(|os| os.to_string_lossy().into_owned());
                             // Hide in-flight / aborted upload temp files
-                            // (`<name>.qftp.partial[.*]`): they are server
+                            // (`<name>.qftp.partial`): they are server
                             // bookkeeping, not listable content, and would
                             // otherwise be pulled down by `mget` / `get -r`.
-                            if name.contains(".qftp.partial") {
+                            // Match the exact suffix `temp_path_for`
+                            // produces, not a substring, so a legitimate
+                            // file merely containing `.qftp.partial` isn't
+                            // hidden (mirrors `is_upload_temp`).
+                            if name.ends_with(".qftp.partial") {
                                 continue;
                             }
                             let meta = match entry.metadata() {
