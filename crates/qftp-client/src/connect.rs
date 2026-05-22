@@ -13,7 +13,7 @@
 //! custom ticket directory, and TOFU's verify-peer override through.
 //! TOFU pinning itself runs in `main.rs` on the returned connection.
 
-use std::net::UdpSocket;
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -97,12 +97,30 @@ pub fn establish(
         client_cert: client_cert_from_spec(spec),
     })?;
 
+    // Resolve `host:port` through the system resolver. `ToSocketAddrs`
+    // handles both numeric literals (`127.0.0.1:4433`, `[::1]:4433`)
+    // and DNS names; a plain `str::parse::<SocketAddr>()` would only
+    // accept numeric literals and reject every hostname.
     let peer_addr = spec
         .host
-        .parse()
-        .with_context(|| format!("{context_label}: bad host {}", spec.host))?;
+        .to_socket_addrs()
+        .with_context(|| format!("{context_label}: cannot resolve host {}", spec.host))?
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "{context_label}: host {} resolved to no addresses",
+                spec.host
+            )
+        })?;
+    // Bind the local socket in the same address family as the peer; a
+    // hardcoded IPv4 bind cannot reach a host that resolved to IPv6.
+    let bind_addr = if peer_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let std_socket =
-        UdpSocket::bind("0.0.0.0:0").with_context(|| format!("{context_label}: UDP bind"))?;
+        UdpSocket::bind(bind_addr).with_context(|| format!("{context_label}: UDP bind"))?;
     std_socket.set_nonblocking(true)?;
     std_socket.connect(peer_addr)?;
     qftp_common::transport::tune_udp_buffers(&std_socket);
