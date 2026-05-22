@@ -64,7 +64,10 @@ fn spawn_server() -> TestServer {
     // Forward the server's stderr so a CI failure shows the cause.
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
                 eprintln!("[qftp-server] {line}");
             }
         });

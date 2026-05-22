@@ -527,7 +527,9 @@ pub fn run(
                 warn!(peer = %ctx.peer_addr, error = %e, "resume re-hash failed; closing connection");
                 let _ = ctx.conn.close(true, 0x01, b"connection error");
             }
-            if let Err(e) = drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids) {
+            if let Err(e) =
+                drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)
+            {
                 warn!(peer = %ctx.peer_addr, error = %e, "send processing failed; closing connection");
                 let _ = ctx.conn.close(true, 0x01, b"connection error");
             }
