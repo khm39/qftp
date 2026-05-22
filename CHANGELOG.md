@@ -125,6 +125,13 @@ is what we will bump to signal an intentional wire break.
 - **WebTransport bridge bounds concurrent sessions.** The bridge
   accepted sessions without limit; each can hold many buffering
   streams. A semaphore now caps concurrent sessions.
+- **A single client can no longer crash the whole server.** A
+  per-stream / per-connection QUIC send error (e.g. a peer that resets
+  a stream right after sending a request, or queues another action
+  behind a `Quit`) propagated out of `process_readable_streams`
+  through `run()`, terminating the process and dropping every other
+  client's connection. The per-connection work in the event loop now
+  catches such errors and closes only the offending connection. (#177)
 
 ## [0.1.0] - placeholder
 

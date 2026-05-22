@@ -499,8 +499,17 @@ pub fn run(
         }
 
         // 3-5. Per-connection work: streams + sending + egress.
+        //
+        // An error here is scoped to the one connection it happened on --
+        // most commonly a stream-/connection-level QUIC send error after
+        // the peer reset a stream or closed the connection mid-request.
+        // Such an error must NOT propagate out of `run()`: that would tear
+        // down the whole server and every other client's connection. We
+        // instead close just the offending connection (the reap sweep
+        // below drops it) and keep serving everyone else. Truly fatal
+        // socket errors still surface via the ingress `recv_from` path.
         for ctx in connections.values_mut() {
-            process_readable_streams(
+            if let Err(e) = process_readable_streams(
                 ctx,
                 &socket,
                 &users,
@@ -510,10 +519,22 @@ pub fn run(
                 &handler_pool,
                 &mut readable_ids,
                 server_config.mtls_required,
-            )?;
-            drive_rehash_streams(ctx, &mut buf, &metrics)?;
-            drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)?;
-            flush_egress(&mut ctx.conn, &socket)?;
+            ) {
+                warn!(peer = %ctx.peer_addr, error = %e, "stream processing failed; closing connection");
+                let _ = ctx.conn.close(true, 0x01, b"connection error");
+            }
+            if let Err(e) = drive_rehash_streams(ctx, &mut buf, &metrics) {
+                warn!(peer = %ctx.peer_addr, error = %e, "resume re-hash failed; closing connection");
+                let _ = ctx.conn.close(true, 0x01, b"connection error");
+            }
+            if let Err(e) = drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids) {
+                warn!(peer = %ctx.peer_addr, error = %e, "send processing failed; closing connection");
+                let _ = ctx.conn.close(true, 0x01, b"connection error");
+            }
+            if let Err(e) = flush_egress(&mut ctx.conn, &socket) {
+                warn!(peer = %ctx.peer_addr, error = %e, "egress flush failed; closing connection");
+                let _ = ctx.conn.close(true, 0x01, b"connection error");
+            }
         }
 
         // 6. Reap closed / timed-out connections.
