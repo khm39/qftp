@@ -278,13 +278,20 @@ class Qftp {
       got += chunk.length;
       onProgress(got, total);
     }
-    if (resp.checksumFollows) {
-      const trailer = await bs.readExact(32);
-      const digest = hasher.digest();
-      for (let i = 0; i < 32; i++) {
-        if (trailer[i] !== digest[i]) {
-          throw new Error("BLAKE3 checksum mismatch: the download is corrupt");
-        }
+    // The Get request always sets checksum_trailer: true, so the
+    // server must answer with a 32-byte BLAKE3 trailer. A response
+    // without one cannot be integrity-checked -- treat it as an error
+    // instead of returning unverified bytes, so a downgrading or
+    // malicious bridge cannot bypass the end-to-end check.
+    if (!resp.checksumFollows) {
+      throw new Error("server did not provide an integrity trailer; "
+        + "the download cannot be verified");
+    }
+    const trailer = await bs.readExact(32);
+    const digest = hasher.digest();
+    for (let i = 0; i < 32; i++) {
+      if (trailer[i] !== digest[i]) {
+        throw new Error("BLAKE3 checksum mismatch: the download is corrupt");
       }
     }
     return new Blob(chunks);

@@ -96,8 +96,11 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     let mut next: u64 = 0;
 
     // Remote index: relative-path -> (size, mtime). We walk the
-    // remote tree breadth-first using Ls; missing trees are treated
-    // as empty.
+    // remote tree breadth-first using Ls. A failed listing (network
+    // error, server denial, or the too-large/cyclic cap) aborts the
+    // sync: proceeding on a partial map would report a silently
+    // incomplete mirror as success, and with `--delete` could remove
+    // files that were merely never walked.
     let remote_files = walk_remote(
         &mut conn,
         &socket,
@@ -106,7 +109,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
         &mut next,
         &remote_root,
     )
-    .unwrap_or_default();
+    .context("sync: failed to walk the remote directory tree")?;
     tracing::info!(count = remote_files.len(), "sync: remote files");
 
     let mut to_upload: Vec<PathBuf> = Vec::new();
@@ -411,6 +414,12 @@ impl IgnoreMatcher {
     }
 }
 
+/// Upper bound on the number of remote directories `walk_remote` will
+/// visit. A malicious or buggy server can return the same sub-directory
+/// name on every `Ls`, driving the client to recurse forever; this cap
+/// makes the walk terminate with a clear error instead.
+const MAX_REMOTE_DIRS: usize = 10_000;
+
 fn walk_remote(
     conn: &mut quiche::Connection,
     socket: &mio::net::UdpSocket,
@@ -422,19 +431,36 @@ fn walk_remote(
     let mut out: HashMap<PathBuf, Meta> = HashMap::new();
     // (remote-abs-path, relative-prefix)
     let mut stack: Vec<(String, PathBuf)> = vec![(root.to_string(), PathBuf::new())];
+    let mut visited: usize = 0;
     while let Some((abs, rel)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_REMOTE_DIRS {
+            // Bailing out: returning a partial map could leave `sync`
+            // believing the remote tree is complete (and with
+            // `--delete`, delete files that were simply never walked).
+            anyhow::bail!(
+                "sync: remote directory tree too large or cyclic \
+                 (exceeded {MAX_REMOTE_DIRS} directories)"
+            );
+        }
         let req = Request::Ls { path: abs.clone() };
         let resp = match request_response(conn, socket, poll, events, next, &req) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, dir = %abs, "sync: remote Ls failed");
-                continue;
+                // A swallowed failure here yields an incomplete map but
+                // still `Ok`, so `sync` would report success on a
+                // silently partial mirror. Propagate it instead.
+                return Err(e).with_context(|| format!("sync: remote Ls failed for {abs}"));
             }
         };
         let entries = match resp {
             Response::DirListing(e) => e,
-            Response::Err(_) => continue,
-            _ => continue,
+            Response::Err(e) => {
+                anyhow::bail!("sync: remote Ls failed for {abs}: {}", e.message);
+            }
+            other => {
+                anyhow::bail!("sync: unexpected response listing {abs}: {other:?}");
+            }
         };
         for e in entries {
             // A malicious server could synthesize entry names with

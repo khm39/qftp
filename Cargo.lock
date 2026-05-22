@@ -1486,6 +1486,7 @@ dependencies = [
  "bincode",
  "blake3",
  "clap",
+ "percent-encoding",
  "qftp-common",
  "qftp-protocol",
  "ring",

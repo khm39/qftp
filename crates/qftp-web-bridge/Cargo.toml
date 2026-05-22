@@ -24,6 +24,7 @@ blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 ring = "0.17"
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"

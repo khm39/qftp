@@ -956,9 +956,21 @@ fn do_recursive_get(
     });
     std::fs::create_dir_all(&local_root).ok();
 
-    // BFS via Ls.
+    // BFS via Ls. A malicious or buggy server can return the same
+    // sub-directory name on every listing, driving the client to
+    // recurse without bound; cap the number of directories visited so
+    // the walk terminates with a clear error instead.
+    const MAX_REMOTE_DIRS: usize = 10_000;
     let mut queue: Vec<(String, PathBuf)> = vec![(remote.to_string(), local_root.clone())];
+    let mut visited: usize = 0;
     while let Some((rdir, ldir)) = queue.pop() {
+        visited += 1;
+        if visited > MAX_REMOTE_DIRS {
+            anyhow::bail!(
+                "recursive get aborted: remote directory tree too large \
+                 or cyclic (exceeded {MAX_REMOTE_DIRS} directories)"
+            );
+        }
         let req = Request::Ls { path: rdir.clone() };
         let resp = request_response(conn, socket, poll, events, next_stream_id, &req)?;
         let entries = match resp {
