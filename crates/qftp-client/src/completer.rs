@@ -27,13 +27,14 @@ use rustyline::{Context, Helper};
 /// All built-in command names. Kept in sync with `repl::parse_command`.
 /// First-word prefix-completed by `complete_command`.
 const COMMANDS: &[&str] = &[
-    "ls", "dir", "cd", "pwd", "get", "put", "mkdir", "rmdir", "rm", "delete", "rename", "mv",
-    "chmod", "stat", "quota", "lcd", "lpwd", "lls", "lmkdir", "stats", "quit", "exit", "help",
+    "ls", "dir", "cd", "pwd", "get", "put", "mget", "mput", "mkdir", "rmdir", "rm", "delete",
+    "rename", "mv", "chmod", "stat", "quota", "lcd", "lpwd", "lls", "lmkdir", "stats", "quit",
+    "exit", "help",
 ];
 
 /// Commands whose first positional argument is a local path.
 /// Completion falls through to `FilenameCompleter` for these.
-const LOCAL_PATH_COMMANDS: &[&str] = &["put", "lcd", "lls", "lmkdir"];
+const LOCAL_PATH_COMMANDS: &[&str] = &["put", "mput", "lcd", "lls", "lmkdir"];
 
 pub struct ReplHelper {
     filenames: FilenameCompleter,

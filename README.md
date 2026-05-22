@@ -55,6 +55,7 @@ qftp-client --trust-on-first-use qftp://localhost:4433
 qftp> ls
 qftp> get -r remote-dir local-dir
 qftp> put -r local-dir remote-dir
+qftp> mget '*.log' ./logs
 qftp> quit
 ```
 

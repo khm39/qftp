@@ -10,6 +10,11 @@ is what we will bump to signal an intentional wire break.
 
 ### Added
 
+- **`mget` — remote wildcard download.** `mget <glob> [local-dir]`
+  lists a remote directory and downloads every file whose name matches
+  the glob, the download counterpart to `put`'s existing client-side
+  glob expansion. `mput` is added as an alias of `put` so FTP-familiar
+  muscle memory works. (#175)
 - **End-to-end integrity for the browser client.** The web SPA now
   computes BLAKE3 in-browser (a small pure-JS implementation,
   `web/blake3.js`): downloads verify the server's trailer and reject a

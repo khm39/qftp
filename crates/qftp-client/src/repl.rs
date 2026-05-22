@@ -15,6 +15,14 @@ pub enum Command {
         remote: Option<String>,
         recursive: bool,
     },
+    /// `mget <remote-glob> [local-dir]` — download every file in one
+    /// remote directory whose name matches the glob. The FTP `mget`:
+    /// the wildcard is expanded against a server directory listing,
+    /// not the local filesystem.
+    Mget {
+        pattern: String,
+        local_dir: Option<String>,
+    },
     /// `lcd <path>` — change the REPL's local working directory used
     /// when a `put` or `get` argument is a relative path. Does not
     /// chdir() the process, so background helpers stay where they
@@ -86,7 +94,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
                 recursive,
             })
         }
-        "put" => {
+        "put" | "mput" => {
             let (recursive, args) = take_recursive_flag(args);
             if args.is_empty() {
                 println!("Usage: put [-r] <local> [remote]");
@@ -96,6 +104,16 @@ pub fn parse_command(line: &str) -> Option<Command> {
                 local: args[0].to_string(),
                 remote: args.get(1).map(|s| s.to_string()),
                 recursive,
+            })
+        }
+        "mget" => {
+            if args.is_empty() {
+                println!("Usage: mget <remote-glob> [local-dir]");
+                return None;
+            }
+            Some(Command::Mget {
+                pattern: args[0].to_string(),
+                local_dir: args.get(1).map(|s| s.to_string()),
             })
         }
         "mkdir" => {
@@ -334,7 +352,9 @@ fn print_help() {
     println!("  cd [path]                    Change remote directory");
     println!("  pwd                          Print remote working directory");
     println!("  get [-r] <remote> [local]    Download (auto-resumes if local exists)");
-    println!("  put [-r] <local> [remote]    Upload (BLAKE3 checksum verified)");
+    println!("  put [-r] <local> [remote]    Upload (BLAKE3 verified, auto-resumes)");
+    println!("  mget <glob> [local-dir]      Download remote files matching a glob");
+    println!("  mput [-r] <glob> [remote]    Alias for put (local glob expands client-side)");
     println!("  mkdir <path>                 Create a directory");
     println!("  rmdir <path>                 Remove a directory");
     println!("  rm <path>                    Delete a file");
