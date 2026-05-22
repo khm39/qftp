@@ -133,6 +133,13 @@ async fn read_request(recv: &mut RecvStream) -> Result<(Request, Vec<u8>)> {
             return Ok((req, buf));
         }
         match recv.read(&mut tmp).await.context("stream read failed")? {
+            // A zero-length read is not end-of-stream: the frame is
+            // still incomplete, `buf` grows by nothing, and looping
+            // again would spin a CPU with no forward progress. Treat it
+            // as anomalous and fail rather than busy-loop.
+            Some(0) => {
+                anyhow::bail!("stream yielded no data while a request frame was still incomplete")
+            }
             Some(n) => buf.extend_from_slice(&tmp[..n]),
             None => anyhow::bail!("stream closed before a complete request frame arrived"),
         }
@@ -387,8 +394,15 @@ async fn do_put(
     }
 
     let temp_path = temp_path_for(&final_path);
+    // The temp name is now deterministic (`<final>.qftp.partial`), so a
+    // stale partial from an earlier aborted upload may already be on
+    // disk. `create_new(true)` would fail on it; instead create-or-open
+    // and truncate, matching the native server's fresh-Put path -- the
+    // web bridge has no resume, so a stale partial is replaced wholesale.
+    // `O_NOFOLLOW` (via `apply_owner_only_no_follow`) still rejects a
+    // symlink planted at the predictable path.
     let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.write(true).create_new(true);
+    open_opts.write(true).create(true).truncate(true);
     qftp_common::fs_safe::apply_owner_only_no_follow(&mut open_opts);
     let std_file = match open_opts.open(&temp_path) {
         Ok(f) => f,
@@ -403,6 +417,14 @@ async fn do_put(
             .await
         }
     };
+    // The O_CREAT mode is ignored when the file already existed, so a
+    // reused stale partial could otherwise keep a looser mode and leak
+    // the in-progress body; re-assert owner-only permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     guard.temp_path = Some(temp_path.clone());
     let mut file = tokio::fs::File::from_std(std_file);
 
@@ -541,23 +563,22 @@ async fn route_put_chunk(
     Ok(None)
 }
 
-/// Compose a `.qftp.partial.*` temp path next to `final_path`. The
-/// random suffix stops a colluding local user from pre-planting a file
-/// at a predictable path to block uploads.
+/// Compose the deterministic resumable-upload temp path for
+/// `final_path`: `<dir>/<filename>.qftp.partial`. This matches the
+/// native `qftp-server`'s `temp_path_for`, so a partial is named the
+/// same regardless of which side wrote it -- a prerequisite for
+/// cross-implementation resume and for the shared stale-partial sweep.
+///
+/// The name is intentionally predictable. The anti-planting defence
+/// lives in the open mode (see `do_put`): a fresh upload truncates and
+/// reuses whatever regular file sits here, and `O_NOFOLLOW` rejects a
+/// planted symlink.
 fn temp_path_for(final_path: &Path) -> PathBuf {
-    let mut rand_bytes = [0u8; 8];
-    use ring::rand::SecureRandom as _;
-    // A swallowed RNG failure here would leave an all-zero suffix and
-    // defeat the anti-planting defense, so fail loudly instead.
-    ring::rand::SystemRandom::new()
-        .fill(&mut rand_bytes)
-        .expect("system RNG failed");
-    let suffix = qftp_common::util::to_hex(&rand_bytes);
     let mut name = final_path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
-    name.push(format!(".qftp.partial.{}.{suffix}", std::process::id()));
+    name.push(".qftp.partial");
     final_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -588,12 +609,14 @@ mod tests {
         let temp = temp_path_for(target);
         assert_eq!(temp.parent(), target.parent());
         let name = temp.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with("report.bin.qftp.partial."), "{name}");
+        assert_eq!(name, "report.bin.qftp.partial", "{name}");
     }
 
     #[test]
-    fn temp_paths_are_unique() {
+    fn temp_path_is_deterministic() {
+        // The temp name must match the native server's deterministic
+        // `<final>.qftp.partial` scheme so partials are interoperable.
         let target = Path::new("/srv/data/report.bin");
-        assert_ne!(temp_path_for(target), temp_path_for(target));
+        assert_eq!(temp_path_for(target), temp_path_for(target));
     }
 }

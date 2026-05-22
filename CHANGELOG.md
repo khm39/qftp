@@ -161,6 +161,53 @@ is what we will bump to signal an intentional wire break.
   duplicate accept (a retransmitted Initial deriving the same SCID)
   incremented the gauge without a matching decrement; the counters are
   now bumped only for a connection that is actually retained. (#192)
+- **`--no-clobber` `get` resumes an interrupted download.** It refused
+  any pre-existing local file; it now probes the remote size and only
+  refuses a file that is already complete, letting a shorter partial
+  resume. (#193)
+- **`mget /<glob>` lists the server root.** A leading-slash pattern
+  collapsed the directory part to `""`, which lists the remote cwd; it
+  now lists `/`. (#194)
+- **A failed resume re-hash no longer leaks quota.** When the server's
+  re-hash of a resumed upload's prefix failed it left the partial on
+  disk with its bytes still charged; the failure path now deletes the
+  temp and refunds the prefix, matching the checksum-mismatch path.
+  (#195)
+- **`resolve_parent` no longer follows a symlinked parent.** It checked
+  the parent with `is_dir()`, which traverses a final symlink; it now
+  uses `symlink_metadata`. (#196)
+- **REPL `put` uploads filenames containing glob metacharacters.** A
+  literal file such as `report[2024].txt` was treated as a glob and
+  matched nothing; `expand_glob` now falls back to the literal path
+  when it exists. (#197)
+- **`stream_send_all` always delivers the FIN.** It derived "last
+  chunk" from a buffer constant, so a write larger than `STREAM_BUF_SIZE`
+  could leave the stream half-open; the FIN is now always sent as a
+  dedicated empty frame. (#198)
+- **The WebTransport bridge cannot be spun by a zero-length read.**
+  `read_request` looped without progress on `Ok(Some(0))`; it now
+  fails fast. (#199)
+- **`is_upload_temp` matches the exact temp suffix.** It used a
+  substring test, so a legitimate file like `archive.qftp.partial.tar`
+  was hidden and un-deletable; it now matches `ends_with`. (#200)
+- **A stale-partial retry is not counted as a transfer failure.** A
+  resumed `put` that restarts from scratch no longer records a
+  spurious failure in `stats`. (#201)
+- **`mget`'s skip-existing check does not follow symlinks.** It used
+  `Path::exists()`; it now uses `symlink_metadata` so the decision is
+  about the local name itself. (#202)
+- **`mget` surfaces server entries rejected for unsafe names.** They
+  were dropped with only a `tracing` line, so a server returning only
+  unsafe names looked like an empty match; the count is now reported
+  to the user. (#203)
+- **The web bridge names upload temps like the native server.** It
+  used a random suffix, so its partials were unresumable and
+  non-interoperable; it now uses the deterministic
+  `<name>.qftp.partial` (truncating a stale partial, keeping the
+  `O_NOFOLLOW` open). (#204)
+- **A Put to a path with no file name is rejected.** Such a path made
+  `temp_path_for` collapse to a bare `.qftp.partial`; `start_put` now
+  refuses it. (#205)
 
 ### Security
 
