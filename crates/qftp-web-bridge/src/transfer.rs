@@ -335,13 +335,26 @@ async fn do_put(
         .await;
     }
 
-    // Quota pre-check, then reserve the bytes atomically so two
-    // concurrent uploads can't both pass the check and overshoot.
+    // Quota enforcement. Reserve the bytes against `in_flight_bytes`
+    // *first*, then check the total. A check-then-reserve sequence
+    // races: two concurrent uploads can both pass the check before
+    // either reservation lands and together overshoot the limit.
+    user.in_flight_bytes.fetch_add(size, Ordering::Relaxed);
+    // From here every early return drops `guard`, which releases the
+    // reservation and removes the temp file if one was created.
+    let mut guard = PutGuard {
+        user: Arc::clone(user),
+        reserved: size,
+        temp_path: None,
+        completed: false,
+    };
     if let Some(limit) = user.quota_bytes {
         let used = user.used_bytes.load(Ordering::Relaxed);
+        // `in_flight` already includes the reservation we just made.
         let in_flight = user.in_flight_bytes.load(Ordering::Relaxed);
-        let projected = used.saturating_add(in_flight).saturating_add(size);
+        let projected = used.saturating_add(in_flight);
         if projected > limit {
+            // Dropping `guard` on return releases the reservation.
             return reply_err(
                 send,
                 ErrorResponse::new(
@@ -352,15 +365,6 @@ async fn do_put(
             .await;
         }
     }
-    user.in_flight_bytes.fetch_add(size, Ordering::Relaxed);
-    // From here every early return drops `guard`, which releases the
-    // reservation and removes the temp file if one was created.
-    let mut guard = PutGuard {
-        user: Arc::clone(user),
-        reserved: size,
-        temp_path: None,
-        completed: false,
-    };
 
     let final_path = match handler::resolve_parent(root, root, path) {
         Ok(p) => p,

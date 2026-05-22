@@ -101,6 +101,13 @@ pub struct ServerConfig {
     pub rate_limit_rps: f64,
     /// Per-IP request token bucket burst capacity.
     pub rate_limit_burst: f64,
+    /// True when the server was started with `--client-ca` (mTLS).
+    /// quiche's `verify_peer(true)` only sets `SSL_VERIFY_PEER`, not
+    /// `SSL_VERIFY_FAIL_IF_NO_PEER_CERT`, so a client that presents no
+    /// certificate still completes the TLS handshake. When this flag
+    /// is set, such connections are closed instead of being served as
+    /// the anonymous user.
+    pub mtls_required: bool,
 }
 
 /// A generic request handed to a handler worker thread for off-loop
@@ -502,6 +509,7 @@ pub fn run(
                 &mut buf,
                 &handler_pool,
                 &mut readable_ids,
+                server_config.mtls_required,
             )?;
             drive_rehash_streams(ctx, &mut buf, &metrics)?;
             drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)?;
@@ -687,57 +695,86 @@ fn send_retry(
 }
 
 /// Try to look up the authenticated user once the handshake is far enough
-/// along that the peer cert is available. Idempotent: returns early if
-/// the connection is already on something other than the directory's
-/// anonymous record (using Arc pointer equality, so a custom-named
-/// anonymous user is still correctly recognised as "not upgraded yet").
-fn upgrade_user_from_cert(ctx: &mut ConnectionContext, users: &UserDirectory) {
+/// along that the peer cert is available.
+///
+/// Returns `false` when the connection was rejected and closed, so the
+/// caller skips stream processing for it; `true` to proceed normally.
+///
+/// Idempotent: returns `true` early if the connection is already on
+/// something other than the directory's anonymous record (using Arc
+/// pointer equality, so a custom-named anonymous user is still
+/// correctly recognised as "not upgraded yet").
+fn upgrade_user_from_cert(
+    ctx: &mut ConnectionContext,
+    users: &UserDirectory,
+    mtls_required: bool,
+) -> bool {
     let anon = users.anonymous();
     if !Arc::ptr_eq(&ctx.user, &anon) {
-        return;
+        return true;
     }
     if !ctx.conn.is_established() {
-        return;
+        return true;
     }
     let Some(der) = ctx.conn.peer_cert() else {
-        return;
+        // mTLS is configured but the peer presented no certificate.
+        // quiche's `verify_peer(true)` only sets `SSL_VERIFY_PEER`,
+        // not `SSL_VERIFY_FAIL_IF_NO_PEER_CERT`, so a no-cert client
+        // completes the TLS handshake; without this check it would be
+        // served as the anonymous user and could read the entire root.
+        if mtls_required {
+            warn!(
+                peer = %ctx.peer_addr,
+                "rejecting connection: mTLS is required but the client presented no certificate"
+            );
+            // 0x101 is our application-layer "unauthorized" close code.
+            let _ = ctx.conn.close(true, 0x101, b"client certificate required");
+            return false;
+        }
+        return true;
     };
-    // Try SAN dNSName / rfc822Name / URI before falling back to
-    // CN, so a modern PKI (cert-manager, smallstep, SPIFFE) that
-    // doesn't populate Subject CN still maps cleanly to users.toml.
-    // Order of candidates is fixed in extract_identity_candidates;
-    // first match wins. lookup_strict trims whitespace.
+    // Try SAN dNSName / rfc822Name / URI plus the Subject CN, so a
+    // modern PKI (cert-manager, smallstep, SPIFFE) that doesn't
+    // populate Subject CN still maps cleanly to users.toml.
+    // `resolve_identity` refuses a cert that maps to more than one
+    // configured user, closing the SAN/CN identity-confusion gap
+    // where an extra SAN entry could select a higher-privileged user.
     let candidates = user::extract_identity_candidates(der);
-    if candidates.is_empty() {
-        return;
+    match user::resolve_identity(&candidates, users) {
+        user::IdentityResolution::Matched { id, user } => {
+            info!(
+                peer = %ctx.peer_addr,
+                user = %user.name,
+                matched = %id,
+                "upgraded connection to authenticated user"
+            );
+            ctx.cwd = user.home.clone();
+            ctx.user = user;
+            true
+        }
+        // A peer whose cert matches no configured user must be
+        // rejected outright, not silently downgraded to anonymous.
+        user::IdentityResolution::NoMatch => {
+            warn!(
+                peer = %ctx.peer_addr,
+                ?candidates,
+                "rejecting connection: client cert identities are not in users.toml"
+            );
+            let _ = ctx.conn.close(true, 0x101, b"unknown identity");
+            false
+        }
+        // A cert that resolves to several distinct users is refused
+        // rather than guessing which account the peer intended.
+        user::IdentityResolution::Ambiguous(matched) => {
+            warn!(
+                peer = %ctx.peer_addr,
+                ?matched,
+                "rejecting connection: client cert maps to multiple configured users"
+            );
+            let _ = ctx.conn.close(true, 0x101, b"ambiguous identity");
+            false
+        }
     }
-    let resolved = candidates
-        .iter()
-        .find_map(|id| users.lookup_strict(id).map(|u| (id.clone(), u)));
-    // A peer that presents a cert whose identity matches no
-    // configured user must be rejected outright, not silently
-    // downgraded to anonymous. Close the QUIC connection with an
-    // application-layer error code so the client surfaces an
-    // explicit auth failure.
-    let Some((matched_id, resolved)) = resolved else {
-        warn!(
-            peer = %ctx.peer_addr,
-            ?candidates,
-            "rejecting connection: client cert identities are not in users.toml"
-        );
-        // 0x101 is our application-layer "unauthorized" close code.
-        // No conflict with the existing 0x00 used for normal shutdown.
-        let _ = ctx.conn.close(true, 0x101, b"unknown identity");
-        return;
-    };
-    info!(
-        peer = %ctx.peer_addr,
-        user = %resolved.name,
-        matched = %matched_id,
-        "upgraded connection to authenticated user"
-    );
-    ctx.cwd = resolved.home.clone();
-    ctx.user = resolved;
 }
 
 /// Action collected during the readable-streams sweep. We can't act on a
@@ -787,8 +824,14 @@ fn process_readable_streams(
     tmp: &mut [u8],
     pool: &HandlerPool,
     readable_ids: &mut Vec<u64>,
+    mtls_required: bool,
 ) -> Result<()> {
-    upgrade_user_from_cert(ctx, users);
+    if !upgrade_user_from_cert(ctx, users, mtls_required) {
+        // Connection was rejected (mTLS / identity failure); its
+        // CONNECTION_CLOSE is flushed by the caller and the reap
+        // sweep drops it. Don't serve any requests on it.
+        return Ok(());
+    }
     readable_ids.clear();
     readable_ids.extend(ctx.conn.readable());
     let peer_ip = ctx.peer_addr.ip();
@@ -1569,33 +1612,37 @@ fn start_put(
         (f, blake3::Hasher::new(), offset, Some(rehash))
     };
 
-    // Quota pre-check + in-flight reservation. `used_bytes` now reflects
-    // reality: a fresh Put refunded any stale partial above, and a
-    // resume's `offset` bytes are legitimately still counted. `size` is
-    // the post-offset body the client is about to send. Reserve
-    // atomically so two concurrent Puts can't both pass and overshoot.
+    // In-flight reservation, then quota check. `used_bytes` now
+    // reflects reality: a fresh Put refunded any stale partial above,
+    // and a resume's `offset` bytes are legitimately still counted.
+    // `size` is the post-offset body the client is about to send.
+    //
+    // Reserve *before* checking: a check-then-reserve sequence races --
+    // two concurrent Puts could both pass the check before either
+    // reservation lands and together overshoot the limit. Reserving
+    // first means a concurrent Put always sees our bytes in its check.
     let new_bytes = size;
+    let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
     if let Some(limit) = ctx.user.quota_bytes {
         let used = ctx.user.used_bytes.load(Ordering::Relaxed);
+        // `in_flight` already includes the reservation just made.
         let in_flight = ctx.user.in_flight_bytes.load(Ordering::Relaxed);
-        let projected = used.saturating_add(in_flight).saturating_add(new_bytes);
+        let projected = used.saturating_add(in_flight);
         if projected > limit {
-            // A fresh Put truncated its temp to empty; remove it so a
-            // rejected upload leaves no litter. A resume's temp is the
-            // user's own partial -- leave it intact for a later retry.
+            // `reservation` is still armed -- it releases `new_bytes`
+            // on return. A fresh Put truncated its temp to empty;
+            // remove it so a rejected upload leaves no litter. A
+            // resume's temp is the user's own partial -- leave it.
             if offset == 0 {
                 let _ = fs::remove_file(&temp_path);
             }
             return send_err(
                 ctx,
                 ErrorCode::QuotaExceeded,
-                format!(
-                    "Quota exceeded: would use {projected} bytes (limit {limit}, currently {used} reserved {in_flight})"
-                ),
+                format!("Quota exceeded: would use {projected} bytes (limit {limit})"),
             );
         }
     }
-    let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
     let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, file);
 
     // The reservation is now owned by `ReadingFileData`'s Drop (via

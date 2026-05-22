@@ -496,6 +496,54 @@ pub fn extract_cn(der: &[u8]) -> Option<String> {
     extract_identity_candidates(der).into_iter().next()
 }
 
+/// Outcome of matching a peer certificate's identity candidates
+/// against the configured user directory.
+#[derive(Debug)]
+pub enum IdentityResolution {
+    /// Exactly one configured user matched.
+    Matched { id: String, user: Arc<User> },
+    /// No candidate matched any configured user.
+    NoMatch,
+    /// Candidates matched more than one distinct configured user.
+    /// Carries the matched user names.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a certificate's ordered identity candidates (see
+/// [`extract_identity_candidates`]) to a single configured user.
+///
+/// A certificate can legitimately carry several identities (SAN
+/// dNSName / rfc822Name / URI plus the Subject CN). Picking the
+/// *first* candidate that matches lets a peer whose CA does not
+/// tightly constrain SAN contents add an extra identity to escalate:
+/// a cert issued for `bob` that also carries `SAN dNSName = alice`
+/// would otherwise authenticate as `alice`. This function therefore
+/// refuses any certificate that resolves to more than one distinct
+/// configured user, returning [`IdentityResolution::Ambiguous`] so the
+/// caller closes the connection rather than silently selecting one.
+pub fn resolve_identity(candidates: &[String], dir: &UserDirectory) -> IdentityResolution {
+    let mut matched: Vec<(String, Arc<User>)> = Vec::new();
+    for id in candidates {
+        if let Some(user) = dir.lookup_strict(id) {
+            // Dedup by resolved user name: several candidates that all
+            // map to the same account is a normal multi-SAN cert.
+            if !matched.iter().any(|(_, u)| u.name == user.name) {
+                matched.push((id.clone(), user));
+            }
+        }
+    }
+    match matched.len() {
+        0 => IdentityResolution::NoMatch,
+        1 => {
+            let (id, user) = matched.into_iter().next().unwrap();
+            IdentityResolution::Matched { id, user }
+        }
+        _ => IdentityResolution::Ambiguous(
+            matched.into_iter().map(|(_, u)| u.name.clone()).collect(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,5 +879,82 @@ mod tests {
     fn extract_identity_candidates_returns_empty_on_garbage() {
         assert!(extract_identity_candidates(&[]).is_empty());
         assert!(extract_identity_candidates(b"not a cert").is_empty());
+    }
+
+    fn directory_with(users: &[&str]) -> UserDirectory {
+        let tmp = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let cfg = UserConfig {
+            anonymous: None,
+            users: users
+                .iter()
+                .map(|n| UserSpec {
+                    name: n.to_string(),
+                    home: None,
+                    permissions: Permissions::full(),
+                    quota_bytes: None,
+                })
+                .collect(),
+        };
+        UserDirectory::from_config(tmp.path(), cfg).unwrap()
+    }
+
+    #[test]
+    fn resolve_identity_single_match() {
+        let dir = directory_with(&["alice"]);
+        match resolve_identity(&["alice".to_string()], &dir) {
+            IdentityResolution::Matched { id, user } => {
+                assert_eq!(id, "alice");
+                assert_eq!(user.name, "alice");
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_identity_no_match() {
+        let dir = directory_with(&["alice"]);
+        assert!(matches!(
+            resolve_identity(&["nobody".to_string()], &dir),
+            IdentityResolution::NoMatch
+        ));
+        assert!(matches!(
+            resolve_identity(&[], &dir),
+            IdentityResolution::NoMatch
+        ));
+    }
+
+    #[test]
+    fn resolve_identity_rejects_multiple_distinct_users() {
+        // A cert that carries identities for two different configured
+        // users must be refused outright, not silently resolved to the
+        // first one -- that is the SAN/CN identity-confusion escalation.
+        let dir = directory_with(&["alice", "bob"]);
+        match resolve_identity(&["alice".to_string(), "bob".to_string()], &dir) {
+            IdentityResolution::Ambiguous(users) => {
+                assert_eq!(users.len(), 2);
+                assert!(users.contains(&"alice".to_string()));
+                assert!(users.contains(&"bob".to_string()));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_identity_same_user_via_multiple_candidates_is_ok() {
+        // Several candidates that all map to the SAME user (e.g. a SAN
+        // dNSName and the CN both = "alice") is a normal cert, with
+        // unknown candidates interleaved; it must still resolve.
+        let dir = directory_with(&["alice"]);
+        match resolve_identity(
+            &[
+                "alice".to_string(),
+                "unknown".to_string(),
+                "alice".to_string(),
+            ],
+            &dir,
+        ) {
+            IdentityResolution::Matched { user, .. } => assert_eq!(user.name, "alice"),
+            other => panic!("expected Matched, got {other:?}"),
+        }
     }
 }

@@ -251,6 +251,48 @@ pub fn recheck_ancestors_no_symlinks(target: &Path, root: &Path) -> Result<(), E
     Ok(())
 }
 
+/// Like [`recheck_ancestors_no_symlinks`] but also verifies the leaf
+/// `target` itself is not a symlink.
+///
+/// The O_NOFOLLOW open paths (Get / Put) only need the ancestor check
+/// because the kernel guards their leaf. `Ls` and `Cd`, however, hand
+/// the resolved path straight to `fs::read_dir` / store it as the new
+/// `cwd`, both of which follow a leaf symlink. A component (or the
+/// leaf) swapped to a symlink after `walk_safe` validated it would
+/// then escape the root. This re-check narrows that TOCTOU window for
+/// those two operations.
+///
+/// A `target` equal to `root` is accepted: the operator-supplied root
+/// may itself be reached via a symlink, and `walk_safe` never lets a
+/// path resolve above it. Only paths strictly below `root` are checked.
+pub fn recheck_path_no_symlinks(target: &Path, root: &Path) -> Result<(), ErrorResponse> {
+    if target == root {
+        return Ok(());
+    }
+    recheck_ancestors_no_symlinks(target, root)?;
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(ErrorResponse::new(
+            ErrorCode::PermissionDenied,
+            format!(
+                "path became a symlink between resolve and op ({}, #137)",
+                target.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ErrorResponse::new(
+            ErrorCode::NotFound,
+            format!(
+                "path disappeared between resolve and op: {}",
+                target.display()
+            ),
+        )),
+        Err(e) => Err(ErrorResponse::new(
+            ErrorCode::Internal,
+            format!("failed to re-stat {}: {e}", target.display()),
+        )),
+    }
+}
+
 /// Required permission for a given request.
 fn required_op(req: &Request) -> Option<Op> {
     match req {
@@ -301,7 +343,12 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
 
         Request::Cd { path } => match resolve(cwd, root, path) {
             Ok(target) => {
-                if !target.is_dir() {
+                // Re-check ancestors + leaf for a TOCTOU symlink swap
+                // before adopting `target` as the new cwd: a poisoned
+                // cwd would otherwise let later operations escape root.
+                if let Err(e) = recheck_path_no_symlinks(&target, root) {
+                    Response::Err(e)
+                } else if !target.is_dir() {
                     err(ErrorCode::NotADirectory, format!("Not a directory: {path}"))
                 } else {
                     *cwd = target;
@@ -317,6 +364,15 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             } else {
                 resolve(cwd, root, path).map(Cow::Owned)
             };
+            // `fs::read_dir` follows a symlink at any path component,
+            // so an intermediate dir (or the listed dir itself)
+            // swapped to a symlink after `walk_safe` would escape the
+            // root. The O_NOFOLLOW open paths re-check ancestors; Ls
+            // reads the directory directly, so it must re-check here.
+            let dir = dir.and_then(|d| {
+                recheck_path_no_symlinks(&d, root)?;
+                Ok(d)
+            });
 
             match dir {
                 Ok(dir) => match fs::read_dir(&*dir) {
@@ -657,5 +713,52 @@ mod tests {
             !outside.path().join("new").exists(),
             "mkdir leaked into symlink target -- TOCTOU still open"
         );
+    }
+
+    /// cwd poisoning: a real directory the connection `Cd`'d into is
+    /// swapped for a symlink afterwards. `Ls` with an empty path lists
+    /// `cwd` directly via `fs::read_dir`, which follows the symlink and
+    /// escapes the root unless the leaf re-check refuses it.
+    #[test]
+    fn ls_refuses_when_cwd_was_swapped_to_symlink() {
+        let (_dir, root) = setup_root();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"leak").unwrap();
+        let mut cwd = root.join("sub");
+        fs::remove_dir_all(&cwd).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &cwd).unwrap();
+        let resp = handle_request(
+            &Request::Ls {
+                path: String::new(),
+            },
+            &mut cwd,
+            &root,
+        );
+        match resp {
+            Response::Err(e) => assert_eq!(e.code, ErrorCode::PermissionDenied),
+            other => panic!("expected PermissionDenied (escape via cwd symlink), got {other:?}"),
+        }
+    }
+
+    /// A normal `Ls` of a clean subdirectory and of the root itself
+    /// must still succeed after the symlink re-check was added.
+    #[test]
+    fn ls_clean_directories_still_work() {
+        let (_dir, root) = setup_root();
+        let mut cwd = root.clone();
+        assert!(matches!(
+            handle_request(&Request::Ls { path: "sub".into() }, &mut cwd, &root),
+            Response::DirListing(_)
+        ));
+        match handle_request(
+            &Request::Ls {
+                path: String::new(),
+            },
+            &mut cwd,
+            &root,
+        ) {
+            Response::DirListing(entries) => assert!(!entries.is_empty()),
+            other => panic!("expected DirListing for root, got {other:?}"),
+        }
     }
 }

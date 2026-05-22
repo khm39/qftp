@@ -615,6 +615,13 @@ pub fn create_server_config(tls: &ServerTlsConfig) -> Result<quiche::Config> {
         config
             .load_verify_locations_from_file(ca_path)
             .context("failed to load client CA bundle")?;
+        // NOTE: quiche's `verify_peer(true)` sets `SSL_VERIFY_PEER`
+        // only, not `SSL_VERIFY_FAIL_IF_NO_PEER_CERT`. A client that
+        // presents no certificate still completes the TLS handshake,
+        // so mTLS *presence* is enforced at the application layer:
+        // `upgrade_user_from_cert` closes any established connection
+        // that has no peer cert when the server was started with
+        // `--client-ca`.
         config.verify_peer(true);
     }
 
