@@ -101,6 +101,12 @@ pub enum StreamState {
         /// abort; the commit path consumes them and converts the
         /// reservation into `used_bytes`.
         reserved_bytes: u64,
+        /// Bytes already on disk and already counted in `used_bytes`
+        /// when this stream started -- i.e. the resume `offset` (0 for
+        /// a fresh upload). On a checksum mismatch the partial is
+        /// deleted, so the mismatch path must refund these from
+        /// `used_bytes` or they leak against the user's quota.
+        prior_bytes: u64,
         /// Back-reference to the user whose counters we mutate. We
         /// can't share the connection's Arc<User> directly here
         /// because the StreamState is stored inside the connection;
@@ -201,6 +207,7 @@ mod tests {
             expected_checksum: None,
             trailer_buf: None,
             reserved_bytes: reserved,
+            prior_bytes: 0,
             owner: user,
         }
     }

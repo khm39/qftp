@@ -833,6 +833,12 @@ fn do_mget(
             return Ok(());
         }
     };
+    // Match like a shell glob: `*` must not pick up leading-dot files,
+    // matching the filesystem-walker behaviour of `put`'s local glob.
+    let glob_opts = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..glob::MatchOptions::new()
+    };
     let local_root = match local_dir {
         Some(d) => resolve_local(local_cwd, d),
         None => local_cwd.to_path_buf(),
@@ -866,8 +872,9 @@ fn do_mget(
 
     let mut matched = 0usize;
     let mut ok = 0usize;
+    let mut skipped = 0usize;
     for entry in entries {
-        if entry.is_dir || !matcher.matches(&entry.name) {
+        if entry.is_dir || !matcher.matches_with(&entry.name, glob_opts) {
             continue;
         }
         // A malicious server can return entry names containing `..` or
@@ -877,12 +884,21 @@ fn do_mget(
             continue;
         }
         matched += 1;
+        let local_child = local_root.join(&entry.name);
+        // Skip an existing local destination rather than auto-resuming
+        // onto it: `do_get` would append to whatever bytes are there,
+        // and a checksum mismatch would then delete the file -- so a
+        // same-named but unrelated local file would be destroyed.
+        if local_child.exists() {
+            println!("mget: skipping {} (local file exists)", entry.name);
+            skipped += 1;
+            continue;
+        }
         let remote_child = if rdir.is_empty() {
             entry.name.clone()
         } else {
             format!("{rdir}/{}", entry.name)
         };
-        let local_child = local_root.join(&entry.name);
         let stream_id = take_stream(next_stream_id);
         match transfer::do_get(
             conn,
@@ -901,7 +917,7 @@ fn do_mget(
         println!("mget: no remote files match '{pattern}'");
     } else {
         println!(
-            "mget: downloaded {ok}/{matched} file(s) to {}",
+            "mget: downloaded {ok}/{matched} file(s) to {} ({skipped} skipped)",
             local_root.display()
         );
     }

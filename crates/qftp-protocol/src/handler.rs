@@ -315,6 +315,20 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 Ok(e) => e,
                                 Err(e) => return err(io_code(&e), format!("Read dir error: {e}")),
                             };
+                            // into_string() is a zero-copy OsString -> String
+                            // move for the UTF-8 common case; fall back to
+                            // lossy only for non-UTF-8.
+                            let name = entry
+                                .file_name()
+                                .into_string()
+                                .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+                            // Hide in-flight / aborted upload temp files
+                            // (`<name>.qftp.partial[.*]`): they are server
+                            // bookkeeping, not listable content, and would
+                            // otherwise be pulled down by `mget` / `get -r`.
+                            if name.contains(".qftp.partial") {
+                                continue;
+                            }
                             let meta = match entry.metadata() {
                                 Ok(m) => m,
                                 Err(e) => return err(io_code(&e), format!("Metadata error: {e}")),
@@ -326,13 +340,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
                             listing.push(DirEntry {
-                                // into_string() is a zero-copy OsString ->
-                                // String move for the UTF-8 common case;
-                                // fall back to lossy only for non-UTF-8.
-                                name: entry
-                                    .file_name()
-                                    .into_string()
-                                    .unwrap_or_else(|os| os.to_string_lossy().into_owned()),
+                                name,
                                 is_dir: meta.is_dir(),
                                 size: meta.len(),
                                 modified,

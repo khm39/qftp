@@ -1354,69 +1354,36 @@ fn start_put(
         fail_stream(ctx, stream_id, metrics, err(code, msg))
     };
 
-    if size > MAX_FILE_SIZE {
+    // The final file is `offset + size` bytes; check the resumed total,
+    // not just this round's body, so resume can't append past the cap.
+    let final_size = offset.saturating_add(size);
+    if final_size > MAX_FILE_SIZE {
         return send_err(
             ctx,
             ErrorCode::FileTooLarge,
-            format!(
-                "Upload too large: {} bytes (max {} bytes)",
-                size, MAX_FILE_SIZE
-            ),
+            format!("Upload too large: {final_size} bytes (max {MAX_FILE_SIZE} bytes)"),
         );
     }
-    // Quota pre-check + in-flight reservation. `size` is the count of
-    // body bytes the client is about to send -- already post-offset --
-    // so it is exactly what this upload adds to storage. The cache
-    // (`used_bytes` / `in_flight_bytes`) is kept up to date by Put
-    // commit/abort and Rm. Reserve atomically so two concurrent
-    // Puts can't both pass the check and overshoot the limit.
-    let new_bytes = size;
-    if let Some(limit) = ctx.user.quota_bytes {
-        let used = ctx.user.used_bytes.load(Ordering::Relaxed);
-        let in_flight = ctx.user.in_flight_bytes.load(Ordering::Relaxed);
-        let projected = used.saturating_add(in_flight).saturating_add(new_bytes);
-        if projected > limit {
-            return send_err(
-                ctx,
-                ErrorCode::QuotaExceeded,
-                format!(
-                    "Quota exceeded: would use {projected} bytes (limit {limit}, currently {} reserved {})",
-                    used, in_flight
-                ),
-            );
-        }
-    }
-    // Reserve unconditionally so abort/disconnect bookkeeping is
-    // symmetric regardless of whether the user has a configured
-    // quota; the value only matters for limited users but the
-    // counter is cheap. The guard releases the reservation on every
-    // early-return path below; it is disarmed once `ReadingFileData`
-    // (which owns the reservation via its Drop) is constructed.
-    let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
+
     let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
         Ok(p) => p,
         Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
     };
-    // Parent-dir symlink TOCTOU re-check. The temp file is
-    // opened with O_NOFOLLOW, which protects the *leaf* but not the
-    // intermediate components -- a parent that was swapped to a
-    // symlink between resolve_parent and open would still be
-    // traversed by the kernel and land the temp under the symlink
-    // target.
+    // Parent-dir symlink TOCTOU re-check. The temp file is opened with
+    // O_NOFOLLOW, which protects the *leaf* but not the intermediate
+    // components -- a parent swapped to a symlink between resolve_parent
+    // and open would still be traversed by the kernel.
     if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, &ctx.user.home) {
-        // `reservation` releases the in-flight bytes on return since
-        // we never opened the temp file.
         send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
         metrics.inc_requests_failed();
         ctx.streams.insert(stream_id, StreamState::Done);
         return Ok(());
     }
-    // Enforce client-requested overwrite refusal. lstat (not
-    // stat) so a planted symlink at `final_path` counts as
-    // "exists" -- otherwise an attacker who could plant a dangling
-    // symlink could bypass --no-clobber by aiming it at /nonexistent.
+    // Enforce client-requested overwrite refusal. lstat (not stat) so a
+    // planted symlink at `final_path` counts as "exists" -- otherwise an
+    // attacker who could plant a dangling symlink could bypass
+    // --no-clobber by aiming it at /nonexistent.
     if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
-        // `reservation` releases the in-flight bytes on return.
         return send_err(
             ctx,
             ErrorCode::AlreadyExists,
@@ -1425,15 +1392,20 @@ fn start_put(
     }
     let temp_path = temp_path_for(&final_path);
 
-    // Open the deterministically named resumable temp file.
+    // Open the deterministically named resumable temp file *before* the
+    // quota check, so a fresh Put can refund a stale partial's bytes
+    // first -- otherwise re-uploading a file whose earlier attempt
+    // aborted near the quota limit would be rejected for the very bytes
+    // it is about to replace.
     //   * Fresh upload (offset == 0): create-or-reuse. A leftover
-    //     partial from an earlier aborted upload is truncated and
-    //     reused; its bytes were charged to `used_bytes` on that
-    //     abort, so refund them first.
+    //     partial is truncated and reused; its bytes were charged to
+    //     `used_bytes` on that abort, so refund them. `prior_bytes` is
+    //     0 -- nothing on disk is pre-accounted for this stream.
     //   * Resume (offset > 0): the temp must already exist and hold
     //     exactly `offset` bytes; re-hash that prefix so the BLAKE3
-    //     trailer check still covers the whole file.
-    let (file, hasher) = if offset == 0 {
+    //     trailer check still covers the whole file. `prior_bytes` is
+    //     `offset`: those bytes are already counted in `used_bytes`.
+    let (file, hasher, prior_bytes) = if offset == 0 {
         let f = match open_temp(&temp_path, false) {
             Ok(f) => f,
             Err(e) => {
@@ -1452,15 +1424,26 @@ fn start_put(
                     Some(u.saturating_sub(stale))
                 })
                 .ok();
-            if let Err(e) = f.set_len(0) {
-                return send_err(
-                    ctx,
-                    io_code(&e),
-                    format!("Failed to truncate stale upload temp file: {e}"),
-                );
-            }
         }
-        (f, blake3::Hasher::new())
+        // Truncate unconditionally: a reused file (a stale partial, or
+        // one a local user planted at the predictable path) must not
+        // leave trailing bytes past the new body.
+        if let Err(e) = f.set_len(0) {
+            return send_err(
+                ctx,
+                io_code(&e),
+                format!("Failed to truncate upload temp file: {e}"),
+            );
+        }
+        // Re-assert 0o600: the O_CREAT mode is ignored when the file
+        // already existed, so a reused/planted temp could otherwise
+        // keep a looser mode and expose the in-progress body.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+        (f, blake3::Hasher::new(), 0u64)
     } else {
         let mut f = match open_temp(&temp_path, true) {
             Ok(f) => f,
@@ -1495,14 +1478,41 @@ fn start_put(
             hasher.update(&buf[..want]);
             left -= want as u64;
         }
-        (f, hasher)
+        (f, hasher, offset)
     };
+
+    // Quota pre-check + in-flight reservation. `used_bytes` now reflects
+    // reality: a fresh Put refunded any stale partial above, and a
+    // resume's `offset` bytes are legitimately still counted. `size` is
+    // the post-offset body the client is about to send. Reserve
+    // atomically so two concurrent Puts can't both pass and overshoot.
+    let new_bytes = size;
+    if let Some(limit) = ctx.user.quota_bytes {
+        let used = ctx.user.used_bytes.load(Ordering::Relaxed);
+        let in_flight = ctx.user.in_flight_bytes.load(Ordering::Relaxed);
+        let projected = used.saturating_add(in_flight).saturating_add(new_bytes);
+        if projected > limit {
+            // A fresh Put truncated its temp to empty; remove it so a
+            // rejected upload leaves no litter. A resume's temp is the
+            // user's own partial -- leave it intact for a later retry.
+            if offset == 0 {
+                let _ = fs::remove_file(&temp_path);
+            }
+            return send_err(
+                ctx,
+                ErrorCode::QuotaExceeded,
+                format!(
+                    "Quota exceeded: would use {projected} bytes (limit {limit}, currently {used} reserved {in_flight})"
+                ),
+            );
+        }
+    }
+    let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
     let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, file);
 
     // The reservation is now owned by `ReadingFileData`'s Drop (via
     // `reserved_bytes`); disarm the guard so the bytes aren't released
-    // twice. Every failure path below this point goes through a
-    // `ReadingFileData` value whose Drop returns the reservation.
+    // twice.
     reservation.disarm();
     let mut new_state = StreamState::ReadingFileData {
         final_path,
@@ -1519,6 +1529,7 @@ fn start_put(
             None
         },
         reserved_bytes: new_bytes,
+        prior_bytes,
         owner: Arc::clone(&ctx.user),
     };
     if !leftover.is_empty() {
@@ -1583,6 +1594,7 @@ fn drive_put(
         expected_checksum,
         trailer_buf,
         reserved_bytes,
+        prior_bytes,
         owner,
     } = state
     else {
@@ -1709,6 +1721,17 @@ fn drive_put(
                 owner
                     .in_flight_bytes
                     .fetch_sub(*reserved_bytes, Ordering::Relaxed);
+                // The partial is being deleted. Refund the prefix bytes
+                // a prior aborted session charged to `used_bytes`, or
+                // they leak permanently against the user's quota.
+                if *prior_bytes > 0 {
+                    owner
+                        .used_bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                            Some(u.saturating_sub(*prior_bytes))
+                        })
+                        .ok();
+                }
                 *completed = true;
                 return Ok(Some(err(
                     ErrorCode::ChecksumMismatch,

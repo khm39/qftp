@@ -455,9 +455,10 @@ fn do_put_inner(
         std::fs::metadata(local).with_context(|| format!("stat {} for upload", local.display()))?;
     let size = meta.len();
 
-    if offset > size {
-        bail!("resume offset {offset} is past local file size {size}; refusing");
-    }
+    // The resume offset was probed against an earlier `metadata()`
+    // snapshot; if the local file shrank since then, fall back to a
+    // fresh upload rather than failing the transfer.
+    let offset = if offset > size { 0 } else { offset };
 
     // Streaming BLAKE3: hash incrementally as we read+send,
     // then ship the 32-byte digest as an in-band trailer after the
