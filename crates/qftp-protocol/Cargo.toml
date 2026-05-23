@@ -12,6 +12,7 @@ readme = "../../README.md"
 [dependencies]
 qftp-common = { path = "../qftp-common" }
 anyhow = "1"
+thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 x509-parser = "0.16"
 blake3 = "1"

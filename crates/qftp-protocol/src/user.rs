@@ -14,8 +14,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use serde::Deserialize;
+
+/// Structured errors from [`UserDirectory::from_config`]. Splits I/O
+/// failures from configuration-shape failures so a wrapper can map
+/// the latter to "operator should edit the config file" diagnostics
+/// without grepping the message text.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum UserDirectoryError {
+    /// Underlying filesystem error (mkdir / canonicalize / stat
+    /// failed). Carries the originating path for diagnostics via the
+    /// message; the inner `io::Error` is the source.
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Configuration shape is invalid (quota = 0, home contains `..`,
+    /// home escapes global root, etc.). Strings reference the issue
+    /// numbers (#112, #126) that documented the constraint so the
+    /// message keeps grep-continuity with the runbook.
+    #[error("invalid user configuration: {0}")]
+    Config(String),
+}
+
+impl UserDirectoryError {
+    fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+type Result<T, E = UserDirectoryError> = std::result::Result<T, E>;
 
 /// Operations gated by ACL. Each variant maps to a Request::* that can
 /// modify or read state.
@@ -273,10 +307,13 @@ impl UserDirectory {
 
     /// Read a TOML config and resolve all home paths against `global_root`.
     pub fn from_config(global_root: &Path, cfg: UserConfig) -> Result<Self> {
-        let canonical_root = global_root.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize global root {}",
-                global_root.display()
+        let canonical_root = global_root.canonicalize().map_err(|e| {
+            UserDirectoryError::io(
+                format!(
+                    "failed to canonicalize global root {}",
+                    global_root.display()
+                ),
+                e,
             )
         })?;
 
@@ -289,12 +326,12 @@ impl UserDirectory {
         // false` to forbid writes.
         for spec in cfg.users.iter().chain(cfg.anonymous.iter()) {
             if spec.quota_bytes == Some(0) {
-                anyhow::bail!(
+                return Err(UserDirectoryError::Config(format!(
                     "user {}: quota_bytes = 0 is ambiguous (#126); \
                      omit the field for unlimited, or set \
                      `permissions.write = false` to forbid writes",
                     spec.name
-                );
+                )));
             }
         }
 
@@ -305,37 +342,43 @@ impl UserDirectory {
                     if h.components()
                         .any(|c| matches!(c, std::path::Component::ParentDir))
                     {
-                        anyhow::bail!(
+                        return Err(UserDirectoryError::Config(format!(
                             "user {}: relative home {} contains `..` (#112)",
                             spec.name,
                             h.display()
-                        );
+                        )));
                     }
                     global_root.join(h)
                 }
                 None => global_root.join(&spec.name),
             };
-            std::fs::create_dir_all(&raw).with_context(|| {
-                format!(
-                    "failed to create home directory {} for user {}",
-                    raw.display(),
-                    spec.name
+            std::fs::create_dir_all(&raw).map_err(|e| {
+                UserDirectoryError::io(
+                    format!(
+                        "failed to create home directory {} for user {}",
+                        raw.display(),
+                        spec.name
+                    ),
+                    e,
                 )
             })?;
-            let canonical = raw.canonicalize().with_context(|| {
-                format!(
-                    "failed to canonicalize home {} for user {}",
-                    raw.display(),
-                    spec.name
+            let canonical = raw.canonicalize().map_err(|e| {
+                UserDirectoryError::io(
+                    format!(
+                        "failed to canonicalize home {} for user {}",
+                        raw.display(),
+                        spec.name
+                    ),
+                    e,
                 )
             })?;
             if !canonical.starts_with(&canonical_root) {
-                anyhow::bail!(
+                return Err(UserDirectoryError::Config(format!(
                     "user {} home {} escapes global root {} (#112)",
                     spec.name,
                     canonical.display(),
                     canonical_root.display()
-                );
+                )));
             }
             Ok(canonical)
         };
@@ -362,7 +405,10 @@ impl UserDirectory {
             let home = resolve_home(spec)?;
             let user = build_user(spec, home);
             if by_name.insert(spec.name.clone(), user).is_some() {
-                anyhow::bail!("duplicate user name in config: {}", spec.name);
+                return Err(UserDirectoryError::Config(format!(
+                    "duplicate user name in config: {}",
+                    spec.name
+                )));
             }
         }
 
