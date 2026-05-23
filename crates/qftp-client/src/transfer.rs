@@ -271,15 +271,26 @@ fn do_get_inner(
         .open(local)
         .with_context(|| format!("opening {} for write", local.display()))?;
 
-    // The server's BLAKE3 trailer certifies exactly the bytes it
-    // streams. On a resumed Get (`offset > 0`) it seeks to `offset` and
-    // hashes only the `[offset..]` suffix it sends -- not the whole
-    // file. So the client hashes only the bytes it receives. Feeding
-    // the on-disk prefix in here would compute a whole-file hash that
-    // can never match the server's suffix trailer, failing every
-    // resumed download.
+    // The server's BLAKE3 trailer is a whole-file hash even for a
+    // resumed Get: it re-hashes [0..offset) before streaming the
+    // [offset..] suffix. Mirror that here -- feed the local prefix
+    // into `hasher` first, then continue with the received suffix.
+    // This is what verifies the local prefix: if it doesn't match the
+    // remote file's prefix, the whole-file hashes won't match and the
+    // download fails at trailer verification (#221).
     let mut hasher = blake3::Hasher::new();
     if resume_offset > 0 {
+        file.seek(SeekFrom::Start(0))
+            .context("seeking to start of local prefix")?;
+        let mut buf = [0u8; CHUNK];
+        let mut left = resume_offset;
+        while left > 0 {
+            let want = (left as usize).min(buf.len());
+            file.read_exact(&mut buf[..want])
+                .context("reading local prefix for hash")?;
+            hasher.update(&buf[..want]);
+            left -= want as u64;
+        }
         file.seek(SeekFrom::Start(resume_offset))
             .with_context(|| format!("seeking to {resume_offset}"))?;
     }

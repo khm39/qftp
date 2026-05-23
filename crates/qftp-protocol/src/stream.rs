@@ -185,7 +185,8 @@ pub enum StreamState {
     /// Streaming a file to the peer (Get). Driven from the main loop on
     /// every iteration so a single big transfer can't monopolize CPU at
     /// the cost of other connections. `hasher` accumulates BLAKE3 over
-    /// the sent bytes; when the body is complete we emit a 32-byte
+    /// the whole file (including the [0..offset) prefix re-read for a
+    /// resumed Get); when the body is complete we emit a 32-byte
     /// trailer with the finalized hash + FIN.
     SendingFileData {
         reader: std::io::BufReader<File>,
@@ -198,6 +199,13 @@ pub enum StreamState {
         trailer: Option<[u8; 32]>,
         trailer_offset: usize,
         finished: bool,
+        /// Bytes of the [0..offset) prefix still to be re-read into
+        /// `hasher` before any body bytes are streamed. For a resumed
+        /// Get (`offset > 0`) the server must produce a whole-file
+        /// BLAKE3 in its trailer so the client can verify its local
+        /// prefix; this counter drives that re-hash incrementally. `0`
+        /// for a fresh Get.
+        prefix_remaining: u64,
     },
     /// Terminal state. The retain() sweep removes streams in this state.
     Done,

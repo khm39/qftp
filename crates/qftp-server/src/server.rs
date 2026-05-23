@@ -1228,7 +1228,7 @@ fn start_get(
     let mut open_opts = std::fs::OpenOptions::new();
     open_opts.read(true);
     qftp_common::fs_safe::apply_no_follow(&mut open_opts);
-    let mut file = match open_opts.open(&file_path) {
+    let file = match open_opts.open(&file_path) {
         Ok(f) => f,
         Err(e) => {
             return send_err(ctx, io_code(&e), format!("Failed to open file: {e}"));
@@ -1270,11 +1270,6 @@ fn start_get(
         Some(n) => n.min(remaining),
         None => remaining,
     };
-    if offset > 0 {
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .with_context(|| format!("seek to offset {offset}"))?;
-    }
     send_message(
         &mut ctx.conn,
         stream_id,
@@ -1284,6 +1279,10 @@ fn start_get(
             checksum_follows: true,
         },
     )?;
+    // The reader stays at position 0 even for a resumed Get: the
+    // streaming state machine re-hashes the [0..offset) prefix into
+    // `hasher` before sending any body bytes, so the trailer is a
+    // whole-file BLAKE3 the client can verify its local prefix against.
     ctx.streams.insert(
         stream_id,
         StreamState::SendingFileData {
@@ -1294,6 +1293,7 @@ fn start_get(
             trailer: None,
             trailer_offset: 0,
             finished: false,
+            prefix_remaining: offset,
         },
     );
     Ok(())
@@ -1389,12 +1389,34 @@ fn drive_one_sender(
         trailer,
         trailer_offset,
         finished,
+        prefix_remaining,
     } = state
     else {
         return SendOutcome::Finished;
     };
     if *finished {
         return SendOutcome::Finished;
+    }
+
+    // Phase 0: re-hash the [0..offset) prefix of a resumed Get into
+    // `hasher` before streaming any body bytes. Doing this incrementally
+    // (one chunk per call) keeps a large resumed Get from stalling the
+    // event loop; once `prefix_remaining` reaches 0 the next call falls
+    // through to Phase A. The trailer is therefore a whole-file BLAKE3,
+    // so the client can verify its local prefix against it (#221).
+    if *prefix_remaining > 0 {
+        let want = (*prefix_remaining as usize).min(chunk.len());
+        if let Err(e) = reader.read_exact(&mut chunk[..want]) {
+            warn!(stream_id, error = %e, "file read failed during prefix re-hash");
+            let _ = ctx.conn.stream_send(stream_id, &[], true);
+            return SendOutcome::Failed;
+        }
+        hasher.update(&chunk[..want]);
+        *prefix_remaining -= want as u64;
+        // Yield to the event loop so other streams get a turn; the next
+        // iteration continues the prefix walk (or proceeds to Phase A
+        // once `prefix_remaining` hits 0).
+        return SendOutcome::Blocked;
     }
 
     // Phase A: stream the body. After every chunk that quiche accepts we
