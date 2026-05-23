@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
@@ -174,16 +175,44 @@ fn run_session(
         let wait = Duration::from_millis(debounce_ms.min(200));
         match rx.recv_timeout(wait) {
             Ok(ev) => {
-                let action = match ev.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) => Some(Action::Upload),
-                    EventKind::Remove(_) => Some(Action::Delete),
-                    _ => None,
-                };
-                if let Some(a) = action {
-                    for p in ev.paths {
-                        // Last action per path wins.
-                        pending.insert(p, a);
+                // notify reports a rename as two events on Linux: the
+                // source as Modify(Name(From)) and the destination as
+                // Modify(Name(To)). Mapping every Modify(_) to Upload
+                // would leave the renamed-away source on the remote
+                // forever (its Upload is skipped because the file is
+                // gone), so split the rename modes out explicitly.
+                let mut touched = false;
+                match ev.kind {
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                        // `paths` is [from, to]: the first is gone, the
+                        // rest are new.
+                        let mut it = ev.paths.into_iter();
+                        if let Some(from) = it.next() {
+                            pending.insert(from, Action::Delete);
+                            touched = true;
+                        }
+                        for to in it {
+                            pending.insert(to, Action::Upload);
+                            touched = true;
+                        }
                     }
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From))
+                    | EventKind::Remove(_) => {
+                        for p in ev.paths {
+                            pending.insert(p, Action::Delete);
+                            touched = true;
+                        }
+                    }
+                    EventKind::Create(_) | EventKind::Modify(_) => {
+                        for p in ev.paths {
+                            // Last action per path wins.
+                            pending.insert(p, Action::Upload);
+                            touched = true;
+                        }
+                    }
+                    _ => {}
+                }
+                if touched {
                     last_event_at = Some(Instant::now());
                 }
             }
