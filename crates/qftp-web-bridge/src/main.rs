@@ -104,12 +104,14 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let root = std::fs::canonicalize(&args.root)
+    let root = tokio::fs::canonicalize(&args.root)
+        .await
         .with_context(|| format!("failed to canonicalize root {}", args.root.display()))?;
 
     let users = match &args.users {
         Some(path) => {
-            let text = std::fs::read_to_string(path)
+            let text = tokio::fs::read_to_string(path)
+                .await
                 .with_context(|| format!("failed to read users file {}", path.display()))?;
             let cfg: UserConfig = toml::from_str(&text)
                 .with_context(|| format!("failed to parse users file {}", path.display()))?;

@@ -174,17 +174,17 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     }
 
     // Ensure the remote root exists. mkdir of an existing dir gets
-    // AlreadyExists which we ignore.
-    let _ = request_response(
+    // AlreadyExists which we ignore; every other error (connection
+    // dropped, malformed response, etc.) bubbles up so the caller
+    // doesn't try to upload into a directory that doesn't exist.
+    ensure_remote_dir(
         &mut conn,
         &socket,
         &mut poll,
         &mut events,
         &mut next,
-        &Request::Mkdir {
-            path: remote_root.clone(),
-        },
-    );
+        remote_root.clone(),
+    )?;
 
     // Create the distinct parent directories once each. A flat
     // directory of N files would otherwise send N redundant Mkdir
@@ -198,14 +198,14 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
         }
     }
     for parent in mkdir_parents {
-        let _ = request_response(
+        ensure_remote_dir(
             &mut conn,
             &socket,
             &mut poll,
             &mut events,
             &mut next,
-            &Request::Mkdir { path: parent },
-        );
+            parent,
+        )?;
     }
 
     // Upload.
@@ -439,6 +439,38 @@ impl IgnoreMatcher {
             }
         }
         false
+    }
+}
+
+/// Send `Mkdir(path)`, tolerating an `AlreadyExists` response but
+/// surfacing every other error. Used to provision the remote root and
+/// each parent directory before uploading; if we silently swallow a
+/// dropped connection here the next file upload fails much later with
+/// a confusing error far from the root cause.
+fn ensure_remote_dir(
+    conn: &mut quiche::Connection,
+    socket: &mio::net::UdpSocket,
+    poll: &mut Poll,
+    events: &mut Events,
+    next: &mut u64,
+    path: String,
+) -> Result<()> {
+    let resp = request_response(
+        conn,
+        socket,
+        poll,
+        events,
+        next,
+        &Request::Mkdir { path: path.clone() },
+    )
+    .with_context(|| format!("sync: Mkdir({path}) request failed"))?;
+    match resp {
+        Response::Ok => Ok(()),
+        Response::Err(e) if e.code == qftp_common::protocol::ErrorCode::AlreadyExists => Ok(()),
+        Response::Err(e) => {
+            anyhow::bail!("sync: Mkdir({path}) failed: [{:?}] {}", e.code, e.message)
+        }
+        other => anyhow::bail!("sync: Mkdir({path}) got unexpected response: {other:?}"),
     }
 }
 

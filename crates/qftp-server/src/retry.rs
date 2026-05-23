@@ -18,6 +18,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use anyhow::Result;
 use hmac::{Hmac, Mac};
 use ring::rand::SecureRandom;
 use sha2::Sha256;
@@ -35,11 +36,12 @@ pub struct RetryKey {
 }
 
 impl RetryKey {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let rng = ring::rand::SystemRandom::new();
         let mut key = [0u8; 32];
-        rng.fill(&mut key).expect("system RNG failed");
-        Self { key }
+        rng.fill(&mut key)
+            .map_err(|e| anyhow::anyhow!("system RNG failed to seed retry key: {e}"))?;
+        Ok(Self { key })
     }
 
     /// Mint a token committing to (peer address, original DCID).
@@ -121,7 +123,11 @@ impl RetryKey {
     }
 
     fn sign(&self, data: &[u8]) -> [u8; HMAC_LEN] {
-        let mut mac = HmacSha256::new_from_slice(&self.key).expect("hmac key");
+        // `new_from_slice` only fails when the key length is rejected
+        // by the underlying HMAC; SHA-256 accepts any length, and our
+        // key is a fixed 32-byte buffer, so this is provably infallible.
+        let mut mac = HmacSha256::new_from_slice(&self.key)
+            .expect("HMAC-SHA256 accepts any key length; 32-byte key is fine");
         mac.update(data);
         let full = mac.finalize().into_bytes();
         let mut out = [0u8; HMAC_LEN];
@@ -137,7 +143,7 @@ mod tests {
 
     #[test]
     fn round_trip_valid() {
-        let key = RetryKey::new();
+        let key = RetryKey::new().expect("test RNG should not fail");
         let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
         let odcid = quiche::ConnectionId::from_ref(&[1, 2, 3, 4, 5]);
         let token = key.mint(peer, &odcid);
@@ -147,7 +153,7 @@ mod tests {
 
     #[test]
     fn wrong_peer_is_rejected() {
-        let key = RetryKey::new();
+        let key = RetryKey::new().expect("test RNG should not fail");
         let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
         let other = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 4242));
         let odcid = quiche::ConnectionId::from_ref(&[9; 8]);
@@ -157,7 +163,7 @@ mod tests {
 
     #[test]
     fn tampered_token_is_rejected() {
-        let key = RetryKey::new();
+        let key = RetryKey::new().expect("test RNG should not fail");
         let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
         let odcid = quiche::ConnectionId::from_ref(&[7; 8]);
         let mut token = key.mint(peer, &odcid);
@@ -167,7 +173,7 @@ mod tests {
 
     #[test]
     fn random_blob_is_rejected() {
-        let key = RetryKey::new();
+        let key = RetryKey::new().expect("test RNG should not fail");
         let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
         assert!(key.verify(peer, &[0u8; 64]).is_none());
         assert!(key.verify(peer, &[]).is_none());

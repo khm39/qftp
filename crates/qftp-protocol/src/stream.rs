@@ -31,10 +31,14 @@ pub const SEND_CHUNK_SIZE: usize = 256 * 1024;
 /// after a Put body. The trailer is always exactly 32 bytes;
 /// this holds whatever subset we've drained off the stream so
 /// far so `drive_put` can finalize verification once `filled == 32`.
+///
+/// Fields are private so the `filled <= 32` invariant `extend` relies on
+/// to avoid out-of-bounds indexing can't be violated from outside the
+/// crate.
 #[derive(Debug)]
 pub struct TrailerBuf {
-    pub bytes: [u8; 32],
-    pub filled: u8,
+    bytes: [u8; 32],
+    filled: u8,
 }
 
 impl TrailerBuf {
@@ -51,6 +55,14 @@ impl TrailerBuf {
 
     pub fn is_full(&self) -> bool {
         self.filled == 32
+    }
+
+    /// The 32-byte trailer payload. Callers should check
+    /// [`Self::is_full`] first: when `filled < 32` the suffix of the
+    /// returned array is zero (the initial value), not part of the
+    /// real trailer.
+    pub fn as_array(&self) -> [u8; 32] {
+        self.bytes
     }
 
     /// Append `src` to the buffer, returning the number of bytes
@@ -246,10 +258,25 @@ impl Drop for StreamState {
                 // the real file rather than the logical write_all total
                 // keeps `used_bytes` correct even if a buffered write
                 // never reached disk.
-                let _ = writer.flush();
+                if let Err(e) = writer.flush() {
+                    tracing::warn!(
+                        path = %temp_path.display(),
+                        error = %e,
+                        "StreamState::drop: flush of aborted upload buffer failed; \
+                         quota accounting will fall back to logical byte count",
+                    );
+                }
                 let written = match std::fs::metadata(&*temp_path) {
                     Ok(m) => m.len().saturating_sub(*prior_bytes),
-                    Err(_) => reserved_bytes.saturating_sub(*remaining),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %temp_path.display(),
+                            error = %e,
+                            "StreamState::drop: cannot stat partial; \
+                             charging logical byte count to used_bytes",
+                        );
+                        reserved_bytes.saturating_sub(*remaining)
+                    }
                 };
                 if written > 0 {
                     owner.used_bytes.fetch_add(written, Ordering::Relaxed);
