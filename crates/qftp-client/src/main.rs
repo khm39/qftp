@@ -688,7 +688,6 @@ fn run_one_line(
                     local_root.map(|p| p.to_string_lossy().into_owned()),
                 )?;
             } else {
-                let stream_id = take_stream(next_stream_id);
                 let local_path = match local {
                     Some(s) => resolve_local(local_cwd, &s),
                     None => {
@@ -699,9 +698,15 @@ fn run_one_line(
                         local_cwd.join(name)
                     }
                 };
-                if let Err(e) =
-                    transfer::do_get(conn, socket, poll, events, stream_id, &remote, &local_path)
-                {
+                if let Err(e) = transfer::do_get(
+                    conn,
+                    socket,
+                    poll,
+                    events,
+                    next_stream_id,
+                    &remote,
+                    &local_path,
+                ) {
                     println!("get failed: {e}");
                 }
             }
@@ -948,13 +953,12 @@ fn do_mget(
         } else {
             format!("{rdir}/{}", entry.name)
         };
-        let stream_id = take_stream(next_stream_id);
         match transfer::do_get(
             conn,
             socket,
             poll,
             events,
-            stream_id,
+            next_stream_id,
             &remote_child,
             &local_child,
         ) {
@@ -1053,13 +1057,12 @@ fn do_recursive_get(
             if entry.is_dir {
                 queue.push((remote_child, local_child));
             } else {
-                let stream_id = take_stream(next_stream_id);
                 if let Err(e) = transfer::do_get(
                     conn,
                     socket,
                     poll,
                     events,
-                    stream_id,
+                    next_stream_id,
                     &remote_child,
                     &local_child,
                 ) {

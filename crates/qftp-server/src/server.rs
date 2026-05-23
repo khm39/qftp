@@ -246,6 +246,34 @@ fn run_handler(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
             }
             Err(e) => Response::Err(e),
         }
+    } else if let Request::Rename { from, to } = req {
+        // Rename can overwrite an existing destination file, freeing
+        // that file's bytes on disk. `handle_request` never sees
+        // `user`, so capture the clobbered size here and refund it from
+        // `used_bytes` once the rename succeeds -- otherwise repeated
+        // overwrite-renames drift the quota upward until the user is
+        // falsely QuotaExceeded.
+        let from_path = handler::resolve(cwd, &user.home, from).ok();
+        let to_path = handler::resolve_parent(cwd, &user.home, to).ok();
+        let clobbered = match (&from_path, &to_path) {
+            // A rename onto itself frees nothing; only count a distinct
+            // destination that already holds a regular file.
+            (Some(f), Some(t)) if f != t => std::fs::symlink_metadata(t)
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let resp = handler::handle_request(req, cwd, &user.home);
+        if matches!(resp, Response::Ok) && clobbered > 0 {
+            user.used_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(clobbered))
+                })
+                .ok();
+        }
+        resp
     } else {
         handler::handle_request(req, cwd, &user.home)
     }

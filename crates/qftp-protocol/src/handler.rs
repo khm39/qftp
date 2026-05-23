@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use qftp_common::protocol::{DirEntry, ErrorCode, ErrorResponse, FileStat, Request, Response};
+use qftp_common::protocol::{
+    DirEntry, ErrorCode, ErrorResponse, FileStat, Request, Response, MAX_DIR_ENTRIES,
+};
 
 use crate::user::{Op, User};
 
@@ -393,6 +395,17 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                     Ok(entries) => {
                         let mut listing: Vec<DirEntry> = Vec::with_capacity(64);
                         for entry in entries {
+                            // Cap the in-memory listing: a directory with
+                            // millions of (e.g. 0-byte) files would
+                            // otherwise drive an unbounded allocation in
+                            // the worker thread. The client enforces the
+                            // same MAX_DIR_ENTRIES in `validate_response`.
+                            if listing.len() >= MAX_DIR_ENTRIES {
+                                return err(
+                                    ErrorCode::Internal,
+                                    format!("directory listing exceeds {MAX_DIR_ENTRIES} entries"),
+                                );
+                            }
                             let entry = match entry {
                                 Ok(e) => e,
                                 Err(e) => return err(io_code(&e), format!("Read dir error: {e}")),
@@ -517,7 +530,17 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
         }
 
         Request::Chmod { path, mode } => match resolve(cwd, root, path) {
-            Ok(target) => set_mode(&target, *mode),
+            Ok(target) => {
+                // Parent-dir symlink TOCTOU re-check. `set_mode`
+                // re-lstats only the leaf, so without this an ancestor
+                // component swapped to a symlink after `resolve` would
+                // let the chmod follow it and modify a file outside the
+                // root. Every other mutating op already does this.
+                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
+                    return Response::Err(e);
+                }
+                set_mode(&target, *mode)
+            }
             Err(e) => Response::Err(e),
         },
 

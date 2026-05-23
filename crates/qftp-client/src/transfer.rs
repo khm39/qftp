@@ -18,7 +18,7 @@ use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
-use crate::proto::{poll_response, poll_response_with_buf};
+use crate::proto::{poll_response, poll_response_with_buf, take_stream};
 
 const CHUNK: usize = 64 * 1024;
 
@@ -180,17 +180,29 @@ pub fn do_get(
     socket: &mio::net::UdpSocket,
     poll: &mut Poll,
     events: &mut Events,
-    stream_id: u64,
+    next_stream_id: &mut u64,
     remote: &str,
     local: &Path,
 ) -> Result<()> {
-    // Parent span for the whole download so structured logs
-    // group the FileReady / chunk / verify events under a single
-    // (op=get, stream_id=N, path=...) header.
-    let _span = tracing::info_span!("transfer", op = "get", stream_id, path = %remote).entered();
-    let result = do_get_inner(conn, socket, poll, events, stream_id, remote, local);
-    if result.is_err() {
-        crate::stats::record_failure();
+    // Parent span for the whole download so structured logs group the
+    // FileReady / chunk / verify events under a single (op=get,
+    // path=...) header.
+    let _span = tracing::info_span!("transfer", op = "get", path = %remote).entered();
+    let stream_id = take_stream(next_stream_id);
+    let mut result = do_get_inner(conn, socket, poll, events, stream_id, remote, local);
+    // A resumed download whose local partial is longer than the (now
+    // shorter) remote file is refused with InvalidRange; `do_get_inner`
+    // deletes the stale local file and signals `StalePartial`. Retry
+    // once from scratch on a fresh stream so the transfer isn't stuck
+    // failing forever on the leftover partial.
+    if result.as_ref().is_err_and(|e| e.is::<StalePartial>()) {
+        let stream_id = take_stream(next_stream_id);
+        result = do_get_inner(conn, socket, poll, events, stream_id, remote, local);
+    }
+    if let Err(e) = &result {
+        if !e.is::<StalePartial>() {
+            crate::stats::record_failure();
+        }
     }
     result
 }
@@ -232,6 +244,14 @@ fn do_get_inner(
             checksum_follows,
         } => (size, total_size, checksum_follows),
         Response::Err(e) => {
+            // A resumed Get whose offset is past the (now shorter)
+            // remote file is refused with InvalidRange: the local
+            // partial is stale. Delete it so a retry starts clean, and
+            // signal the caller to retry from offset 0.
+            if e.code == ErrorCode::InvalidRange && resume_offset > 0 {
+                let _ = std::fs::remove_file(local);
+                return Err(anyhow::Error::new(StalePartial));
+            }
             bail!("server refused Get: {} ({:?})", e.message, e.code);
         }
         other => bail!("unexpected response to Get: {other:?}"),

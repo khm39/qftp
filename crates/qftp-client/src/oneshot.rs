@@ -439,8 +439,7 @@ fn run_get(
                 }
             }
         }
-        let stream_id = take_stream(next);
-        match transfer::do_get(conn, socket, poll, events, stream_id, &r.path, &local_path) {
+        match transfer::do_get(conn, socket, poll, events, next, &r.path, &local_path) {
             Ok(()) => Ok(exit::OK),
             Err(e) => {
                 eprintln!("get failed: {e}");
