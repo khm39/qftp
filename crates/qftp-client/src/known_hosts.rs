@@ -177,6 +177,17 @@ impl KnownHosts {
         let mut f = opts
             .open(path)
             .with_context(|| format!("failed to open {} for append", path.display()))?;
+        // `OpenOptionsExt::mode` is only honored when the file is
+        // being CREATED; an already-existing known_hosts (created
+        // with a looser umask, restored from backup, etc.) would
+        // keep its old mode. Re-assert 0600 explicitly so the
+        // documented "not world-readable" property holds for both
+        // new and existing files.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         // Serialize concurrent `qftp-client -T` invocations so
         // we don't get duplicate or interleaved entries. flock is
         // released automatically when the File drops.

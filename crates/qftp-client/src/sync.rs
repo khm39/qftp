@@ -209,6 +209,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     }
 
     // Upload.
+    let mut upload_failures = 0u64;
     for rel in &to_upload {
         let local_path = local_root.join(rel);
         let remote_path = join_remote(&remote_root, rel);
@@ -225,30 +226,44 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
             false,
         ) {
             Ok(()) => tracing::info!(file = %remote_path, "sync: uploaded"),
-            Err(e) => tracing::warn!(error = %e, file = %remote_path, "sync: upload failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, file = %remote_path, "sync: upload failed");
+                upload_failures += 1;
+            }
         }
     }
 
-    // Delete (rsync --delete-after semantics: only after the batch
-    // succeeds at least for the upload side).
-    for rel in &to_delete {
-        let remote_path = join_remote(&remote_root, Path::new(rel));
-        match request_response(
-            &mut conn,
-            &socket,
-            &mut poll,
-            &mut events,
-            &mut next,
-            &Request::Rm {
-                path: remote_path.clone(),
-            },
-        ) {
-            Ok(Response::Ok) => tracing::info!(file = %remote_path, "sync: deleted"),
-            Ok(Response::Err(e)) => {
-                tracing::warn!(?e.code, msg = %e.message, file = %remote_path, "sync: delete failed")
+    // Delete (rsync --delete-after semantics: only run when the upload
+    // batch succeeded). An upload failure suggests a degraded
+    // connection or remote -- the remote-only files we're about to
+    // delete might still be needed -- so skip the delete pass rather
+    // than silently destroy data on top of a partial upload.
+    if upload_failures > 0 && !to_delete.is_empty() {
+        eprintln!(
+            "sync: skipping --delete: {upload_failures} upload(s) failed, leaving \
+             {} remote-only file(s) in place",
+            to_delete.len()
+        );
+    } else {
+        for rel in &to_delete {
+            let remote_path = join_remote(&remote_root, Path::new(rel));
+            match request_response(
+                &mut conn,
+                &socket,
+                &mut poll,
+                &mut events,
+                &mut next,
+                &Request::Rm {
+                    path: remote_path.clone(),
+                },
+            ) {
+                Ok(Response::Ok) => tracing::info!(file = %remote_path, "sync: deleted"),
+                Ok(Response::Err(e)) => {
+                    tracing::warn!(?e.code, msg = %e.message, file = %remote_path, "sync: delete failed")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "sync: delete failed"),
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "sync: delete failed"),
         }
     }
 
@@ -530,11 +545,13 @@ fn sync_excludes(ignore: &IgnoreMatcher, rel: &Path) -> bool {
     false
 }
 
-/// mtime equality with 2-second tolerance. FAT only stores even
-/// seconds, and many copy tools round differently; rsync uses a 1s
-/// window. We mirror that.
+/// mtime equality with a 2-second tolerance. FAT only stores even
+/// seconds, so a copy to/from FAT can drift the recorded mtime by up
+/// to 2 seconds even when the contents are identical. Counting such a
+/// gap as "differs" would force a needless re-upload every sync; this
+/// matches `rsync --modify-window=2`, which exists for the same case.
 fn mtime_differs(a: u64, b: u64) -> bool {
-    a.abs_diff(b) > 1
+    a.abs_diff(b) > 2
 }
 
 // SystemTime helper is reserved for the future remote->local path;
@@ -552,10 +569,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mtime_window_is_1s() {
+    fn mtime_window_is_2s() {
+        // The window tolerates a 2-second drift (FAT's 2-second
+        // granularity); anything bigger counts as "differs".
         assert!(!mtime_differs(10, 10));
         assert!(!mtime_differs(10, 11));
-        assert!(mtime_differs(10, 12));
+        assert!(!mtime_differs(10, 12));
+        assert!(mtime_differs(10, 13));
     }
 
     fn matcher_from(lines: &[&str]) -> IgnoreMatcher {

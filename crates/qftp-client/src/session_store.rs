@@ -157,7 +157,21 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     // Write into a sibling temp + atomic rename so a concurrent
     // reader never sees a half-written ticket. The rename also
     // refreshes mtime, which our TTL check relies on.
-    let tmp = path.with_extension("ticket.tmp");
+    //
+    // The temp filename carries a pid + monotonic counter suffix:
+    // two concurrent saves for the same host:port (e.g. a `put-multi
+    // --to host,host` fanout) would otherwise share one deterministic
+    // temp path, interleave their `write_all`s, and rename a
+    // mixed-content blob into place. Each writer here gets its own
+    // temp; whichever rename runs last publishes a well-formed (if
+    // not necessarily newest) ticket.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "ticket.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -176,7 +190,15 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(not(unix))]
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("ticket.tmp");
+    // See the unix branch for why the temp path carries a random-ish
+    // pid + counter suffix.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "ticket.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

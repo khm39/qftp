@@ -257,6 +257,24 @@ fn do_get_inner(
         other => bail!("unexpected response to Get: {other:?}"),
     };
 
+    // `total_size` is the server's announced full-file size; `size` is
+    // the streamed body. `do_get` always sends `length: None`, so the
+    // streamed body should be exactly `total_size - resume_offset`. A
+    // mismatch means the server is announcing one size and delivering
+    // another (e.g. a malicious server returning a valid-looking
+    // trailer over a truncated body and banking on `total_size` going
+    // unchecked); refuse before we touch the local disk.
+    if resume_offset
+        .checked_add(size)
+        .map(|t| t != total_size)
+        .unwrap_or(true)
+    {
+        bail!(
+            "server returned inconsistent sizes: resume_offset ({resume_offset}) \
+             + size ({size}) != total_size ({total_size})"
+        );
+    }
+
     // Refuse to open through a pre-existing symlink. Combined
     // with the name filter this stops a malicious server from
     // pointing a recursive download at, say, ~/.ssh/authorized_keys

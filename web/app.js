@@ -470,16 +470,25 @@ function disconnect() {
   onDisconnected("by user");
 }
 
+let refreshGen = 0;
 async function refresh() {
   if (!qftp) return;
+  // Bump a generation token; only the latest refresh applies its
+  // results. Without this, two concurrent refresh() calls would each
+  // clear el.rows and then race their qftp.list() promises, causing
+  // duplicated rows (both appends land) or missing rows (a later
+  // clear wipes the earlier append).
+  const gen = ++refreshGen;
   el.path.textContent = currentPath;
   el.rows.innerHTML = "";
   try {
     const entries = await qftp.list(currentPath);
+    if (gen !== refreshGen) return;
     entries.sort((a, b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name));
     el.emptyDir.hidden = entries.length !== 0;
     for (const entry of entries) el.rows.appendChild(renderRow(entry));
   } catch (e) {
+    if (gen !== refreshGen) return;
     log("ls failed: " + (e.message || e), "err");
   }
 }
