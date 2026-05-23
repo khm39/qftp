@@ -178,6 +178,21 @@ async fn do_get(
 ) -> Result<()> {
     let root = &user.home;
 
+    // Server-internal upload temp files (`*.qftp.partial`) are server
+    // bookkeeping: a client must not be able to read one. The native
+    // `qftp-server` blocks this in `start_get`; mirror it here so the
+    // web bridge has the same security posture.
+    if handler::is_upload_temp(path) {
+        return reply_err(
+            send,
+            ErrorResponse::new(
+                ErrorCode::PermissionDenied,
+                "path refers to a server-internal upload temp file",
+            ),
+        )
+        .await;
+    }
+
     let file_path = match handler::resolve(root, root, path) {
         Ok(p) => p,
         Err(e) => return reply_err(send, e).await,

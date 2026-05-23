@@ -201,7 +201,7 @@ fn init_users(path: &Path) -> Result<()> {
 
 fn add_user(path: &Path, name: &str, home: Option<&Path>, perms: Perms) -> Result<()> {
     let mut doc = load_or_default(path)?;
-    let users = ensure_users_array(&mut doc);
+    let users = ensure_users_array(&mut doc)?;
 
     if find_user_index(users, name).is_some() {
         bail!("user '{name}' already exists; use `set-permissions` to modify");
@@ -233,7 +233,7 @@ fn add_user(path: &Path, name: &str, home: Option<&Path>, perms: Perms) -> Resul
 
 fn remove_user(path: &Path, name: &str) -> Result<()> {
     let mut doc = load_existing(path)?;
-    let users = ensure_users_array(&mut doc);
+    let users = ensure_users_array(&mut doc)?;
     let idx = find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))?;
     users.remove(idx);
     write_atomic(path, &doc.to_string())?;
@@ -294,7 +294,7 @@ fn format_perms(t: &toml_edit::Table) -> String {
 
 fn set_permissions(path: &Path, name: &str, partial: PartialPerms) -> Result<()> {
     let mut doc = load_existing(path)?;
-    let users = ensure_users_array(&mut doc);
+    let users = ensure_users_array(&mut doc)?;
     let idx = find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))?;
 
     let entry = users.get_mut(idx).expect("idx in bounds");
@@ -350,13 +350,21 @@ fn load_or_default(path: &Path) -> Result<toml_edit::DocumentMut> {
     }
 }
 
-fn ensure_users_array(doc: &mut toml_edit::DocumentMut) -> &mut toml_edit::ArrayOfTables {
+fn ensure_users_array(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::ArrayOfTables> {
     if doc.get("users").is_none() {
         doc.insert("users", toml_edit::Item::ArrayOfTables(Default::default()));
     }
-    doc["users"]
-        .as_array_of_tables_mut()
-        .expect("just inserted")
+    // If the file pre-existed with a `users` key of the wrong shape
+    // (e.g. a hand-edited `[users]` table or `users = "..."`), the
+    // insert above is skipped and `as_array_of_tables_mut` returns
+    // None. Surface that as a clean parse-style error instead of
+    // panicking with a misleading "just inserted" message.
+    doc["users"].as_array_of_tables_mut().ok_or_else(|| {
+        anyhow!(
+            "`users` key in users.toml is not an array-of-tables; \
+             expected `[[users]]` entries"
+        )
+    })
 }
 
 fn find_user_index(users: &toml_edit::ArrayOfTables, name: &str) -> Option<usize> {
