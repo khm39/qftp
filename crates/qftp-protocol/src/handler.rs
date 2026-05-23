@@ -305,22 +305,39 @@ pub fn recheck_path_no_symlinks(target: &Path, root: &Path) -> Result<(), ErrorR
 }
 
 /// Required permission for a given request.
-fn required_op(req: &Request) -> Option<Op> {
+///
+/// Returns `Ok(None)` for requests that are unconditionally allowed
+/// (no permission required), `Ok(Some(op))` for known requests that
+/// need an `Op`, and `Err(())` for unknown future variants — `Request`
+/// is `#[non_exhaustive]`, so when this crate is older than the
+/// protocol it must deny rather than fall back to the least-privilege
+/// `Op` and silently let the request through. `acl_reject` turns
+/// `Err(())` into a `PermissionDenied`.
+fn required_op(req: &Request) -> Result<Option<Op>, ()> {
     match req {
-        Request::Pwd | Request::Cd { .. } | Request::Quit | Request::Quota => None,
-        Request::Ls { .. } | Request::Stat { .. } | Request::Get { .. } => Some(Op::Read),
-        Request::Put { .. } => Some(Op::Write),
-        Request::Mkdir { .. } => Some(Op::Mkdir),
-        Request::Rmdir { .. } => Some(Op::Rmdir),
-        Request::Rm { .. } => Some(Op::Delete),
-        Request::Rename { .. } => Some(Op::Rename),
-        Request::Chmod { .. } => Some(Op::Chmod),
-        _ => Some(Op::Read),
+        Request::Pwd | Request::Cd { .. } | Request::Quit | Request::Quota => Ok(None),
+        Request::Ls { .. } | Request::Stat { .. } | Request::Get { .. } => Ok(Some(Op::Read)),
+        Request::Put { .. } => Ok(Some(Op::Write)),
+        Request::Mkdir { .. } => Ok(Some(Op::Mkdir)),
+        Request::Rmdir { .. } => Ok(Some(Op::Rmdir)),
+        Request::Rm { .. } => Ok(Some(Op::Delete)),
+        Request::Rename { .. } => Ok(Some(Op::Rename)),
+        Request::Chmod { .. } => Ok(Some(Op::Chmod)),
+        _ => Err(()),
     }
 }
 
 pub fn acl_reject(user: &User, req: &Request) -> Option<Response> {
-    let op = required_op(req)?;
+    let op = match required_op(req) {
+        Ok(None) => return None,
+        Ok(Some(op)) => op,
+        Err(()) => {
+            return Some(err(
+                ErrorCode::PermissionDenied,
+                "request type is not recognized by this server's ACL; refusing",
+            ));
+        }
+    };
     if user.permissions.allows(op) {
         None
     } else {

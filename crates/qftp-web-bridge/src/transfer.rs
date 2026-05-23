@@ -459,7 +459,16 @@ async fn do_put(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            return reply_err(
+                send,
+                ErrorResponse::new(
+                    handler::io_code(&e),
+                    format!("Failed to re-assert 0o600 on partial: {e}"),
+                ),
+            )
+            .await;
+        }
     }
     guard.temp_path = Some(temp_path.clone());
     let mut file = tokio::fs::File::from_std(std_file);

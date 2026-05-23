@@ -1707,7 +1707,13 @@ fn start_put(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+            if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                return send_err(
+                    ctx,
+                    io_code(&e),
+                    format!("Failed to re-assert 0o600 on partial: {e}"),
+                );
+            }
         }
         (f, blake3::Hasher::new(), 0u64, None)
     } else {
