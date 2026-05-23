@@ -112,10 +112,18 @@ async fn handle_stream_impl(
 
         // The remaining variants (Pwd / Cd / Ls / Mkdir / Rmdir / Rm /
         // Rename / Chmod / Stat) are stateless one-shot operations the
-        // shared handler implements directly.
+        // shared handler implements directly. They can issue many
+        // blocking fs syscalls (an `Ls` of a large directory does one
+        // per entry), so they have to run on the blocking-io pool to
+        // avoid parking a tokio worker on slow filesystems.
         other => {
-            let mut cwd = user.home.clone();
-            let resp = handler::handle_request(&other, &mut cwd, &user.home);
+            let home = user.home.clone();
+            let resp = tokio::task::spawn_blocking(move || {
+                let mut cwd = home.clone();
+                handler::handle_request(&other, &mut cwd, &home)
+            })
+            .await
+            .context("handler thread panicked")?;
             send_framed(&mut send, &resp).await?;
             finish(&mut send).await
         }
@@ -193,34 +201,36 @@ async fn do_get(
         .await;
     }
 
-    let file_path = match handler::resolve(root, root, path) {
-        Ok(p) => p,
+    // `resolve` + `recheck_ancestors_no_symlinks` + O_NOFOLLOW `open`
+    // each issue blocking syscalls (lstat per ancestor, plus the open
+    // itself). Hand the whole bundle to the blocking pool so a slow FS
+    // can't park the tokio worker servicing this stream.
+    let root_owned = root.clone();
+    let path_owned = path.to_string();
+    type OpenOutcome = std::result::Result<(std::fs::File, std::fs::Metadata), ErrorResponse>;
+    let open_outcome: OpenOutcome = tokio::task::spawn_blocking(move || {
+        let file_path = handler::resolve(&root_owned, &root_owned, &path_owned)?;
+        handler::recheck_ancestors_no_symlinks(&file_path, &root_owned)?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.read(true);
+        qftp_common::fs_safe::apply_no_follow(&mut open_opts);
+        let std_file = open_opts.open(&file_path).map_err(|e| {
+            ErrorResponse::new(handler::io_code(&e), format!("Failed to open file: {e}"))
+        })?;
+        let meta = std_file.metadata().map_err(|e| {
+            ErrorResponse::new(
+                handler::io_code(&e),
+                format!("failed to stat opened file: {e}"),
+            )
+        })?;
+        Ok((std_file, meta))
+    })
+    .await
+    .context("blocking open task panicked")?;
+    let (std_file, meta) = match open_outcome {
+        Ok(pair) => pair,
         Err(e) => return reply_err(send, e).await,
     };
-    // Parent-dir symlink TOCTOU re-check: O_NOFOLLOW below guards the
-    // leaf only, an intermediate parent swapped to a symlink would
-    // still be traversed by the kernel.
-    if let Err(e) = handler::recheck_ancestors_no_symlinks(&file_path, root) {
-        return reply_err(send, e).await;
-    }
-
-    // Open with O_NOFOLLOW first, then derive metadata from the
-    // resulting fd so the bytes we stream are bound to the inode the
-    // path resolved to.
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.read(true);
-    qftp_common::fs_safe::apply_no_follow(&mut open_opts);
-    let std_file = match open_opts.open(&file_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return reply_err(
-                send,
-                ErrorResponse::new(handler::io_code(&e), format!("Failed to open file: {e}")),
-            )
-            .await
-        }
-    };
-    let meta = std_file.metadata().context("failed to stat opened file")?;
     if !meta.is_file() {
         return reply_err(
             send,
@@ -388,16 +398,25 @@ async fn do_put(
         }
     }
 
-    let final_path = match handler::resolve_parent(root, root, path) {
-        Ok(p) => p,
+    // Same shape as `do_get`'s resolve: bundle the path validation
+    // syscalls (resolve_parent, ancestor lstats, optional no_clobber
+    // lstat) into one blocking task.
+    let root_owned = root.clone();
+    let path_owned = path.to_string();
+    type ResolveOutcome = std::result::Result<(PathBuf, bool), ErrorResponse>;
+    let resolve_outcome: ResolveOutcome = tokio::task::spawn_blocking(move || {
+        let final_path = handler::resolve_parent(&root_owned, &root_owned, &path_owned)?;
+        handler::recheck_ancestors_no_symlinks(&final_path, &root_owned)?;
+        let exists = std::fs::symlink_metadata(&final_path).is_ok();
+        Ok((final_path, exists))
+    })
+    .await
+    .context("blocking resolve task panicked")?;
+    let (final_path, exists) = match resolve_outcome {
+        Ok(pair) => pair,
         Err(e) => return reply_err(send, e).await,
     };
-    if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, root) {
-        return reply_err(send, e).await;
-    }
-    // lstat (not stat) so a planted dangling symlink still counts as
-    // "exists" and can't be used to bypass --no-clobber.
-    if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
+    if no_clobber && exists {
         return reply_err(
             send,
             ErrorResponse::new(
@@ -436,40 +455,45 @@ async fn do_put(
     // and truncate, matching the native server's fresh-Put path -- the
     // web bridge has no resume, so a stale partial is replaced wholesale.
     // `O_NOFOLLOW` (via `apply_owner_only_no_follow`) still rejects a
-    // symlink planted at the predictable path.
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.write(true).create(true).truncate(true);
-    qftp_common::fs_safe::apply_owner_only_no_follow(&mut open_opts);
-    let std_file = match open_opts.open(&temp_path) {
+    // symlink planted at the predictable path. The open + the
+    // permission re-assertion are bundled into one blocking task so a
+    // slow FS can't park this tokio worker between the two syscalls.
+    let temp_path_for_open = temp_path.clone();
+    type TempOpenOutcome = std::result::Result<std::fs::File, ErrorResponse>;
+    let open_outcome: TempOpenOutcome = tokio::task::spawn_blocking(move || {
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create(true).truncate(true);
+        qftp_common::fs_safe::apply_owner_only_no_follow(&mut open_opts);
+        let std_file = open_opts.open(&temp_path_for_open).map_err(|e| {
+            ErrorResponse::new(
+                handler::io_code(&e),
+                format!("Failed to create upload temp file: {e}"),
+            )
+        })?;
+        // The O_CREAT mode is ignored when the file already existed,
+        // so a reused stale partial could otherwise keep a looser
+        // mode and leak the in-progress body; re-assert owner-only
+        // permissions right after open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std_file
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    ErrorResponse::new(
+                        handler::io_code(&e),
+                        format!("Failed to re-assert 0o600 on partial: {e}"),
+                    )
+                })?;
+        }
+        Ok(std_file)
+    })
+    .await
+    .context("blocking temp-file open task panicked")?;
+    let std_file = match open_outcome {
         Ok(f) => f,
-        Err(e) => {
-            return reply_err(
-                send,
-                ErrorResponse::new(
-                    handler::io_code(&e),
-                    format!("Failed to create upload temp file: {e}"),
-                ),
-            )
-            .await
-        }
+        Err(e) => return reply_err(send, e).await,
     };
-    // The O_CREAT mode is ignored when the file already existed, so a
-    // reused stale partial could otherwise keep a looser mode and leak
-    // the in-progress body; re-assert owner-only permissions.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-            return reply_err(
-                send,
-                ErrorResponse::new(
-                    handler::io_code(&e),
-                    format!("Failed to re-assert 0o600 on partial: {e}"),
-                ),
-            )
-            .await;
-        }
-    }
     guard.temp_path = Some(temp_path.clone());
     let mut file = tokio::fs::File::from_std(std_file);
 
@@ -546,14 +570,14 @@ async fn do_put(
         }
     }
 
-    if let Err(e) = std::fs::rename(&temp_path, &final_path) {
+    if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
         return reply_err(
             send,
             ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}")),
         )
         .await;
     }
-    apply_mode(&final_path, mode);
+    apply_mode(&final_path, mode).await;
 
     // The upload committed: stop the guard from undoing it, then hand
     // the reservation over to the persistent used-bytes counter.
@@ -633,16 +657,16 @@ fn temp_path_for(final_path: &Path) -> PathBuf {
 /// Apply the client-requested mode, stripping suid/sgid/sticky bits so
 /// an upload can't plant a setuid primitive inside the served tree.
 #[cfg(unix)]
-fn apply_mode(path: &Path, mode: u32) {
+async fn apply_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(mode & 0o0777);
-    if let Err(e) = std::fs::set_permissions(path, perms) {
+    if let Err(e) = tokio::fs::set_permissions(path, perms).await {
         tracing::warn!(path = %path.display(), error = %e, "failed to set permissions");
     }
 }
 
 #[cfg(not(unix))]
-fn apply_mode(_path: &Path, _mode: u32) {}
+async fn apply_mode(_path: &Path, _mode: u32) {}
 
 #[cfg(test)]
 mod tests {

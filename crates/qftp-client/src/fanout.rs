@@ -47,7 +47,7 @@ pub fn run(
     }
 
     let results: Arc<Mutex<Vec<Outcome>>> = Arc::new(Mutex::new(Vec::with_capacity(targets.len())));
-    let mut handles = Vec::with_capacity(targets.len());
+    let mut handles: Vec<(String, thread::JoinHandle<()>)> = Vec::with_capacity(targets.len());
 
     for host in targets {
         let host = host.clone();
@@ -55,6 +55,7 @@ pub fn run(
         let remote_path = remote_path.to_string();
         let overrides = overrides.clone();
         let results = Arc::clone(&results);
+        let host_for_handle = host.clone();
         let h = thread::Builder::new()
             .name(format!("fanout-{host}"))
             .spawn(move || {
@@ -81,11 +82,26 @@ pub fn run(
                     .push(outcome);
             })
             .context("spawn fanout worker")?;
-        handles.push(h);
+        handles.push((host_for_handle, h));
     }
 
-    for h in handles {
-        let _ = h.join();
+    for (host, h) in handles {
+        if let Err(payload) = h.join() {
+            // A worker that panicked never wrote its Outcome, so the
+            // summary line below would silently undercount the targets.
+            // Synthesize a failure Outcome here so the user sees one
+            // row per --to host and can tell that something blew up.
+            let msg = panic_payload_message(payload);
+            results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Outcome {
+                    host,
+                    ok: false,
+                    elapsed_ms: 0,
+                    message: format!("worker thread panicked: {msg}"),
+                });
+        }
     }
     let results = Arc::into_inner(results)
         .expect("all worker threads have been joined; this is the sole Arc owner")
@@ -124,6 +140,20 @@ pub fn run(
         return Ok(crate::oneshot::exit::DATA);
     }
     Ok(crate::oneshot::exit::OK)
+}
+
+/// Best-effort extraction of a panic payload's message for inclusion
+/// in the fanout summary. Mirrors what the default panic hook does
+/// when it prints to stderr: `panic!("...")` uses `&'static str`, and
+/// `panic!("...{}", x)` boxes a `String`.
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 fn upload_to_host(

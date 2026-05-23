@@ -151,18 +151,30 @@ pub struct ConnectionCounter {
 }
 
 impl ConnectionCounter {
-    pub fn try_acquire(&mut self, caps: Caps, ip: IpAddr) -> bool {
+    /// Try to reserve one connection slot for `ip`. On success, returns
+    /// an RAII `ConnectionSlot` guard whose `Drop` releases the slot
+    /// unless `commit()` has been called. Modelled on the
+    /// `InFlightReservation` pattern in `server.rs`; the goal is that
+    /// every early-return branch between acquire and the final
+    /// `connections.insert` automatically releases the slot, instead of
+    /// requiring each branch to remember `release(ip)` by hand.
+    #[must_use = "the returned slot must be either committed or dropped to release the count"]
+    pub fn try_acquire(&mut self, caps: Caps, ip: IpAddr) -> Option<ConnectionSlot<'_>> {
         if self.total >= caps.max_total_connections {
-            return false;
+            return None;
         }
         let key = bucket_key(ip);
         let entry = self.per_ip.entry(key).or_insert(0);
         if *entry >= caps.max_per_ip_connections {
-            return false;
+            return None;
         }
         *entry += 1;
         self.total += 1;
-        true
+        Some(ConnectionSlot {
+            counter: self,
+            ip,
+            armed: true,
+        })
     }
 
     pub fn release(&mut self, ip: IpAddr) {
@@ -179,6 +191,34 @@ impl ConnectionCounter {
     #[allow(dead_code)] // surfaced by metrics + soak harness
     pub fn total(&self) -> usize {
         self.total
+    }
+}
+
+/// RAII guard for a `ConnectionCounter` slot reserved via
+/// [`ConnectionCounter::try_acquire`]. Dropping the guard releases the
+/// slot; call [`Self::commit`] to keep the slot alive across the guard's
+/// lifetime (used once the connection is fully accepted and ownership
+/// moves into `ConnectionContext`).
+pub struct ConnectionSlot<'a> {
+    counter: &'a mut ConnectionCounter,
+    ip: IpAddr,
+    armed: bool,
+}
+
+impl ConnectionSlot<'_> {
+    /// Hand off the slot to the long-lived `ConnectionContext`; the
+    /// guard becomes a no-op on drop and the normal `release(ip)` in
+    /// the connection-reap loop handles the eventual cleanup.
+    pub fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionSlot<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.counter.release(self.ip);
+        }
     }
 }
 
@@ -274,16 +314,16 @@ mod tests {
         let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 
-        assert!(cnt.try_acquire(caps, a));
-        assert!(cnt.try_acquire(caps, a));
+        assert!(cnt.try_acquire(caps, a).map(|s| s.commit()).is_some());
+        assert!(cnt.try_acquire(caps, a).map(|s| s.commit()).is_some());
         // Per-IP cap of 2 for `a`.
-        assert!(!cnt.try_acquire(caps, a));
-        assert!(cnt.try_acquire(caps, b));
+        assert!(cnt.try_acquire(caps, a).is_none());
+        assert!(cnt.try_acquire(caps, b).map(|s| s.commit()).is_some());
         // Total cap of 3 hit.
-        assert!(!cnt.try_acquire(caps, b));
+        assert!(cnt.try_acquire(caps, b).is_none());
 
         cnt.release(a);
         assert_eq!(cnt.total(), 2);
-        assert!(cnt.try_acquire(caps, b));
+        assert!(cnt.try_acquire(caps, b).map(|s| s.commit()).is_some());
     }
 }

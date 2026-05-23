@@ -134,10 +134,43 @@ struct HandlerResult {
 
 /// Pool of worker threads that execute blocking filesystem requests
 /// off the event-loop thread.
+///
+/// On drop, the pool closes `job_tx`, waits for every worker thread to
+/// finish its current job, and joins each handle so any panic payload
+/// surfaces in the log instead of being silently detached. Field order
+/// matters: `job_tx` declares first so it drops first, which makes the
+/// workers' blocking `recv()` return `Err` and lets `Drop` reach the
+/// join without deadlocking.
 struct HandlerPool {
     job_tx: mpsc::Sender<HandlerJob>,
     result_rx: mpsc::Receiver<HandlerResult>,
-    _workers: Vec<thread::JoinHandle<()>>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl Drop for HandlerPool {
+    fn drop(&mut self) {
+        // Replace `job_tx` with a fresh, detached channel so the only
+        // sender feeding workers' `recv()` is dropped *now*; workers
+        // wake up with `Err(RecvError)` and exit their loop. The
+        // dummy sender drops at end of statement.
+        let (dummy_tx, _) = mpsc::channel::<HandlerJob>();
+        let _ = std::mem::replace(&mut self.job_tx, dummy_tx);
+        for handle in std::mem::take(&mut self.workers) {
+            if let Err(payload) = handle.join() {
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic payload>".to_string()
+                };
+                tracing::error!(
+                    panic = %msg,
+                    "qftp handler worker thread panicked; pool is shutting down anyway",
+                );
+            }
+        }
+    }
 }
 
 fn spawn_handler_pool(waker: Arc<Waker>) -> HandlerPool {
@@ -161,7 +194,7 @@ fn spawn_handler_pool(waker: Arc<Waker>) -> HandlerPool {
     HandlerPool {
         job_tx,
         result_rx,
-        _workers: workers,
+        workers,
     }
 }
 
@@ -374,7 +407,7 @@ pub fn run(
     let mut rate_limiter =
         RateLimiter::new(server_config.rate_limit_rps, server_config.rate_limit_burst);
     let mut counter = ConnectionCounter::default();
-    let retry_key = RetryKey::new();
+    let retry_key = RetryKey::new().context("seed retry-token signing key")?;
 
     // Per-process seed used to derive a deterministic server SCID from
     // each client's original DCID. Without this, every retransmitted
@@ -654,11 +687,21 @@ fn try_accept(
         // Verified: fall through and accept with odcid set below.
     }
 
-    if !ax.counter.try_acquire(ax.cfg.caps, from.ip()) {
-        ax.metrics.inc_connections_rejected_caps();
-        debug!(peer = %from, "Initial dropped by connection cap");
-        return Ok(());
-    }
+    // RAII slot: every early return below drops the slot, which
+    // releases the per-IP and global counters. The success path
+    // calls `.commit()` so the slot survives this function and the
+    // normal `release(peer_ip)` in the connection-reap loop handles
+    // eventual cleanup. This replaces the previous "remember
+    // counter.release(from.ip()) on every early-return branch"
+    // bookkeeping that was prone to leaks on future refactors.
+    let slot = match ax.counter.try_acquire(ax.cfg.caps, from.ip()) {
+        Some(s) => s,
+        None => {
+            ax.metrics.inc_connections_rejected_caps();
+            debug!(peer = %from, "Initial dropped by connection cap");
+            return Ok(());
+        }
+    };
 
     // Derive the server SCID deterministically from the client's DCID +
     // process seed. Retransmitted Initials therefore land on the same
@@ -684,11 +727,8 @@ fn try_accept(
     ) {
         Ok(c) => c,
         Err(e) => {
-            // The connection slot was already counted by `try_acquire`
-            // above; release it so a failed accept doesn't leak a
-            // per-IP / global connection unit.
             warn!(peer = %from, error = ?e, "quiche::accept failed");
-            ax.counter.release(from.ip());
+            // `slot` drops here -> release happens automatically.
             return Ok(());
         }
     };
@@ -700,7 +740,7 @@ fn try_accept(
     };
     if let Err(e) = conn.recv(pkt, recv_info) {
         warn!(peer = %from, error = ?e, "initial recv failed");
-        ax.counter.release(from.ip());
+        // `slot` drops here -> release happens automatically.
         return Ok(());
     }
 
@@ -710,20 +750,22 @@ fn try_accept(
 
     // If a previous Initial from this peer already created the slot
     // (the deterministic SCID collapses retransmits onto the same key),
-    // just drop the duplicate accept. The connection counters are
-    // bumped only *after* this check so a retransmitted Initial that
-    // derives the same SCID doesn't leak a `connections_open` gauge
-    // unit for a `ConnectionContext` that is dropped here and never
-    // enters the `connections` map (so the reap sweep, which calls
-    // `dec_connections_open()`, never runs for it).
+    // just drop the duplicate accept. The slot drops here, releasing
+    // the duplicate count so a retransmitted Initial that derives the
+    // same SCID doesn't leak a `connections_open` gauge unit for a
+    // `ConnectionContext` that is dropped here and never enters the
+    // `connections` map.
     if ax.connections.contains_key(&scid) {
-        ax.counter.release(from.ip());
+        // `slot` drops here -> release happens automatically.
         return Ok(());
     }
     info!(peer = %from, "connection accepted");
     ax.metrics.inc_connections_total();
     ax.metrics.inc_connections_open();
     ax.connections.insert(scid, ctx);
+    // Hand the slot off to the long-lived connection; the reap loop
+    // will release it via `counter.release(peer_ip)` on close.
+    slot.commit();
     Ok(())
 }
 
@@ -733,7 +775,11 @@ fn derive_scid(seed: &[u8; 32], dcid: &quiche::ConnectionId) -> quiche::Connecti
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(seed).expect("hmac key");
+    // `new_from_slice` rejects only when the key length is invalid for
+    // the underlying HMAC; SHA-256 accepts any length and `seed` is a
+    // fixed 32-byte buffer, so this is provably infallible.
+    let mut mac = HmacSha256::new_from_slice(seed)
+        .expect("HMAC-SHA256 accepts any key length; 32-byte seed is fine");
     mac.update(dcid.as_ref());
     let bytes = mac.finalize().into_bytes();
     let take = quiche::MAX_CONN_ID_LEN.min(bytes.len());
@@ -2119,7 +2165,7 @@ fn drive_put(
         let expected: Option<[u8; 32]> = trailer_buf
             .as_ref()
             .filter(|b| b.is_full())
-            .map(|b| b.bytes)
+            .map(|b| b.as_array())
             .or(*expected_checksum);
         if let Some(expected) = expected {
             let got = *hasher.finalize().as_bytes();
