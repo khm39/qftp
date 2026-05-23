@@ -51,7 +51,13 @@ impl RetryKey {
             IpAddr::V6(v6) => payload.extend_from_slice(&v6.octets()),
         }
         payload.extend_from_slice(&peer.port().to_be_bytes());
-        payload.push(odcid.len() as u8);
+        // QUIC v1 limits CIDs to 20 bytes (RFC 9000 §17.2), so `as u8`
+        // would only silently truncate if quiche or a future revision
+        // ever handed us a longer ID — fail loud instead of writing a
+        // wrong length byte that `verify` would parse against trimmed bytes.
+        let odcid_len =
+            u8::try_from(odcid.len()).expect("QUIC v1 limits ODCIDs to 20 bytes (RFC 9000 §17.2)");
+        payload.push(odcid_len);
         payload.extend_from_slice(odcid.as_ref());
 
         let tag = self.sign(&payload);

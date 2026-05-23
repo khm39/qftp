@@ -75,7 +75,10 @@ pub fn run(
                         message: format!("{e:#}"),
                     },
                 };
-                results.lock().unwrap().push(outcome);
+                results
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(outcome);
             })
             .context("spawn fanout worker")?;
         handles.push(h);
@@ -84,7 +87,10 @@ pub fn run(
     for h in handles {
         let _ = h.join();
     }
-    let results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    let results = Arc::into_inner(results)
+        .expect("all worker threads have been joined; this is the sole Arc owner")
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
 
     let mut ok = 0;
     let mut fail = 0;

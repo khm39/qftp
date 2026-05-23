@@ -422,7 +422,15 @@ fn do_get_inner(
         }
     }
 
-    file.flush().ok();
+    if let Err(e) = file.flush() {
+        // Tear down the partial file rather than leave one whose
+        // last buffered bytes never reached disk. The BLAKE3 check
+        // below only validates the in-memory hash, so a silent
+        // flush failure would let us report "verified" for a
+        // truncated local file.
+        let _ = std::fs::remove_file(local);
+        bail!("final flush of download file failed: {e}");
+    }
     bar.finish_and_clear();
 
     if checksum_follows {
