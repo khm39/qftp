@@ -42,7 +42,8 @@ use crate::metrics::Metrics;
 use crate::retry::RetryKey;
 use qftp_protocol::handler::{self, err, io_code};
 use qftp_protocol::stream::{
-    ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+    temp_path_for, ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE,
+    SEND_CHUNK_SIZE,
 };
 use qftp_protocol::user::{self, User, UserDirectory};
 
@@ -155,7 +156,28 @@ impl Drop for HandlerPool {
         // dummy sender drops at end of statement.
         let (dummy_tx, _) = mpsc::channel::<HandlerJob>();
         let _ = std::mem::replace(&mut self.job_tx, dummy_tx);
+        // Workers parked inside `recv()` unblock immediately, but a
+        // worker mid-syscall (e.g. a slow NFS `readdir`) won't even
+        // observe the channel close until that syscall returns.
+        // Polling `is_finished()` with a bounded deadline lets server
+        // shutdown progress in that case: any thread still running
+        // past the deadline is detached (the JoinHandle's normal Drop
+        // does not join) and will exit on its own once the syscall
+        // completes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         for handle in std::mem::take(&mut self.workers) {
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !handle.is_finished() {
+                tracing::warn!(
+                    thread = handle.thread().name().unwrap_or("<unnamed>"),
+                    "qftp handler worker did not exit within shutdown deadline; \
+                     detaching (likely stuck in a blocking filesystem syscall)",
+                );
+                // Dropping the handle without join detaches the thread.
+                continue;
+            }
             if let Err(payload) = handle.join() {
                 let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                     (*s).to_string()
@@ -2277,29 +2299,11 @@ fn open_temp(path: &Path, resume: bool) -> std::io::Result<File> {
     opts.open(path)
 }
 
-/// Compose the deterministic resumable-upload temp path for
-/// `final_path`: `<dir>/<filename>.qftp.partial`.
-///
-/// The name is intentionally predictable. An interrupted upload leaves
-/// its partial here, and a later session resumes it by sending an
-/// `offset`; the server has only the destination path to reconstruct
-/// the temp name from, so it cannot depend on a random suffix.
-///
-/// The anti-planting defence therefore moved from the name to the open
-/// mode (see [`open_temp`]): a fresh Put truncates and reuses whatever
-/// regular file sits at this path, and `O_NOFOLLOW` rejects a planted
-/// symlink.
-fn temp_path_for(final_path: &Path) -> PathBuf {
-    let mut name = final_path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".qftp.partial");
-    final_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(name)
-}
+// `temp_path_for` lives in `qftp_protocol::stream` (lifted by review
+// cycle 2 #14) and is imported via `use qftp_protocol::stream::...`
+// at the top of this file. Single source of truth ensures the native
+// server and the WebTransport bridge always agree on the partial
+// path so cross-transport resume works.
 
 #[cfg(test)]
 mod tests {
@@ -2379,20 +2383,9 @@ mod tests {
         assert_eq!(mode, 0o600, "temp file mode was {mode:o}, expected 0o600");
     }
 
-    #[test]
-    fn temp_path_for_is_deterministic_and_a_sibling() {
-        // Resume relies on the same destination always mapping to the
-        // same partial path, so two calls must agree.
-        let target = Path::new("/srv/data/report.bin");
-        let a = temp_path_for(target);
-        let b = temp_path_for(target);
-        assert_eq!(a, b, "temp_path_for must be deterministic for resume");
-        assert_eq!(a.parent(), target.parent());
-        assert_eq!(
-            a.file_name().unwrap().to_str().unwrap(),
-            "report.bin.qftp.partial"
-        );
-    }
+    // `temp_path_for` is now defined and tested in
+    // `qftp_protocol::stream`; no need to duplicate the deterministic /
+    // sibling assertions here.
 
     #[cfg(unix)]
     #[test]

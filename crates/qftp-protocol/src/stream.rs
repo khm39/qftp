@@ -8,11 +8,62 @@
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::user::User;
+
+/// Compute the deterministic `.qftp.partial` temp path for a final
+/// destination. Both the native server and the WebTransport bridge use
+/// this so a resumed upload from the native client always finds the
+/// same partial regardless of which transport committed the previous
+/// session. Sibling-of-target keeps the temp on the same filesystem so
+/// the final `rename` is atomic; the trailing `.qftp.partial` suffix
+/// gives the swept-stale-partials code a single grep target.
+pub fn temp_path_for(final_path: &Path) -> PathBuf {
+    let mut name = final_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".qftp.partial");
+    final_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(name)
+}
+
+#[cfg(test)]
+mod temp_path_tests {
+    use super::temp_path_for;
+    use std::path::Path;
+
+    #[test]
+    fn sibling_of_target() {
+        let target = Path::new("/srv/data/report.bin");
+        let temp = temp_path_for(target);
+        assert_eq!(temp.parent(), target.parent());
+        let name = temp.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name, "report.bin.qftp.partial");
+    }
+
+    #[test]
+    fn deterministic() {
+        let a = temp_path_for(Path::new("/x/y.dat"));
+        let b = temp_path_for(Path::new("/x/y.dat"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn handles_relative_path_with_no_parent() {
+        // `Path::new("loose.bin").parent()` returns Some(""), not None,
+        // so the `unwrap_or_else(|| ".")` does not fire and the result
+        // is just the filename without a "./" prefix.
+        let target = Path::new("loose.bin");
+        let temp = temp_path_for(target);
+        assert_eq!(temp, Path::new("loose.bin.qftp.partial"));
+    }
+}
 
 /// Maximum file size accepted by Get/Put.
 pub const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;

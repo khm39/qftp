@@ -442,11 +442,16 @@ impl IgnoreMatcher {
     }
 }
 
-/// Send `Mkdir(path)`, tolerating an `AlreadyExists` response but
-/// surfacing every other error. Used to provision the remote root and
-/// each parent directory before uploading; if we silently swallow a
-/// dropped connection here the next file upload fails much later with
-/// a confusing error far from the root cause.
+/// Send `Mkdir(path)` and tolerate every Response::Err the server returns;
+/// only transport-level failures (dropped connection, framing error,
+/// unexpected response variant) bubble up. The original `let _ =
+/// request_response(...)` form swallowed everything, and a strict
+/// "only AlreadyExists is OK" version broke deployments where the
+/// user has Put permission but not Mkdir (e.g. their tree is
+/// pre-provisioned). Failures other than AlreadyExists are logged at
+/// `warn!` so a misconfigured pipeline still leaves a breadcrumb, and
+/// any genuine I/O problem still surfaces because the subsequent
+/// per-file `do_put` will fail concretely.
 fn ensure_remote_dir(
     conn: &mut quiche::Connection,
     socket: &mio::net::UdpSocket,
@@ -468,7 +473,13 @@ fn ensure_remote_dir(
         Response::Ok => Ok(()),
         Response::Err(e) if e.code == qftp_common::protocol::ErrorCode::AlreadyExists => Ok(()),
         Response::Err(e) => {
-            anyhow::bail!("sync: Mkdir({path}) failed: [{:?}] {}", e.code, e.message)
+            tracing::warn!(
+                path = %path,
+                code = ?e.code,
+                msg = %e.message,
+                "sync: remote Mkdir failed; continuing in case the path is already a directory",
+            );
+            Ok(())
         }
         other => anyhow::bail!("sync: Mkdir({path}) got unexpected response: {other:?}"),
     }
