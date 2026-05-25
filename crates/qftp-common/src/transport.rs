@@ -129,10 +129,17 @@ fn flush_egress_per_packet(
         let (write, send_info) = match conn.send(&mut out) {
             Ok(v) => v,
             Err(quiche::Error::Done) => break,
-            Err(e) => return Err(TransportError::Quic(e)),
+            Err(e) => {
+                return Err(TransportError::quic_ctx(
+                    "conn.send (per-packet fallback)",
+                    e,
+                ))
+            }
         };
 
-        socket.send_to(&out[..write], send_info.to)?;
+        socket
+            .send_to(&out[..write], send_info.to)
+            .map_err(|e| TransportError::io_ctx("UDP send_to (per-packet fallback)", e))?;
     }
 
     Ok(())
@@ -176,7 +183,7 @@ fn flush_egress_gso(
             let (write, send_info) = match conn.send(&mut buf[total..total + cap]) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
-                Err(e) => return Err(TransportError::Quic(e)),
+                Err(e) => return Err(TransportError::quic_ctx("conn.send (gso)", e)),
             };
 
             // From here on we only need disjoint subslices of `buf`;
@@ -508,7 +515,13 @@ pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> R
         return Ok(None);
     }
 
-    // Bound per-field allocations during deserialization. The
+    // Cap the cumulative read-byte budget at MAX_MESSAGE_SIZE. This
+    // is in addition to the 4-byte length-prefix check above; combined
+    // with the post-decode `validate_request` / `validate_response`
+    // pass (`qftp_common::protocol`), it bounds both wire-size and
+    // individual-field sizes against a malicious peer. Note: bincode's
+    // `with_limit` is the TOTAL decode-byte budget, not a per-field
+    // cap -- the per-field defense lives in `validate_*`.
     // 4-byte frame length is already bounded by MAX_MESSAGE_SIZE, but
     // bincode's defaults will happily allocate a 16 MiB `String` for
     // a single field within that frame. with_limit caps individual

@@ -735,8 +735,12 @@ pub fn probe_put_resume_offset(
     remote: &str,
     local_size: u64,
 ) -> u64 {
+    // Use the single source of truth `qftp_protocol::stream::temp_path_for`
+    // so a future change to the partial naming scheme (suffix, layout)
+    // can't drift between the server's commit path and this client probe.
+    let partial = qftp_protocol::stream::temp_path_for(std::path::Path::new(remote));
     let req = Request::Stat {
-        path: format!("{remote}.qftp.partial"),
+        path: partial.to_string_lossy().into_owned(),
     };
     match crate::proto::request_response(conn, socket, poll, events, next_stream_id, &req) {
         Ok(Response::FileStat(s)) if !s.is_dir && s.size > 0 && s.size <= local_size => s.size,

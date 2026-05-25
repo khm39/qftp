@@ -1412,6 +1412,7 @@ dependencies = [
  "mio",
  "notify",
  "qftp-common",
+ "qftp-protocol",
  "quiche",
  "ring",
  "rustyline",

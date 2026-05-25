@@ -123,16 +123,24 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed to parse users file {}", path.display()))?;
             let root_for_users = root.clone();
             let path_display = path.display().to_string();
-            tokio::task::spawn_blocking(move || UserDirectory::from_config(&root_for_users, cfg))
-                .await
-                .context("UserDirectory::from_config thread panicked")?
-                .with_context(|| format!("failed to build user directory from {}", path_display))?
+            crate::transfer::await_blocking(
+                tokio::task::spawn_blocking(move || {
+                    UserDirectory::from_config(&root_for_users, cfg)
+                }),
+                "UserDirectory::from_config",
+            )
+            .await?
+            .with_context(|| format!("failed to build user directory from {}", path_display))?
         }
         None => {
             let root_for_users = root.clone();
-            tokio::task::spawn_blocking(move || UserDirectory::default_anonymous(&root_for_users))
-                .await
-                .context("UserDirectory::default_anonymous thread panicked")?
+            crate::transfer::await_blocking(
+                tokio::task::spawn_blocking(move || {
+                    UserDirectory::default_anonymous(&root_for_users)
+                }),
+                "UserDirectory::default_anonymous",
+            )
+            .await?
         }
     };
 

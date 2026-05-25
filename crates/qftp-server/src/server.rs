@@ -136,12 +136,12 @@ struct HandlerResult {
 /// Pool of worker threads that execute blocking filesystem requests
 /// off the event-loop thread.
 ///
-/// On drop, the pool closes `job_tx`, waits for every worker thread to
-/// finish its current job, and joins each handle so any panic payload
-/// surfaces in the log instead of being silently detached. Field order
-/// matters: `job_tx` declares first so it drops first, which makes the
-/// workers' blocking `recv()` return `Err` and lets `Drop` reach the
-/// join without deadlocking.
+/// On drop, the explicit `Drop` impl below replaces `job_tx` with a
+/// dummy sender via `mem::replace` so workers blocked in `recv()`
+/// wake up with `Err(RecvError)`, then bounded-waits each handle
+/// via `is_finished()` and joins them so panic payloads surface in
+/// the log. Field declaration order is therefore *not* load-bearing
+/// -- the explicit Drop runs before any implicit field drops.
 struct HandlerPool {
     job_tx: mpsc::Sender<HandlerJob>,
     result_rx: mpsc::Receiver<HandlerResult>,
@@ -236,14 +236,48 @@ fn handler_worker(
                 Err(_) => return,
             }
         };
+        let conn_key = job.conn_key.clone();
+        let stream_id = job.stream_id;
+        let user = Arc::clone(&job.user);
+        let req_dbg = format!("{:?}", job.req);
+        // Wrap `run_handler` in catch_unwind so a panic inside a
+        // single request handler doesn't permanently shrink the pool
+        // (after HANDLER_WORKERS panics nothing would drain
+        // `pending_handler_jobs`, and the event loop would queue
+        // requests forever). On panic, synthesize an Internal error
+        // response and keep the worker alive.
         let mut cwd = job.cwd;
-        let response = run_handler(&job.req, &mut cwd, &job.user);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_handler(&job.req, &mut cwd, &job.user)
+        }));
+        let response = match outcome {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic payload>".to_string()
+                };
+                tracing::error!(
+                    panic = %msg,
+                    request = %req_dbg,
+                    user = %user.name,
+                    "handler_worker: request handler panicked; replying with Internal error",
+                );
+                Response::Err(qftp_common::protocol::ErrorResponse::new(
+                    qftp_common::protocol::ErrorCode::Internal,
+                    "handler crashed",
+                ))
+            }
+        };
         let result = HandlerResult {
-            conn_key: job.conn_key,
-            stream_id: job.stream_id,
+            conn_key,
+            stream_id,
             response,
             new_cwd: cwd,
-            user: job.user,
+            user,
         };
         if result_tx.send(result).is_err() {
             return; // event loop gone
@@ -784,10 +818,14 @@ fn try_accept(
     info!(peer = %from, "connection accepted");
     ax.metrics.inc_connections_total();
     ax.metrics.inc_connections_open();
-    ax.connections.insert(scid, ctx);
-    // Hand the slot off to the long-lived connection; the reap loop
-    // will release it via `counter.release(peer_ip)` on close.
+    // Commit BEFORE inserting into the map so any panic between this
+    // point and the insert leaves the slot already handed off to the
+    // reap loop (which calls `counter.release(peer_ip)` on close).
+    // The reverse order would double-decrement: slot's Drop on unwind
+    // releases once, then the connection sits in the map until its
+    // close triggers another release.
     slot.commit();
+    ax.connections.insert(scid, ctx);
     Ok(())
 }
 

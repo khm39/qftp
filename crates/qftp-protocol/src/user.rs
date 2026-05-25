@@ -250,7 +250,7 @@ pub fn sweep_stale_partials(root: &Path) {
             let is_partial = entry
                 .file_name()
                 .to_str()
-                .map(|n| n.contains(".qftp.partial"))
+                .map(|n| n.ends_with(".qftp.partial"))
                 .unwrap_or(false);
             if !is_partial {
                 continue;
