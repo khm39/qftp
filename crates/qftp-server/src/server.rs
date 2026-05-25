@@ -155,7 +155,28 @@ impl Drop for HandlerPool {
         // dummy sender drops at end of statement.
         let (dummy_tx, _) = mpsc::channel::<HandlerJob>();
         let _ = std::mem::replace(&mut self.job_tx, dummy_tx);
+        // Workers parked inside `recv()` unblock immediately, but a
+        // worker mid-syscall (e.g. a slow NFS `readdir`) won't even
+        // observe the channel close until that syscall returns.
+        // Polling `is_finished()` with a bounded deadline lets server
+        // shutdown progress in that case: any thread still running
+        // past the deadline is detached (the JoinHandle's normal Drop
+        // does not join) and will exit on its own once the syscall
+        // completes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         for handle in std::mem::take(&mut self.workers) {
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !handle.is_finished() {
+                tracing::warn!(
+                    thread = handle.thread().name().unwrap_or("<unnamed>"),
+                    "qftp handler worker did not exit within shutdown deadline; \
+                     detaching (likely stuck in a blocking filesystem syscall)",
+                );
+                // Dropping the handle without join detaches the thread.
+                continue;
+            }
             if let Err(payload) = handle.join() {
                 let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                     (*s).to_string()

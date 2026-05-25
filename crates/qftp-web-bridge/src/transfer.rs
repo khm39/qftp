@@ -449,6 +449,12 @@ async fn do_put(
         };
 
     let temp_path = temp_path_for(&final_path);
+    // Assign the temp_path to the guard *before* the open spawn_blocking
+    // so that if the outer future is cancelled (browser disconnect)
+    // after the file is created but before this binding lands, the
+    // guard's Drop still has the path to clean up. The reverse order
+    // would leak a 0o600 partial that nothing reaps.
+    guard.temp_path = Some(temp_path.clone());
     // The temp name is now deterministic (`<final>.qftp.partial`), so a
     // stale partial from an earlier aborted upload may already be on
     // disk. `create_new(true)` would fail on it; instead create-or-open
@@ -458,9 +464,18 @@ async fn do_put(
     // symlink planted at the predictable path. The open + the
     // permission re-assertion are bundled into one blocking task so a
     // slow FS can't park this tokio worker between the two syscalls.
+    // A second `recheck_ancestors_no_symlinks` runs inside the same
+    // blocking task immediately before the open: the first recheck
+    // happened in a separate spawn_blocking, so without re-checking
+    // here, two await boundaries + arbitrary tokio scheduling delay
+    // open a TOCTOU window where an attacker can swap a parent dir to
+    // a symlink between the recheck and the open.
     let temp_path_for_open = temp_path.clone();
+    let root_for_open = root.clone();
+    let final_for_open = final_path.clone();
     type TempOpenOutcome = std::result::Result<std::fs::File, ErrorResponse>;
     let open_outcome: TempOpenOutcome = tokio::task::spawn_blocking(move || {
+        handler::recheck_ancestors_no_symlinks(&final_for_open, &root_for_open)?;
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.write(true).create(true).truncate(true);
         qftp_common::fs_safe::apply_owner_only_no_follow(&mut open_opts);
@@ -494,7 +509,6 @@ async fn do_put(
         Ok(f) => f,
         Err(e) => return reply_err(send, e).await,
     };
-    guard.temp_path = Some(temp_path.clone());
     let mut file = tokio::fs::File::from_std(std_file);
 
     let mut hasher = blake3::Hasher::new();
@@ -570,14 +584,39 @@ async fn do_put(
         }
     }
 
-    if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
-        return reply_err(
-            send,
-            ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}")),
-        )
-        .await;
+    // Commit: bundle the symlink TOCTOU recheck + rename + mode
+    // application into one blocking task so the tokio scheduler can't
+    // interleave another task between them. The recheck must happen
+    // here (not just at the start of `do_put`) because the body
+    // transfer above can take arbitrarily long, and a parent
+    // directory swapped to a symlink during the transfer would make
+    // the rename land the file outside the user's home. Splitting
+    // rename and apply_mode across two `.await`s would also leave
+    // `final_path` at the temp file's 0o600 for any concurrent reader
+    // in the gap; bundling them keeps the file invisible at
+    // `final_path` until both succeed.
+    let temp_for_commit = temp_path.clone();
+    let final_for_commit = final_path.clone();
+    let root_for_commit = root.clone();
+    type CommitOutcome = std::result::Result<(), ErrorResponse>;
+    let commit_outcome: CommitOutcome = tokio::task::spawn_blocking(move || {
+        handler::recheck_ancestors_no_symlinks(&final_for_commit, &root_for_commit)?;
+        std::fs::rename(&temp_for_commit, &final_for_commit).map_err(|e| {
+            ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}"))
+        })?;
+        apply_mode_sync(&final_for_commit, mode).map_err(|e| {
+            ErrorResponse::new(
+                handler::io_code(&e),
+                format!("failed to set permissions: {e}"),
+            )
+        })?;
+        Ok(())
+    })
+    .await
+    .context("blocking commit task panicked")?;
+    if let Err(e) = commit_outcome {
+        return reply_err(send, e).await;
     }
-    apply_mode(&final_path, mode).await;
 
     // The upload committed: stop the guard from undoing it, then hand
     // the reservation over to the persistent used-bytes counter.
@@ -656,17 +695,19 @@ fn temp_path_for(final_path: &Path) -> PathBuf {
 
 /// Apply the client-requested mode, stripping suid/sgid/sticky bits so
 /// an upload can't plant a setuid primitive inside the served tree.
+/// Synchronous: called from inside the commit `spawn_blocking` block
+/// so it executes back-to-back with the rename, with no await between.
 #[cfg(unix)]
-async fn apply_mode(path: &Path, mode: u32) {
+fn apply_mode_sync(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(mode & 0o0777);
-    if let Err(e) = tokio::fs::set_permissions(path, perms).await {
-        tracing::warn!(path = %path.display(), error = %e, "failed to set permissions");
-    }
+    std::fs::set_permissions(path, perms)
 }
 
 #[cfg(not(unix))]
-async fn apply_mode(_path: &Path, _mode: u32) {}
+fn apply_mode_sync(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

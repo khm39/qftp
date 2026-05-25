@@ -423,12 +423,16 @@ fn do_get_inner(
     }
 
     if let Err(e) = file.flush() {
-        // Tear down the partial file rather than leave one whose
-        // last buffered bytes never reached disk. The BLAKE3 check
-        // below only validates the in-memory hash, so a silent
-        // flush failure would let us report "verified" for a
-        // truncated local file.
-        let _ = std::fs::remove_file(local);
+        // Bail rather than report "verified" -- the in-memory BLAKE3
+        // covers the bytes we wrote, not the bytes that reached disk.
+        // We deliberately do NOT remove the partial here: a resumed
+        // download whose final flush failed still has a useful
+        // prefix on disk, and the next attempt will either resume
+        // (and the existing checksum-mismatch handler below tears
+        // down a genuinely corrupt partial) or start fresh from
+        // offset 0 anyway. Removing the partial here would force a
+        // full re-transfer of a multi-GiB file after a transient
+        // flush error.
         bail!("final flush of download file failed: {e}");
     }
     bar.finish_and_clear();
