@@ -65,23 +65,37 @@ pub const MAX_ERROR_MESSAGE_LEN: usize = 1024;
 pub const MAX_DIR_ENTRIES: usize = 100_000;
 
 /// Errors surfaced by [`validate_request`] / [`validate_response`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationError(pub String);
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+///
+/// The variants are structured so callers can pattern-match on the
+/// specific cap that was exceeded (path length vs. error-message length
+/// vs. directory-entry count) instead of grepping `Display` text.
+/// The `(#140)` tag in each `#[error(...)]` message refers to the
+/// issue that introduced these caps and is preserved for grep
+/// continuity with operator runbooks.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ValidationError {
+    #[error("{field} field is {len} bytes, exceeds MAX_PATH_LEN ({max}) (#140)")]
+    PathTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
+    #[error("ErrorResponse.message is {len} bytes, exceeds MAX_ERROR_MESSAGE_LEN ({max}) (#140)")]
+    ErrorMessageTooLong { len: usize, max: usize },
+    #[error("DirListing has {len} entries, exceeds MAX_DIR_ENTRIES ({max}) (#140)")]
+    DirEntriesTooMany { len: usize, max: usize },
+    #[error("DirEntry.name is {len} bytes, exceeds MAX_PATH_LEN ({max}) (#140)")]
+    DirEntryNameTooLong { len: usize, max: usize },
 }
 
-impl std::error::Error for ValidationError {}
-
-fn check_path(field: &str, value: &str) -> Result<(), ValidationError> {
+fn check_path(field: &'static str, value: &str) -> Result<(), ValidationError> {
     if value.len() > MAX_PATH_LEN {
-        return Err(ValidationError(format!(
-            "{field} field is {} bytes, exceeds MAX_PATH_LEN ({MAX_PATH_LEN}) (#140)",
-            value.len()
-        )));
+        return Err(ValidationError::PathTooLong {
+            field,
+            len: value.len(),
+            max: MAX_PATH_LEN,
+        });
     }
     Ok(())
 }
@@ -116,26 +130,26 @@ pub fn validate_response(resp: &Response) -> Result<(), ValidationError> {
     match resp {
         Response::Err(e) => {
             if e.message.len() > MAX_ERROR_MESSAGE_LEN {
-                return Err(ValidationError(format!(
-                    "ErrorResponse.message is {} bytes, exceeds MAX_ERROR_MESSAGE_LEN ({MAX_ERROR_MESSAGE_LEN}) (#140)",
-                    e.message.len()
-                )));
+                return Err(ValidationError::ErrorMessageTooLong {
+                    len: e.message.len(),
+                    max: MAX_ERROR_MESSAGE_LEN,
+                });
             }
             Ok(())
         }
         Response::DirListing(entries) => {
             if entries.len() > MAX_DIR_ENTRIES {
-                return Err(ValidationError(format!(
-                    "DirListing has {} entries, exceeds MAX_DIR_ENTRIES ({MAX_DIR_ENTRIES}) (#140)",
-                    entries.len()
-                )));
+                return Err(ValidationError::DirEntriesTooMany {
+                    len: entries.len(),
+                    max: MAX_DIR_ENTRIES,
+                });
             }
             for entry in entries {
                 if entry.name.len() > MAX_PATH_LEN {
-                    return Err(ValidationError(format!(
-                        "DirEntry.name is {} bytes, exceeds MAX_PATH_LEN ({MAX_PATH_LEN}) (#140)",
-                        entry.name.len()
-                    )));
+                    return Err(ValidationError::DirEntryNameTooLong {
+                        len: entry.name.len(),
+                        max: MAX_PATH_LEN,
+                    });
                 }
             }
             Ok(())
@@ -484,7 +498,7 @@ mod tests {
             path: "a".repeat(MAX_PATH_LEN + 1),
         };
         let e = validate_request(&req).unwrap_err();
-        assert!(e.0.contains("#140"), "unexpected error: {e}");
+        assert!(e.to_string().contains("#140"), "unexpected error: {e}");
     }
 
     #[test]
@@ -504,7 +518,10 @@ mod tests {
             to: "z".repeat(MAX_PATH_LEN + 1),
         };
         let e = validate_request(&req).unwrap_err();
-        assert!(e.0.contains("to"), "expected `to` field cited, got: {e}");
+        assert!(
+            matches!(e, ValidationError::PathTooLong { field: "to", .. }),
+            "expected `to` field cited, got: {e:?}"
+        );
     }
 
     #[test]
@@ -514,7 +531,7 @@ mod tests {
             "x".repeat(MAX_ERROR_MESSAGE_LEN + 1),
         ));
         let e = validate_response(&resp).unwrap_err();
-        assert!(e.0.contains("#140"), "unexpected error: {e}");
+        assert!(e.to_string().contains("#140"), "unexpected error: {e}");
     }
 
     #[test]
@@ -530,6 +547,9 @@ mod tests {
         let entries = (0..MAX_DIR_ENTRIES + 1).map(|_| entry.clone()).collect();
         let resp = Response::DirListing(entries);
         let e = validate_response(&resp).unwrap_err();
-        assert!(e.0.contains("MAX_DIR_ENTRIES"), "unexpected error: {e}");
+        assert!(
+            matches!(e, ValidationError::DirEntriesTooMany { .. }),
+            "unexpected error: {e:?}"
+        );
     }
 }

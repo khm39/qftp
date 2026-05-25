@@ -1434,6 +1434,7 @@ dependencies = [
  "mio",
  "quiche",
  "serde",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1447,6 +1448,7 @@ dependencies = [
  "rcgen 0.13.2",
  "serde",
  "tempfile",
+ "thiserror 1.0.69",
  "toml",
  "tracing",
  "x509-parser 0.16.0",

@@ -1,5 +1,9 @@
-use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
+
+use crate::error::TransportError;
+
+/// Result alias for the structured `qftp-common::transport` API.
+type Result<T, E = TransportError> = std::result::Result<T, E>;
 
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const STREAM_BUF_SIZE: usize = 65536;
@@ -125,12 +129,10 @@ fn flush_egress_per_packet(
         let (write, send_info) = match conn.send(&mut out) {
             Ok(v) => v,
             Err(quiche::Error::Done) => break,
-            Err(e) => return Err(e).context("QUIC send failed"),
+            Err(e) => return Err(TransportError::Quic(e)),
         };
 
-        socket
-            .send_to(&out[..write], send_info.to)
-            .context("UDP send_to failed")?;
+        socket.send_to(&out[..write], send_info.to)?;
     }
 
     Ok(())
@@ -174,7 +176,7 @@ fn flush_egress_gso(
             let (write, send_info) = match conn.send(&mut buf[total..total + cap]) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
-                Err(e) => return Err(e).context("QUIC send failed"),
+                Err(e) => return Err(TransportError::Quic(e)),
             };
 
             // From here on we only need disjoint subslices of `buf`;
@@ -187,9 +189,7 @@ fn flush_egress_gso(
                     if total > 0 {
                         send_batch(socket, &buf[..total], prev, seg_size, packets)?;
                     }
-                    socket
-                        .send_to(&buf[total..total + write], send_info.to)
-                        .context("UDP send_to (path swap) failed")?;
+                    socket.send_to(&buf[total..total + write], send_info.to)?;
                     continue 'outer;
                 }
             } else {
@@ -203,9 +203,7 @@ fn flush_egress_gso(
                 if total > 0 {
                     send_batch(socket, &buf[..total], dst.unwrap(), seg_size, packets)?;
                 }
-                socket
-                    .send_to(&buf[total..total + write], send_info.to)
-                    .context("UDP send_to (oversize) failed")?;
+                socket.send_to(&buf[total..total + write], send_info.to)?;
                 continue 'outer;
             }
 
@@ -241,9 +239,7 @@ fn send_batch(
     packets: usize,
 ) -> Result<()> {
     if packets <= 1 {
-        socket
-            .send_to(buf, dst)
-            .context("UDP send_to (single) failed")?;
+        socket.send_to(buf, dst)?;
         return Ok(());
     }
 
@@ -263,9 +259,7 @@ fn send_batch(
             let mut off = 0;
             while off < buf.len() {
                 let n = seg_size.min(buf.len() - off);
-                socket
-                    .send_to(&buf[off..off + n], dst)
-                    .context("UDP send_to (fallback) failed")?;
+                socket.send_to(&buf[off..off + n], dst)?;
                 off += n;
             }
             Ok(())
@@ -355,13 +349,13 @@ pub fn handle_ingress(
     socket: &mio::net::UdpSocket,
     buf: &mut [u8],
 ) -> Result<()> {
-    let local_addr = socket.local_addr().context("failed to get local addr")?;
+    let local_addr = socket.local_addr()?;
 
     loop {
         let (len, from) = match socket.recv_from(buf) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e).context("UDP recv_from failed"),
+            Err(e) => return Err(TransportError::Io(e)),
         };
 
         let recv_info = quiche::RecvInfo {
@@ -388,16 +382,16 @@ pub fn encode_framed_message<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
     // Serialize straight into one length-prefixed buffer: the 4-byte
     // BE prefix up front, then bincode appends the payload after it.
     // Avoids the separate payload Vec + copy the two-step form needs.
-    let payload_len = bincode::serialized_size(msg).context("failed to size message")? as usize;
-    anyhow::ensure!(
-        payload_len <= MAX_MESSAGE_SIZE,
-        "message too large: {} bytes (max {})",
-        payload_len,
-        MAX_MESSAGE_SIZE
-    );
+    let payload_len = bincode::serialized_size(msg)? as usize;
+    if payload_len > MAX_MESSAGE_SIZE {
+        return Err(TransportError::FrameTooLarge {
+            actual: payload_len,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
     let mut data = Vec::with_capacity(4 + payload_len);
     data.extend_from_slice(&(payload_len as u32).to_be_bytes());
-    bincode::serialize_into(&mut data, msg).context("failed to serialize message")?;
+    bincode::serialize_into(&mut data, msg)?;
     Ok(data)
 }
 
@@ -427,12 +421,10 @@ pub fn stream_send_all(
     // empty-fin frame after the loop.
     let mut offset = 0;
     while offset < data.len() {
-        let written = conn
-            .stream_send(stream_id, &data[offset..], false)
-            .context("stream_send failed")?;
+        let written = conn.stream_send(stream_id, &data[offset..], false)?;
         offset += written;
         if written == 0 {
-            anyhow::bail!("stream_send wrote 0 bytes, stream may be blocked");
+            return Err(TransportError::StreamBlocked);
         }
     }
     // Deliver the FIN as a dedicated empty-fin frame once the whole
@@ -440,8 +432,7 @@ pub fn stream_send_all(
     // a non-empty body, and guarantees `fin=true` is never passed to a
     // mid-data `stream_send`.
     if fin {
-        conn.stream_send(stream_id, &[], true)
-            .context("stream_send fin failed")?;
+        conn.stream_send(stream_id, &[], true)?;
     }
     Ok(())
 }
@@ -469,7 +460,7 @@ pub fn recv_message<T: DeserializeOwned>(
             // Both mean "no more bytes will arrive", so handle them
             // the same way here.
             Err(quiche::Error::InvalidStreamState(_)) => break,
-            Err(e) => return Err(e).context("stream_recv failed"),
+            Err(e) => return Err(TransportError::Quic(e)),
         }
     }
 
@@ -495,12 +486,12 @@ pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> R
     let msg_len =
         u32::from_be_bytes([stream_buf[0], stream_buf[1], stream_buf[2], stream_buf[3]]) as usize;
 
-    anyhow::ensure!(
-        msg_len <= MAX_MESSAGE_SIZE,
-        "peer sent oversized message: {} bytes (max {})",
-        msg_len,
-        MAX_MESSAGE_SIZE
-    );
+    if msg_len > MAX_MESSAGE_SIZE {
+        return Err(TransportError::FrameTooLarge {
+            actual: msg_len,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
 
     if stream_buf.len() < 4 + msg_len {
         return Ok(None);
@@ -516,9 +507,7 @@ pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> R
         .allow_trailing_bytes()
         .with_limit(MAX_MESSAGE_SIZE as u64);
     use bincode::Options as _;
-    let msg: T = opts
-        .deserialize(&stream_buf[4..4 + msg_len])
-        .context("failed to deserialize message")?;
+    let msg: T = opts.deserialize(&stream_buf[4..4 + msg_len])?;
 
     // Drain the consumed bytes.
     stream_buf.drain(..4 + msg_len);
@@ -530,7 +519,7 @@ pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> R
 fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> Result<()> {
     config
         .set_application_protos(&[crate::protocol::ALPN])
-        .context("failed to set ALPN")?;
+        .map_err(|e| TransportError::TlsConfig(format!("failed to set ALPN: {e}")))?;
 
     config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -609,20 +598,22 @@ pub struct ClientCert {
 
 /// Create a QUIC server configuration.
 pub fn create_server_config(tls: &ServerTlsConfig) -> Result<quiche::Config> {
-    let mut config =
-        quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
+        .map_err(|e| TransportError::TlsConfig(format!("failed to create QUIC config: {e}")))?;
 
     config
         .load_cert_chain_from_pem_file(&tls.cert_pem)
-        .context("failed to load cert chain")?;
+        .map_err(|e| TransportError::TlsConfig(format!("failed to load cert chain: {e}")))?;
     config
         .load_priv_key_from_pem_file(&tls.key_pem)
-        .context("failed to load private key")?;
+        .map_err(|e| TransportError::TlsConfig(format!("failed to load private key: {e}")))?;
 
     if let Some(ca_path) = &tls.client_ca_pem {
         config
             .load_verify_locations_from_file(ca_path)
-            .context("failed to load client CA bundle")?;
+            .map_err(|e| {
+                TransportError::TlsConfig(format!("failed to load client CA bundle: {e}"))
+            })?;
         // NOTE: quiche's `verify_peer(true)` sets `SSL_VERIFY_PEER`
         // only, not `SSL_VERIFY_FAIL_IF_NO_PEER_CERT`. A client that
         // presents no certificate still completes the TLS handshake,
@@ -640,15 +631,15 @@ pub fn create_server_config(tls: &ServerTlsConfig) -> Result<quiche::Config> {
 
 /// Create a QUIC client configuration.
 pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
-    let mut config =
-        quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create QUIC config")?;
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
+        .map_err(|e| TransportError::TlsConfig(format!("failed to create QUIC config: {e}")))?;
 
     config.verify_peer(tls.verify_peer);
 
     if let Some(ca_path) = &tls.ca_path {
         config
             .load_verify_locations_from_file(ca_path)
-            .context("failed to load CA bundle")?;
+            .map_err(|e| TransportError::TlsConfig(format!("failed to load CA bundle: {e}")))?;
     } else if tls.verify_peer {
         // Fall back to the platform trust store. quiche delegates to
         // BoringSSL; without an explicit bundle the OS roots are used.
@@ -668,10 +659,10 @@ pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
     if let Some(cc) = &tls.client_cert {
         config
             .load_cert_chain_from_pem_file(&cc.cert_pem)
-            .context("failed to load client cert")?;
+            .map_err(|e| TransportError::TlsConfig(format!("failed to load client cert: {e}")))?;
         config
             .load_priv_key_from_pem_file(&cc.key_pem)
-            .context("failed to load client key")?;
+            .map_err(|e| TransportError::TlsConfig(format!("failed to load client key: {e}")))?;
     }
 
     // Gate 0-RTT on whether the TLS stack will actually
