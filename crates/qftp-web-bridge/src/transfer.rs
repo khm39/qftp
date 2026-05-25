@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use qftp_common::protocol::{validate_request, ErrorCode, ErrorResponse, Request, Response};
 use qftp_common::transport::{decode_framed_message, MAX_MESSAGE_SIZE};
 use qftp_protocol::handler;
-use qftp_protocol::stream::{FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
+use qftp_protocol::stream::{temp_path_for, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
 use qftp_protocol::user::User;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -118,12 +118,14 @@ async fn handle_stream_impl(
         // avoid parking a tokio worker on slow filesystems.
         other => {
             let home = user.home.clone();
-            let resp = tokio::task::spawn_blocking(move || {
-                let mut cwd = home.clone();
-                handler::handle_request(&other, &mut cwd, &home)
-            })
-            .await
-            .context("handler thread panicked")?;
+            let resp = await_blocking(
+                tokio::task::spawn_blocking(move || {
+                    let mut cwd = home.clone();
+                    handler::handle_request(&other, &mut cwd, &home)
+                }),
+                "handler request",
+            )
+            .await?;
             send_framed(&mut send, &resp).await?;
             finish(&mut send).await
         }
@@ -208,25 +210,27 @@ async fn do_get(
     let root_owned = root.clone();
     let path_owned = path.to_string();
     type OpenOutcome = std::result::Result<(std::fs::File, std::fs::Metadata), ErrorResponse>;
-    let open_outcome: OpenOutcome = tokio::task::spawn_blocking(move || {
-        let file_path = handler::resolve(&root_owned, &root_owned, &path_owned)?;
-        handler::recheck_ancestors_no_symlinks(&file_path, &root_owned)?;
-        let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.read(true);
-        qftp_common::fs_safe::apply_no_follow(&mut open_opts);
-        let std_file = open_opts.open(&file_path).map_err(|e| {
-            ErrorResponse::new(handler::io_code(&e), format!("Failed to open file: {e}"))
-        })?;
-        let meta = std_file.metadata().map_err(|e| {
-            ErrorResponse::new(
-                handler::io_code(&e),
-                format!("failed to stat opened file: {e}"),
-            )
-        })?;
-        Ok((std_file, meta))
-    })
-    .await
-    .context("blocking open task panicked")?;
+    let open_outcome: OpenOutcome = await_blocking(
+        tokio::task::spawn_blocking(move || {
+            let file_path = handler::resolve(&root_owned, &root_owned, &path_owned)?;
+            handler::recheck_ancestors_no_symlinks(&file_path, &root_owned)?;
+            let mut open_opts = std::fs::OpenOptions::new();
+            open_opts.read(true);
+            qftp_common::fs_safe::apply_no_follow(&mut open_opts);
+            let std_file = open_opts.open(&file_path).map_err(|e| {
+                ErrorResponse::new(handler::io_code(&e), format!("Failed to open file: {e}"))
+            })?;
+            let meta = std_file.metadata().map_err(|e| {
+                ErrorResponse::new(
+                    handler::io_code(&e),
+                    format!("failed to stat opened file: {e}"),
+                )
+            })?;
+            Ok((std_file, meta))
+        }),
+        "do_get open",
+    )
+    .await?;
     let (std_file, meta) = match open_outcome {
         Ok(pair) => pair,
         Err(e) => return reply_err(send, e).await,
@@ -317,11 +321,46 @@ impl Drop for PutGuard {
             .in_flight_bytes
             .fetch_sub(self.reserved, Ordering::Relaxed);
         if let Some(p) = &self.temp_path {
+            // Before removing the partial, charge whatever bytes
+            // already landed on disk to `used_bytes`. The web-bridge
+            // has no resume (every Put truncates the temp at open),
+            // so the temp's current size IS the bytes this session
+            // produced -- no `prior_bytes` to subtract. If we skip
+            // this and the subsequent remove_file fails (EROFS,
+            // EACCES on a degraded mount), a "Put -> abort" loop
+            // can leak unbounded real disk space while quota
+            // accounting stays at zero. Mirrors
+            // `StreamState::ReadingFileData::Drop` in the native
+            // server (qftp-protocol/src/stream.rs).
+            let written = match std::fs::metadata(p) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %p.display(),
+                            error = %e,
+                            "PutGuard::drop: cannot stat partial; \
+                             quota accounting will undercount this abort",
+                        );
+                    }
+                    0
+                }
+            };
+            if written > 0 {
+                self.user.used_bytes.fetch_add(written, Ordering::Relaxed);
+            }
             if let Err(e) = std::fs::remove_file(p) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(path = %p.display(), error = %e,
                         "failed to clean up partial upload");
                 }
+            } else if written > 0 {
+                // We successfully removed the file we just charged to
+                // used_bytes. Refund those bytes so the next quota
+                // check sees the correct on-disk state (the partial
+                // is gone). If the remove failed above, the bytes
+                // stay charged -- which is the safe direction.
+                self.user.used_bytes.fetch_sub(written, Ordering::Relaxed);
             }
         }
     }
@@ -404,14 +443,16 @@ async fn do_put(
     let root_owned = root.clone();
     let path_owned = path.to_string();
     type ResolveOutcome = std::result::Result<(PathBuf, bool), ErrorResponse>;
-    let resolve_outcome: ResolveOutcome = tokio::task::spawn_blocking(move || {
-        let final_path = handler::resolve_parent(&root_owned, &root_owned, &path_owned)?;
-        handler::recheck_ancestors_no_symlinks(&final_path, &root_owned)?;
-        let exists = std::fs::symlink_metadata(&final_path).is_ok();
-        Ok((final_path, exists))
-    })
-    .await
-    .context("blocking resolve task panicked")?;
+    let resolve_outcome: ResolveOutcome = await_blocking(
+        tokio::task::spawn_blocking(move || {
+            let final_path = handler::resolve_parent(&root_owned, &root_owned, &path_owned)?;
+            handler::recheck_ancestors_no_symlinks(&final_path, &root_owned)?;
+            let exists = std::fs::symlink_metadata(&final_path).is_ok();
+            Ok((final_path, exists))
+        }),
+        "do_put resolve",
+    )
+    .await?;
     let (final_path, exists) = match resolve_outcome {
         Ok(pair) => pair,
         Err(e) => return reply_err(send, e).await,
@@ -474,37 +515,39 @@ async fn do_put(
     let root_for_open = root.clone();
     let final_for_open = final_path.clone();
     type TempOpenOutcome = std::result::Result<std::fs::File, ErrorResponse>;
-    let open_outcome: TempOpenOutcome = tokio::task::spawn_blocking(move || {
-        handler::recheck_ancestors_no_symlinks(&final_for_open, &root_for_open)?;
-        let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.write(true).create(true).truncate(true);
-        qftp_common::fs_safe::apply_owner_only_no_follow(&mut open_opts);
-        let std_file = open_opts.open(&temp_path_for_open).map_err(|e| {
-            ErrorResponse::new(
-                handler::io_code(&e),
-                format!("Failed to create upload temp file: {e}"),
-            )
-        })?;
-        // The O_CREAT mode is ignored when the file already existed,
-        // so a reused stale partial could otherwise keep a looser
-        // mode and leak the in-progress body; re-assert owner-only
-        // permissions right after open.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std_file
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| {
-                    ErrorResponse::new(
-                        handler::io_code(&e),
-                        format!("Failed to re-assert 0o600 on partial: {e}"),
-                    )
-                })?;
-        }
-        Ok(std_file)
-    })
-    .await
-    .context("blocking temp-file open task panicked")?;
+    let open_outcome: TempOpenOutcome = await_blocking(
+        tokio::task::spawn_blocking(move || {
+            handler::recheck_ancestors_no_symlinks(&final_for_open, &root_for_open)?;
+            let mut open_opts = std::fs::OpenOptions::new();
+            open_opts.write(true).create(true).truncate(true);
+            qftp_common::fs_safe::apply_owner_only_no_follow(&mut open_opts);
+            let std_file = open_opts.open(&temp_path_for_open).map_err(|e| {
+                ErrorResponse::new(
+                    handler::io_code(&e),
+                    format!("Failed to create upload temp file: {e}"),
+                )
+            })?;
+            // The O_CREAT mode is ignored when the file already existed,
+            // so a reused stale partial could otherwise keep a looser
+            // mode and leak the in-progress body; re-assert owner-only
+            // permissions right after open.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std_file
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| {
+                        ErrorResponse::new(
+                            handler::io_code(&e),
+                            format!("Failed to re-assert 0o600 on partial: {e}"),
+                        )
+                    })?;
+            }
+            Ok(std_file)
+        }),
+        "do_put temp-file open",
+    )
+    .await?;
     let std_file = match open_outcome {
         Ok(f) => f,
         Err(e) => return reply_err(send, e).await,
@@ -599,21 +642,23 @@ async fn do_put(
     let final_for_commit = final_path.clone();
     let root_for_commit = root.clone();
     type CommitOutcome = std::result::Result<(), ErrorResponse>;
-    let commit_outcome: CommitOutcome = tokio::task::spawn_blocking(move || {
-        handler::recheck_ancestors_no_symlinks(&final_for_commit, &root_for_commit)?;
-        std::fs::rename(&temp_for_commit, &final_for_commit).map_err(|e| {
-            ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}"))
-        })?;
-        apply_mode_sync(&final_for_commit, mode).map_err(|e| {
-            ErrorResponse::new(
-                handler::io_code(&e),
-                format!("failed to set permissions: {e}"),
-            )
-        })?;
-        Ok(())
-    })
-    .await
-    .context("blocking commit task panicked")?;
+    let commit_outcome: CommitOutcome = await_blocking(
+        tokio::task::spawn_blocking(move || {
+            handler::recheck_ancestors_no_symlinks(&final_for_commit, &root_for_commit)?;
+            std::fs::rename(&temp_for_commit, &final_for_commit).map_err(|e| {
+                ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}"))
+            })?;
+            apply_mode_sync(&final_for_commit, mode).map_err(|e| {
+                ErrorResponse::new(
+                    handler::io_code(&e),
+                    format!("failed to set permissions: {e}"),
+                )
+            })?;
+            Ok(())
+        }),
+        "do_put commit",
+    )
+    .await?;
     if let Err(e) = commit_outcome {
         return reply_err(send, e).await;
     }
@@ -678,21 +723,6 @@ async fn route_put_chunk(
 /// cross-implementation resume and for the shared stale-partial sweep.
 ///
 /// The name is intentionally predictable. The anti-planting defence
-/// lives in the open mode (see `do_put`): a fresh upload truncates and
-/// reuses whatever regular file sits here, and `O_NOFOLLOW` rejects a
-/// planted symlink.
-fn temp_path_for(final_path: &Path) -> PathBuf {
-    let mut name = final_path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".qftp.partial");
-    final_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(name)
-}
-
 /// Apply the client-requested mode, stripping suid/sgid/sticky bits so
 /// an upload can't plant a setuid primitive inside the served tree.
 /// Synchronous: called from inside the commit `spawn_blocking` block
@@ -709,24 +739,34 @@ fn apply_mode_sync(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn temp_path_is_a_sibling_of_the_target() {
-        let target = Path::new("/srv/data/report.bin");
-        let temp = temp_path_for(target);
-        assert_eq!(temp.parent(), target.parent());
-        let name = temp.file_name().unwrap().to_str().unwrap();
-        assert_eq!(name, "report.bin.qftp.partial", "{name}");
-    }
-
-    #[test]
-    fn temp_path_is_deterministic() {
-        // The temp name must match the native server's deterministic
-        // `<final>.qftp.partial` scheme so partials are interoperable.
-        let target = Path::new("/srv/data/report.bin");
-        assert_eq!(temp_path_for(target), temp_path_for(target));
-    }
+/// Await a `tokio::task::JoinHandle` and turn a panic payload into a
+/// readable error string. The default `JoinError::Display` produces
+/// `"task &lt;id&gt; panicked"` with no panic message; downcasting the
+/// payload (mirroring the `HandlerPool::Drop` pattern in
+/// `qftp-server::server`) surfaces the actual panic text so operator
+/// logs are diagnosable.
+async fn await_blocking<T: Send + 'static>(
+    handle: tokio::task::JoinHandle<T>,
+    desc: &'static str,
+) -> Result<T> {
+    handle.await.map_err(|je| {
+        if je.is_cancelled() {
+            return anyhow::anyhow!("{desc} task was cancelled");
+        }
+        if je.is_panic() {
+            let payload = je.into_panic();
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            return anyhow::anyhow!("{desc} panicked: {msg}");
+        }
+        anyhow::anyhow!("{desc}: {je}")
+    })
 }
+
+// `temp_path_for` lives in `qftp_protocol::stream` and is tested
+// there (cycle-2 review #14). No test module needed in this file.

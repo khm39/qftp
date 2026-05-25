@@ -189,7 +189,9 @@ fn flush_egress_gso(
                     if total > 0 {
                         send_batch(socket, &buf[..total], prev, seg_size, packets)?;
                     }
-                    socket.send_to(&buf[total..total + write], send_info.to)?;
+                    socket
+                        .send_to(&buf[total..total + write], send_info.to)
+                        .map_err(|e| TransportError::io_ctx("UDP send_to (path swap)", e))?;
                     continue 'outer;
                 }
             } else {
@@ -203,7 +205,9 @@ fn flush_egress_gso(
                 if total > 0 {
                     send_batch(socket, &buf[..total], dst.unwrap(), seg_size, packets)?;
                 }
-                socket.send_to(&buf[total..total + write], send_info.to)?;
+                socket
+                    .send_to(&buf[total..total + write], send_info.to)
+                    .map_err(|e| TransportError::io_ctx("UDP send_to (oversize)", e))?;
                 continue 'outer;
             }
 
@@ -239,7 +243,9 @@ fn send_batch(
     packets: usize,
 ) -> Result<()> {
     if packets <= 1 {
-        socket.send_to(buf, dst)?;
+        socket
+            .send_to(buf, dst)
+            .map_err(|e| TransportError::io_ctx("UDP send_to (single)", e))?;
         return Ok(());
     }
 
@@ -259,7 +265,9 @@ fn send_batch(
             let mut off = 0;
             while off < buf.len() {
                 let n = seg_size.min(buf.len() - off);
-                socket.send_to(&buf[off..off + n], dst)?;
+                socket
+                    .send_to(&buf[off..off + n], dst)
+                    .map_err(|e| TransportError::io_ctx("UDP send_to (fallback)", e))?;
                 off += n;
             }
             Ok(())
@@ -355,7 +363,7 @@ pub fn handle_ingress(
         let (len, from) = match socket.recv_from(buf) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(TransportError::Io(e)),
+            Err(e) => return Err(TransportError::io_ctx("UDP recv_from", e)),
         };
 
         let recv_info = quiche::RecvInfo {
@@ -421,7 +429,9 @@ pub fn stream_send_all(
     // empty-fin frame after the loop.
     let mut offset = 0;
     while offset < data.len() {
-        let written = conn.stream_send(stream_id, &data[offset..], false)?;
+        let written = conn
+            .stream_send(stream_id, &data[offset..], false)
+            .map_err(|e| TransportError::quic_ctx("stream_send", e))?;
         offset += written;
         if written == 0 {
             return Err(TransportError::StreamBlocked);
@@ -432,7 +442,8 @@ pub fn stream_send_all(
     // a non-empty body, and guarantees `fin=true` is never passed to a
     // mid-data `stream_send`.
     if fin {
-        conn.stream_send(stream_id, &[], true)?;
+        conn.stream_send(stream_id, &[], true)
+            .map_err(|e| TransportError::quic_ctx("stream_send (fin)", e))?;
     }
     Ok(())
 }
@@ -460,7 +471,7 @@ pub fn recv_message<T: DeserializeOwned>(
             // Both mean "no more bytes will arrive", so handle them
             // the same way here.
             Err(quiche::Error::InvalidStreamState(_)) => break,
-            Err(e) => return Err(TransportError::Quic(e)),
+            Err(e) => return Err(TransportError::quic_ctx("stream_recv", e)),
         }
     }
 

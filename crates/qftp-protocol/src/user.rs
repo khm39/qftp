@@ -206,12 +206,39 @@ pub fn sweep_stale_partials(root: &Path) {
     let now = std::time::SystemTime::now();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in read.flatten() {
-            let Ok(meta) = entry.metadata() else {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "sweep_stale_partials: read_dir failed; skipping subtree",
+                );
                 continue;
+            }
+        };
+        for entry in read {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "sweep_stale_partials: dir entry read failed; skipping",
+                    );
+                    continue;
+                }
+            };
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "sweep_stale_partials: metadata failed; skipping entry",
+                    );
+                    continue;
+                }
             };
             if meta.is_dir() {
                 stack.push(entry.path());
@@ -235,7 +262,13 @@ pub fn sweep_stale_partials(root: &Path) {
                 .map(|age| age > STALE_PARTIAL_AGE)
                 .unwrap_or(false);
             if abandoned {
-                let _ = std::fs::remove_file(entry.path());
+                if let Err(e) = std::fs::remove_file(entry.path()) {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "sweep_stale_partials: remove of abandoned partial failed",
+                    );
+                }
             }
         }
     }
@@ -248,12 +281,44 @@ pub fn walk_size(root: &Path) -> (u64, u64) {
     while let Some(dir) = stack.pop() {
         let read = match std::fs::read_dir(&dir) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                // Silently skipping here would permanently undercount
+                // any subtree that briefly couldn't be read at startup
+                // (NFS hiccup, EACCES race, etc.) and quota checks
+                // would then let the user write past their real budget
+                // until the next process restart. Log so operators can
+                // correlate "quota looks wrong" with the boot-time
+                // event that caused it.
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "walk_size: read_dir failed; quota cache will undercount this subtree",
+                );
+                continue;
+            }
         };
-        for entry in read.flatten() {
+        for entry in read {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "walk_size: dir entry read failed; skipping",
+                    );
+                    continue;
+                }
+            };
             let meta = match entry.metadata() {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "walk_size: metadata failed; quota cache will undercount this file",
+                    );
+                    continue;
+                }
             };
             if meta.is_dir() {
                 stack.push(entry.path());

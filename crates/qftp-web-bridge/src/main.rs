@@ -108,6 +108,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to canonicalize root {}", args.root.display()))?;
 
+    // `UserDirectory::from_config` and `default_anonymous` both invoke
+    // recursive sync filesystem walks (`sweep_stale_partials` +
+    // `walk_size` per home), which on a populated server can park a
+    // tokio worker for seconds. Hand the whole build off to the
+    // blocking pool so the runtime stays responsive even during a
+    // slow first boot.
     let users = match &args.users {
         Some(path) => {
             let text = tokio::fs::read_to_string(path)
@@ -115,9 +121,19 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed to read users file {}", path.display()))?;
             let cfg: UserConfig = toml::from_str(&text)
                 .with_context(|| format!("failed to parse users file {}", path.display()))?;
-            UserDirectory::from_config(&root, cfg)?
+            let root_for_users = root.clone();
+            let path_display = path.display().to_string();
+            tokio::task::spawn_blocking(move || UserDirectory::from_config(&root_for_users, cfg))
+                .await
+                .context("UserDirectory::from_config thread panicked")?
+                .with_context(|| format!("failed to build user directory from {}", path_display))?
         }
-        None => UserDirectory::default_anonymous(&root),
+        None => {
+            let root_for_users = root.clone();
+            tokio::task::spawn_blocking(move || UserDirectory::default_anonymous(&root_for_users))
+                .await
+                .context("UserDirectory::default_anonymous thread panicked")?
+        }
     };
 
     let tokens = match &args.users_tokens {
