@@ -247,10 +247,15 @@ pub fn sweep_stale_partials(root: &Path) {
             if !meta.is_file() {
                 continue;
             }
+            // `temp_path_for` always appends `.qftp.partial` to a
+            // non-empty filename, so a legitimate partial is
+            // `<something>.qftp.partial`. Require a non-empty prefix
+            // so a hand-created bare-`.qftp.partial` user file isn't
+            // swept.
             let is_partial = entry
                 .file_name()
                 .to_str()
-                .map(|n| n.ends_with(".qftp.partial"))
+                .map(|n| n.ends_with(".qftp.partial") && n.len() > ".qftp.partial".len())
                 .unwrap_or(false);
             if !is_partial {
                 continue;

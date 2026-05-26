@@ -729,13 +729,6 @@ async fn route_put_chunk(
     Ok(None)
 }
 
-/// Compose the deterministic resumable-upload temp path for
-/// `final_path`: `<dir>/<filename>.qftp.partial`. This matches the
-/// native `qftp-server`'s `temp_path_for`, so a partial is named the
-/// same regardless of which side wrote it -- a prerequisite for
-/// cross-implementation resume and for the shared stale-partial sweep.
-///
-/// The name is intentionally predictable. The anti-planting defence
 /// Apply the client-requested mode, stripping suid/sgid/sticky bits so
 /// an upload can't plant a setuid primitive inside the served tree.
 /// Synchronous: called from inside the commit `spawn_blocking` block
@@ -768,10 +761,11 @@ fn apply_mode_sync(_path: &Path, _mode: u32) {}
 
 /// Await a `tokio::task::JoinHandle` and turn a panic payload into a
 /// readable error string. The default `JoinError::Display` produces
-/// `"task &lt;id&gt; panicked"` with no panic message; downcasting the
-/// payload (mirroring the `HandlerPool::Drop` pattern in
-/// `qftp-server::server`) surfaces the actual panic text so operator
-/// logs are diagnosable.
+/// `"task <id> panicked"` with no panic message; downcasting the
+/// payload via the shared `qftp_common::util::panic_payload_message`
+/// helper (also used by `HandlerPool::Drop` and `handler_worker` so
+/// payload-shape support stays in one place) surfaces the actual
+/// panic text so operator logs are diagnosable.
 pub async fn await_blocking<T: Send + 'static>(
     handle: tokio::task::JoinHandle<T>,
     desc: &'static str,
@@ -781,14 +775,7 @@ pub async fn await_blocking<T: Send + 'static>(
             return anyhow::anyhow!("{desc} task was cancelled");
         }
         if je.is_panic() {
-            let payload = je.into_panic();
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<non-string panic payload>".to_string()
-            };
+            let msg = qftp_common::util::panic_payload_message(je.into_panic());
             return anyhow::anyhow!("{desc} panicked: {msg}");
         }
         anyhow::anyhow!("{desc}: {je}")

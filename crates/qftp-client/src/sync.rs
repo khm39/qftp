@@ -442,15 +442,20 @@ impl IgnoreMatcher {
     }
 }
 
-/// Send `Mkdir(path)` and tolerate the application-level errors that
-/// can legitimately mean "the directory is already there (or about to
-/// be created by the caller's intended Put)": `AlreadyExists` and
-/// `PermissionDenied` (the latter covers pre-provisioned trees where
-/// the user has Put but not Mkdir rights). Every OTHER application
-/// error (`NotADirectory`, `Internal`, etc.) and every transport-level
-/// failure bubbles up, so a single misconfigured root or a dropped
-/// connection aborts sync at the root cause instead of producing
-/// hundreds of confusing per-file `do_put` errors.
+/// Send `Mkdir(path)` and tolerate every application-level error so a
+/// single misconfigured or transiently flaky directory doesn't kill
+/// the entire sync run. Only transport-level failures (dropped
+/// connection, framing error, unexpected response variant) bubble up.
+///
+/// The two obvious cases are `AlreadyExists` (the directory is
+/// already there) and `PermissionDenied` (the user has Put but not
+/// Mkdir on a pre-provisioned tree). Less obvious but equally benign
+/// are the kernel-coalesced shapes that the server's `io_code` folds
+/// into `Internal` -- ESTALE on NFS, EIO during a brief remount,
+/// transient EBUSY etc. Cycle-3 hard-failed sync on those, breaking
+/// pipelines that previously coped. The per-file `do_put` step that
+/// follows is what surfaces a truly broken path; we just need to
+/// log here so the operator can see the warning trail.
 fn ensure_remote_dir(
     conn: &mut quiche::Connection,
     socket: &mio::net::UdpSocket,
@@ -468,25 +473,18 @@ fn ensure_remote_dir(
         &Request::Mkdir { path: path.clone() },
     )
     .with_context(|| format!("sync: Mkdir({path}) request failed"))?;
-    use qftp_common::protocol::ErrorCode;
     match resp {
         Response::Ok => Ok(()),
-        Response::Err(e)
-            if matches!(
-                e.code,
-                ErrorCode::AlreadyExists | ErrorCode::PermissionDenied
-            ) =>
-        {
+        Response::Err(e) => {
             tracing::warn!(
                 path = %path,
                 code = ?e.code,
                 msg = %e.message,
-                "sync: remote Mkdir tolerated; continuing in case the path is already a directory",
+                "sync: remote Mkdir returned an application-level error; \
+                 continuing (the subsequent do_put will fail concretely if the \
+                 path is not a usable directory)",
             );
             Ok(())
-        }
-        Response::Err(e) => {
-            anyhow::bail!("sync: Mkdir({path}) failed: [{:?}] {}", e.code, e.message)
         }
         other => anyhow::bail!("sync: Mkdir({path}) got unexpected response: {other:?}"),
     }

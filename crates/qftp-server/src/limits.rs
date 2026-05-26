@@ -305,6 +305,30 @@ mod tests {
     }
 
     #[test]
+    fn connection_slot_drop_releases_when_uncommitted() {
+        // RAII regression guard: try_acquire's whole reason for
+        // returning a slot is that dropping it without commit()
+        // releases the counter back automatically. A future
+        // "optimization" that removed the Drop impl would compile
+        // cleanly but silently break this invariant.
+        let caps = Caps {
+            max_total_connections: 8,
+            max_per_ip_connections: 4,
+        };
+        let mut cnt = ConnectionCounter::default();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // Acquire inside an inner scope so the slot's borrow of
+        // `cnt` ends before we check the post-Drop count.
+        {
+            let slot = cnt.try_acquire(caps, ip).expect("acquire");
+            // The slot holds `&mut cnt`, so we can't observe the
+            // intermediate total here; trust the assertion below.
+            drop(slot);
+        }
+        assert_eq!(cnt.total(), 0, "Drop on uncommitted slot must release");
+    }
+
+    #[test]
     fn connection_counter_enforces_caps() {
         let caps = Caps {
             max_total_connections: 3,
