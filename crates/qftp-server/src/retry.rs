@@ -45,7 +45,18 @@ impl RetryKey {
     }
 
     /// Mint a token committing to (peer address, original DCID).
+    ///
+    /// Panics if `odcid.len()` is outside the QUIC v1 range \[8, 20\]
+    /// (RFC 9000 §7.2 mandates clients pick ≥ 8 bytes). quiche enforces
+    /// the upper bound on parse; the lower bound is checked here so a
+    /// peer that bypassed quiche's parser (or a future quiche version
+    /// that loosened the check) can't mint a vacuous token.
     pub fn mint(&self, peer: SocketAddr, odcid: &quiche::ConnectionId) -> Vec<u8> {
+        assert!(
+            odcid.len() >= 8 && odcid.len() <= 20,
+            "ODCID length {} is outside the QUIC v1 range [8, 20] (RFC 9000 §7.2)",
+            odcid.len()
+        );
         let mut payload = Vec::with_capacity(MAGIC.len() + 32);
         payload.extend_from_slice(MAGIC);
         match peer.ip() {
@@ -119,6 +130,14 @@ impl RetryKey {
         if cursor.len() != dcid_len {
             return None;
         }
+        // RFC 9000 §7.2: client-chosen Initial DCIDs are >= 8 bytes
+        // for the connection's lifetime. Refuse a token claiming an
+        // empty/short ODCID so a peer that bypassed quiche's parser
+        // can't burn cap-counter / rate-limit budget by minting then
+        // re-presenting a vacuous token.
+        if !(8..=20).contains(&dcid_len) {
+            return None;
+        }
         Some(quiche::ConnectionId::from_ref(cursor))
     }
 
@@ -143,12 +162,46 @@ mod tests {
 
     #[test]
     fn round_trip_valid() {
+        // RFC 9000 §7.2 mandates client-chosen Initial DCIDs are >= 8
+        // bytes; mint enforces that lower bound and the test must too.
         let key = RetryKey::new().expect("test RNG should not fail");
         let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
-        let odcid = quiche::ConnectionId::from_ref(&[1, 2, 3, 4, 5]);
+        let odcid = quiche::ConnectionId::from_ref(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let token = key.mint(peer, &odcid);
         let recovered = key.verify(peer, &token).expect("token should verify");
         assert_eq!(recovered.as_ref(), odcid.as_ref());
+    }
+
+    #[test]
+    fn empty_odcid_token_is_rejected_on_verify() {
+        // Defense-in-depth: even if a peer somehow minted a token with
+        // a 0-byte ODCID (or a future change loosened the mint assert),
+        // verify must refuse it so cap counters can't be amplified.
+        let key = RetryKey::new().expect("test RNG should not fail");
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
+        // Hand-craft a token claiming dcid_len = 0.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(MAGIC);
+        payload.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 1).octets());
+        payload.extend_from_slice(&4242u16.to_be_bytes());
+        payload.push(0u8); // dcid_len = 0
+                           // no dcid bytes
+        let tag = key.sign(&payload);
+        let mut token = payload;
+        token.extend_from_slice(&tag);
+        assert!(
+            key.verify(peer, &token).is_none(),
+            "verify must reject a token with empty ODCID"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the QUIC v1 range")]
+    fn mint_rejects_short_odcid() {
+        let key = RetryKey::new().expect("test RNG should not fail");
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
+        let odcid = quiche::ConnectionId::from_ref(&[1, 2, 3]);
+        let _ = key.mint(peer, &odcid);
     }
 
     #[test]

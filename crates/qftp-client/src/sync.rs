@@ -442,16 +442,15 @@ impl IgnoreMatcher {
     }
 }
 
-/// Send `Mkdir(path)` and tolerate every Response::Err the server returns;
-/// only transport-level failures (dropped connection, framing error,
-/// unexpected response variant) bubble up. The original `let _ =
-/// request_response(...)` form swallowed everything, and a strict
-/// "only AlreadyExists is OK" version broke deployments where the
-/// user has Put permission but not Mkdir (e.g. their tree is
-/// pre-provisioned). Failures other than AlreadyExists are logged at
-/// `warn!` so a misconfigured pipeline still leaves a breadcrumb, and
-/// any genuine I/O problem still surfaces because the subsequent
-/// per-file `do_put` will fail concretely.
+/// Send `Mkdir(path)` and tolerate the application-level errors that
+/// can legitimately mean "the directory is already there (or about to
+/// be created by the caller's intended Put)": `AlreadyExists` and
+/// `PermissionDenied` (the latter covers pre-provisioned trees where
+/// the user has Put but not Mkdir rights). Every OTHER application
+/// error (`NotADirectory`, `Internal`, etc.) and every transport-level
+/// failure bubbles up, so a single misconfigured root or a dropped
+/// connection aborts sync at the root cause instead of producing
+/// hundreds of confusing per-file `do_put` errors.
 fn ensure_remote_dir(
     conn: &mut quiche::Connection,
     socket: &mio::net::UdpSocket,
@@ -469,17 +468,25 @@ fn ensure_remote_dir(
         &Request::Mkdir { path: path.clone() },
     )
     .with_context(|| format!("sync: Mkdir({path}) request failed"))?;
+    use qftp_common::protocol::ErrorCode;
     match resp {
         Response::Ok => Ok(()),
-        Response::Err(e) if e.code == qftp_common::protocol::ErrorCode::AlreadyExists => Ok(()),
-        Response::Err(e) => {
+        Response::Err(e)
+            if matches!(
+                e.code,
+                ErrorCode::AlreadyExists | ErrorCode::PermissionDenied
+            ) =>
+        {
             tracing::warn!(
                 path = %path,
                 code = ?e.code,
                 msg = %e.message,
-                "sync: remote Mkdir failed; continuing in case the path is already a directory",
+                "sync: remote Mkdir tolerated; continuing in case the path is already a directory",
             );
             Ok(())
+        }
+        Response::Err(e) => {
+            anyhow::bail!("sync: Mkdir({path}) failed: [{:?}] {}", e.code, e.message)
         }
         other => anyhow::bail!("sync: Mkdir({path}) got unexpected response: {other:?}"),
     }

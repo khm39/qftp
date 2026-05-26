@@ -578,6 +578,21 @@ async fn do_put(
     let mut tmp = vec![0u8; FILE_CHUNK_SIZE];
     while body_remaining > 0 || (checksum_trailer && trailer_filled < 32) {
         let n = match recv.read(&mut tmp).await.context("stream read failed")? {
+            Some(0) => {
+                // A zero-length read on an open stream is anomalous --
+                // the loop would otherwise spin forever without
+                // forward progress on `body_remaining` /
+                // `trailer_filled`. Treat as the same shape as EOF and
+                // fail with UploadTruncated rather than burning a
+                // tokio worker until the QUIC idle timeout closes
+                // the connection.
+                let msg = if body_remaining > 0 {
+                    "Upload truncated: stream yielded no data while body bytes remained"
+                } else {
+                    "Stream yielded no data while the BLAKE3 trailer was incomplete"
+                };
+                return reply_err(send, ErrorResponse::new(ErrorCode::UploadTruncated, msg)).await;
+            }
             Some(n) => n,
             None => {
                 let msg = if body_remaining > 0 {
@@ -648,12 +663,10 @@ async fn do_put(
             std::fs::rename(&temp_for_commit, &final_for_commit).map_err(|e| {
                 ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}"))
             })?;
-            apply_mode_sync(&final_for_commit, mode).map_err(|e| {
-                ErrorResponse::new(
-                    handler::io_code(&e),
-                    format!("failed to set permissions: {e}"),
-                )
-            })?;
+            // apply_mode_sync logs and continues on failure (matches
+            // the native server); never bubbles an error so we can't
+            // leave an orphan file at final_path after rename.
+            apply_mode_sync(&final_for_commit, mode);
             Ok(())
         }),
         "do_put commit",
@@ -727,17 +740,31 @@ async fn route_put_chunk(
 /// an upload can't plant a setuid primitive inside the served tree.
 /// Synchronous: called from inside the commit `spawn_blocking` block
 /// so it executes back-to-back with the rename, with no await between.
+///
+/// Failures here are logged at warn! and the upload still completes
+/// successfully -- matching the native server's `apply_mode`
+/// (server.rs ~2270). Bubbling the error up would leave the renamed
+/// file at `final_path` (rename already succeeded) with the temp's
+/// 0o600 mode and no quota charge, because the surrounding
+/// `PutGuard::drop` is unable to recover the file once rename has
+/// moved it. Logging-and-continuing keeps server-side state
+/// consistent and the user's file accessible at the cost of an
+/// (rare) wrong-mode landing.
 #[cfg(unix)]
-fn apply_mode_sync(path: &Path, mode: u32) -> std::io::Result<()> {
+fn apply_mode_sync(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(mode & 0o0777);
-    std::fs::set_permissions(path, perms)
+    if let Err(e) = std::fs::set_permissions(path, perms) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "apply_mode_sync: set_permissions failed; file landed with the temp's 0o600 mode",
+        );
+    }
 }
 
 #[cfg(not(unix))]
-fn apply_mode_sync(_path: &Path, _mode: u32) -> std::io::Result<()> {
-    Ok(())
-}
+fn apply_mode_sync(_path: &Path, _mode: u32) {}
 
 /// Await a `tokio::task::JoinHandle` and turn a panic payload into a
 /// readable error string. The default `JoinError::Display` produces
@@ -745,7 +772,7 @@ fn apply_mode_sync(_path: &Path, _mode: u32) -> std::io::Result<()> {
 /// payload (mirroring the `HandlerPool::Drop` pattern in
 /// `qftp-server::server`) surfaces the actual panic text so operator
 /// logs are diagnosable.
-async fn await_blocking<T: Send + 'static>(
+pub async fn await_blocking<T: Send + 'static>(
     handle: tokio::task::JoinHandle<T>,
     desc: &'static str,
 ) -> Result<T> {
