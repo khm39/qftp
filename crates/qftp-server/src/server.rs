@@ -179,13 +179,7 @@ impl Drop for HandlerPool {
                 continue;
             }
             if let Err(payload) = handle.join() {
-                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "<non-string panic payload>".to_string()
-                };
+                let msg = qftp_common::util::panic_payload_message(payload);
                 tracing::error!(
                     panic = %msg,
                     "qftp handler worker thread panicked; pool is shutting down anyway",
@@ -246,37 +240,43 @@ fn handler_worker(
         // `pending_handler_jobs`, and the event loop would queue
         // requests forever). On panic, synthesize an Internal error
         // response and keep the worker alive.
+        //
+        // Snapshot `cwd` BEFORE the catch_unwind closure so a panic
+        // that mutated `cwd` halfway through (e.g. `Cd` writes the
+        // new target before a downstream check panics) can be rolled
+        // back. Otherwise the synthesized Internal response would
+        // ship while the connection silently transitioned to a
+        // partial / unverified cwd.
+        let cwd_snapshot = job.cwd.clone();
         let mut cwd = job.cwd;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_handler(&job.req, &mut cwd, &job.user)
         }));
-        let response = match outcome {
-            Ok(r) => r,
+        let (response, new_cwd) = match outcome {
+            Ok(r) => (r, cwd),
             Err(payload) => {
-                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "<non-string panic payload>".to_string()
-                };
+                let msg = qftp_common::util::panic_payload_message(payload);
                 tracing::error!(
                     panic = %msg,
                     request = %req_dbg,
                     user = %user.name,
-                    "handler_worker: request handler panicked; replying with Internal error",
+                    "handler_worker: request handler panicked; replying with Internal \
+                     error and restoring cwd to the pre-handler value",
                 );
-                Response::Err(qftp_common::protocol::ErrorResponse::new(
-                    qftp_common::protocol::ErrorCode::Internal,
-                    "handler crashed",
-                ))
+                (
+                    Response::Err(qftp_common::protocol::ErrorResponse::new(
+                        qftp_common::protocol::ErrorCode::Internal,
+                        "handler crashed",
+                    )),
+                    cwd_snapshot,
+                )
             }
         };
         let result = HandlerResult {
             conn_key,
             stream_id,
             response,
-            new_cwd: cwd,
+            new_cwd,
             user,
         };
         if result_tx.send(result).is_err() {
@@ -818,14 +818,17 @@ fn try_accept(
     info!(peer = %from, "connection accepted");
     ax.metrics.inc_connections_total();
     ax.metrics.inc_connections_open();
-    // Commit BEFORE inserting into the map so any panic between this
-    // point and the insert leaves the slot already handed off to the
-    // reap loop (which calls `counter.release(peer_ip)` on close).
-    // The reverse order would double-decrement: slot's Drop on unwind
-    // releases once, then the connection sits in the map until its
-    // close triggers another release.
-    slot.commit();
+    // Order: insert THEN commit. `ConnectionSlot::commit()` is
+    // infallible (`self.armed = false`), so the only failure window
+    // is `connections.insert` itself -- if it panics (e.g. allocator
+    // OOM during a HashMap resize), the slot's Drop releases the
+    // counter and we lose nothing. The opposite order (commit then
+    // insert) trades that for a permanent counter leak: a panicking
+    // insert with the slot already disarmed leaves no `connections`
+    // entry for the reap loop to release on, so the per-IP and
+    // global counters drift up forever.
     ax.connections.insert(scid, ctx);
+    slot.commit();
     Ok(())
 }
 
@@ -857,7 +860,21 @@ fn send_retry(
     let mut new_scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SecureRandom::fill(rng, &mut new_scid_bytes).expect("system RNG failed");
     let new_scid = quiche::ConnectionId::from_ref(&new_scid_bytes);
-    let token = retry_key.mint(from, &hdr.dcid);
+    // quiche v0.24 does NOT enforce a minimum DCID length on Initial
+    // parse, so a peer can deliver a < 8-byte DCID here. mint refuses
+    // to issue a token in that case (RFC 9000 §7.2); drop the packet
+    // silently rather than crashing the accept thread.
+    let token = match retry_key.mint(from, &hdr.dcid) {
+        Some(t) => t,
+        None => {
+            debug!(
+                peer = %from,
+                dcid_len = hdr.dcid.len(),
+                "Initial with out-of-range DCID dropped (won't mint retry token)",
+            );
+            return Ok(());
+        }
+    };
     let written = quiche::retry(
         &hdr.scid,
         &hdr.dcid,

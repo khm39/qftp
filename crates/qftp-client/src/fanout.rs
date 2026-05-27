@@ -91,7 +91,7 @@ pub fn run(
             // summary line below would silently undercount the targets.
             // Synthesize a failure Outcome here so the user sees one
             // row per --to host and can tell that something blew up.
-            let msg = panic_payload_message(payload);
+            let msg = qftp_common::util::panic_payload_message(payload);
             results
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -140,20 +140,6 @@ pub fn run(
         return Ok(crate::oneshot::exit::DATA);
     }
     Ok(crate::oneshot::exit::OK)
-}
-
-/// Best-effort extraction of a panic payload's message for inclusion
-/// in the fanout summary. Mirrors what the default panic hook does
-/// when it prints to stderr: `panic!("...")` uses `&'static str`, and
-/// `panic!("...{}", x)` boxes a `String`.
-fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        return (*s).to_string();
-    }
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return s.clone();
-    }
-    "<non-string panic payload>".to_string()
 }
 
 fn upload_to_host(
