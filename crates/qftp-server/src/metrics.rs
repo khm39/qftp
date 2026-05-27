@@ -23,6 +23,7 @@ pub struct Metrics {
     pub connections_total: AtomicU64,
     pub connections_rejected_caps: AtomicU64,
     pub connections_rejected_rate: AtomicU64,
+    pub initials_dropped_bad_dcid: AtomicU64,
     pub retries_issued: AtomicU64,
     pub bytes_received: AtomicU64,
     pub bytes_sent: AtomicU64,
@@ -101,6 +102,10 @@ impl Metrics {
         self.connections_rejected_caps
             .fetch_add(1, Ordering::Relaxed);
     }
+    pub fn inc_initials_dropped_bad_dcid(&self) {
+        self.initials_dropped_bad_dcid
+            .fetch_add(1, Ordering::Relaxed);
+    }
     pub fn inc_requests_rate_limited(&self) {
         self.requests_rate_limited.fetch_add(1, Ordering::Relaxed);
     }
@@ -144,6 +149,13 @@ impl Metrics {
             "Connections dropped by the rate limiter.",
             Kind::Counter,
             self.connections_rejected_rate.load(Ordering::Relaxed),
+        );
+        g(
+            &mut out,
+            "qftp_initials_dropped_bad_dcid_total",
+            "Initials dropped because the client-chosen DCID was out of the RFC 9000 §7.2 range.",
+            Kind::Counter,
+            self.initials_dropped_bad_dcid.load(Ordering::Relaxed),
         );
         g(
             &mut out,

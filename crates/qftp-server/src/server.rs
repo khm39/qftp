@@ -241,13 +241,19 @@ fn handler_worker(
         // requests forever). On panic, synthesize an Internal error
         // response and keep the worker alive.
         //
-        // Snapshot `cwd` BEFORE the catch_unwind closure so a panic
-        // that mutated `cwd` halfway through (e.g. `Cd` writes the
-        // new target before a downstream check panics) can be rolled
-        // back. Otherwise the synthesized Internal response would
-        // ship while the connection silently transitioned to a
-        // partial / unverified cwd.
-        let cwd_snapshot = job.cwd.clone();
+        // Snapshot `cwd` only for `Cd` requests. `Cd` is the only
+        // handler arm that mutates `cwd`; other requests (`Ls`,
+        // `Stat`, `Mkdir`, ...) take `&mut cwd` but never write to
+        // it, so a panic mid-handler can't desync the connection's
+        // working directory. Cloning unconditionally would charge
+        // every hot-path request a `PathBuf` allocation -- on top of
+        // the clone already done by `dispatch_handler_job` to fill
+        // `job.cwd` -- for a rollback we'd never use.
+        let cwd_snapshot = if matches!(job.req, Request::Cd { .. }) {
+            Some(job.cwd.clone())
+        } else {
+            None
+        };
         let mut cwd = job.cwd;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_handler(&job.req, &mut cwd, &job.user)
@@ -261,14 +267,20 @@ fn handler_worker(
                     request = %req_dbg,
                     user = %user.name,
                     "handler_worker: request handler panicked; replying with Internal \
-                     error and restoring cwd to the pre-handler value",
+                     error and restoring cwd to the pre-handler value (if Cd)",
                 );
+                // For non-Cd requests we did not take a snapshot
+                // (cwd is unmodified by the handler), so fall back
+                // to `cwd` -- which equals the value Cd hadn't yet
+                // overwritten anyway, since the partial-mutation
+                // path only exists in Cd's match arm.
+                let restored = cwd_snapshot.unwrap_or(cwd);
                 (
                     Response::Err(qftp_common::protocol::ErrorResponse::new(
                         qftp_common::protocol::ErrorCode::Internal,
                         "handler crashed",
                     )),
-                    cwd_snapshot,
+                    restored,
                 )
             }
         };
@@ -389,9 +401,44 @@ fn dispatch_handler_job(
     match pool.job_tx.send(job) {
         Ok(()) => ctx.handler_in_flight = true,
         Err(mpsc::SendError(job)) => {
+            // Inline fallback: the pool channel is dead (all workers
+            // exited, e.g. mid-shutdown). Run the handler here on the
+            // event-loop thread, with the same catch_unwind + cwd
+            // rollback the worker pool uses, so a handler panic
+            // can't take down every other connection.
+            let cwd_snapshot = if matches!(job.req, Request::Cd { .. }) {
+                Some(job.cwd.clone())
+            } else {
+                None
+            };
+            let user = Arc::clone(&job.user);
+            let req_dbg = format!("{:?}", job.req);
             let mut cwd = job.cwd;
-            let response = run_handler(&job.req, &mut cwd, &job.user);
-            ctx.cwd = cwd;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_handler(&job.req, &mut cwd, &job.user)
+            }));
+            let (response, new_cwd) = match outcome {
+                Ok(r) => (r, cwd),
+                Err(payload) => {
+                    let msg = qftp_common::util::panic_payload_message(payload);
+                    tracing::error!(
+                        panic = %msg,
+                        request = %req_dbg,
+                        user = %user.name,
+                        "dispatch_handler_job inline fallback panicked; \
+                         replying with Internal error",
+                    );
+                    let restored = cwd_snapshot.unwrap_or(cwd);
+                    (
+                        Response::Err(qftp_common::protocol::ErrorResponse::new(
+                            qftp_common::protocol::ErrorCode::Internal,
+                            "handler crashed",
+                        )),
+                        restored,
+                    )
+                }
+            };
+            ctx.cwd = new_cwd;
             if matches!(response, Response::Err(_)) {
                 metrics.inc_requests_failed();
             }
@@ -719,6 +766,23 @@ fn try_accept(
     pkt: &mut [u8],
     out_pkt: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<()> {
+    // Validate the DCID range BEFORE consuming a rate-limit token.
+    // quiche v0.24 does not enforce RFC 9000 §7.2's >= 8-byte lower
+    // bound, so a peer can spray short-DCID Initials cheaply. If we
+    // consumed the rate-limit token before this check, the bad peer
+    // would pin their per-/32 bucket exhausted (denying legitimate
+    // retries from the same prefix) while never completing a
+    // handshake.
+    if !(8..=20).contains(&hdr.dcid.len()) {
+        ax.metrics.inc_initials_dropped_bad_dcid();
+        debug!(
+            peer = %from,
+            dcid_len = hdr.dcid.len(),
+            "Initial dropped: DCID outside RFC 9000 §7.2 range",
+        );
+        return Ok(());
+    }
+
     if !ax.rate_limiter.try_consume(from.ip()) {
         ax.metrics.inc_connections_rejected_rate();
         debug!(peer = %from, "Initial dropped by rate limiter");
@@ -731,8 +795,16 @@ fn try_accept(
     if ax.cfg.require_retry {
         let has_token = hdr.token.as_ref().is_some_and(|t| !t.is_empty());
         if !has_token {
-            send_retry(ax.retry_key, ax.rng, ax.socket, hdr, from, out_pkt)?;
-            ax.metrics.inc_retries_issued();
+            // send_retry returns Ok regardless of whether a RETRY went
+            // out, so only credit the retry metric when it actually
+            // emitted a packet. The DCID-range check above guarantees
+            // mint will succeed today, but keep the conditional so a
+            // future relaxation of that check can't silently desync
+            // the metric.
+            let emitted = send_retry(ax.retry_key, ax.rng, ax.socket, hdr, from, out_pkt)?;
+            if emitted {
+                ax.metrics.inc_retries_issued();
+            }
             return Ok(());
         }
         let token = hdr.token.as_ref().unwrap();
@@ -816,18 +888,19 @@ fn try_accept(
         return Ok(());
     }
     info!(peer = %from, "connection accepted");
+    // Order: insert FIRST so the metrics gauge and the cap counter
+    // both reflect a live map entry. If `connections.insert` panics
+    // (allocator OOM during a HashMap resize), the slot's Drop
+    // releases the cap counter; the metric increments below haven't
+    // happened yet so the `connections_open` gauge stays in sync.
+    // The previous order (inc_connections_open BEFORE insert) leaked
+    // the gauge forever on that panic path -- `dec_connections_open`
+    // is only called by the reap loop, which iterates the map.
+    ax.connections.insert(scid, ctx);
+    // From this point on, the connection is live: reap loop is
+    // responsible for `release(peer_ip)` and `dec_connections_open`.
     ax.metrics.inc_connections_total();
     ax.metrics.inc_connections_open();
-    // Order: insert THEN commit. `ConnectionSlot::commit()` is
-    // infallible (`self.armed = false`), so the only failure window
-    // is `connections.insert` itself -- if it panics (e.g. allocator
-    // OOM during a HashMap resize), the slot's Drop releases the
-    // counter and we lose nothing. The opposite order (commit then
-    // insert) trades that for a permanent counter leak: a panicking
-    // insert with the slot already disarmed leaves no `connections`
-    // entry for the reap loop to release on, so the per-IP and
-    // global counters drift up forever.
-    ax.connections.insert(scid, ctx);
     slot.commit();
     Ok(())
 }
@@ -856,23 +929,25 @@ fn send_retry(
     hdr: &quiche::Header,
     from: std::net::SocketAddr,
     out: &mut [u8; MAX_DATAGRAM_SIZE],
-) -> Result<()> {
+) -> Result<bool> {
     let mut new_scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SecureRandom::fill(rng, &mut new_scid_bytes).expect("system RNG failed");
     let new_scid = quiche::ConnectionId::from_ref(&new_scid_bytes);
     // quiche v0.24 does NOT enforce a minimum DCID length on Initial
-    // parse, so a peer can deliver a < 8-byte DCID here. mint refuses
-    // to issue a token in that case (RFC 9000 §7.2); drop the packet
-    // silently rather than crashing the accept thread.
+    // parse. The pre-rate-limit check in `try_accept` filters these
+    // before we reach here, but keep the mint defensive in case
+    // another caller wires in without that pre-check. Return Ok(false)
+    // so the caller knows no retry was actually emitted (and can skip
+    // the `retries_issued` metric).
     let token = match retry_key.mint(from, &hdr.dcid) {
         Some(t) => t,
         None => {
             debug!(
                 peer = %from,
                 dcid_len = hdr.dcid.len(),
-                "Initial with out-of-range DCID dropped (won't mint retry token)",
+                "send_retry: won't mint retry token for out-of-range DCID",
             );
-            return Ok(());
+            return Ok(false);
         }
     };
     let written = quiche::retry(
@@ -887,7 +962,7 @@ fn send_retry(
     socket
         .send_to(&out[..written], from)
         .context("UDP send_to for retry failed")?;
-    Ok(())
+    Ok(true)
 }
 
 /// Try to look up the authenticated user once the handshake is far enough
