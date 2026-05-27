@@ -411,12 +411,32 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                 Ok(dir) => match fs::read_dir(&*dir) {
                     Ok(entries) => {
                         let mut listing: Vec<DirEntry> = Vec::with_capacity(64);
+                        // Cap loop iterations (not just `listing.len()`)
+                        // so a directory padded with millions of
+                        // `.qftp.partial` files -- which the loop body
+                        // filters out before incrementing `listing.len`
+                        // -- cannot pin a worker thread doing per-entry
+                        // syscalls. A malicious authenticated user can
+                        // create partials by aborting uploads (each
+                        // counted against their quota, which is the
+                        // only natural bound) and then issue a single
+                        // Ls to exhaust the worker. Allow some slack
+                        // over MAX_DIR_ENTRIES so a real directory
+                        // sitting near the cap with a few aborted
+                        // uploads still lists correctly.
+                        const MAX_DIR_SCAN: usize = MAX_DIR_ENTRIES * 4;
+                        let mut scanned = 0usize;
                         for entry in entries {
-                            // Cap the in-memory listing: a directory with
-                            // millions of (e.g. 0-byte) files would
-                            // otherwise drive an unbounded allocation in
-                            // the worker thread. The client enforces the
-                            // same MAX_DIR_ENTRIES in `validate_response`.
+                            scanned += 1;
+                            if scanned > MAX_DIR_SCAN {
+                                return err(
+                                    ErrorCode::Internal,
+                                    format!(
+                                        "directory scan exceeded {MAX_DIR_SCAN} entries (too many \
+                                         hidden / temp files)"
+                                    ),
+                                );
+                            }
                             if listing.len() >= MAX_DIR_ENTRIES {
                                 return err(
                                     ErrorCode::Internal,
@@ -441,7 +461,8 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                             // Match the exact suffix `temp_path_for`
                             // produces, not a substring, so a legitimate
                             // file merely containing `.qftp.partial` isn't
-                            // hidden (mirrors `is_upload_temp`).
+                            // hidden (mirrors `is_upload_temp`). Skip
+                            // BEFORE the metadata() syscall.
                             if name.ends_with(".qftp.partial") {
                                 continue;
                             }
