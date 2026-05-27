@@ -473,8 +473,42 @@ fn ensure_remote_dir(
         &Request::Mkdir { path: path.clone() },
     )
     .with_context(|| format!("sync: Mkdir({path}) request failed"))?;
+    use qftp_common::protocol::ErrorCode;
     match resp {
         Response::Ok => Ok(()),
+        // Fatal codes -- continuing would either fail every subsequent
+        // request the same way (Unauthorized: auth gone) or indicate a
+        // protocol-level mismatch we should not paper over (Malformed:
+        // our wire format disagrees with the server; Unsupported:
+        // server is too old / lacks Mkdir entirely). Bail at the first
+        // one so the operator sees the root cause instead of N
+        // confusing per-file do_put errors.
+        Response::Err(e)
+            if matches!(
+                e.code,
+                ErrorCode::Unauthorized | ErrorCode::Malformed | ErrorCode::Unsupported
+            ) =>
+        {
+            anyhow::bail!(
+                "sync: Mkdir({path}) failed with fatal code [{:?}] {}",
+                e.code,
+                e.message
+            )
+        }
+        // AlreadyExists is the expected case on a re-sync; debug! so
+        // operators tailing the log on a 5000-directory tree don't
+        // get a wall of warns. The other tolerated codes (Internal
+        // / NotADirectory / PermissionDenied / QuotaExceeded / etc.)
+        // stay at warn! because they're surprising enough to want
+        // visible.
+        Response::Err(e) if e.code == ErrorCode::AlreadyExists => {
+            tracing::debug!(
+                path = %path,
+                msg = %e.message,
+                "sync: remote dir already exists (expected on re-sync)",
+            );
+            Ok(())
+        }
         Response::Err(e) => {
             tracing::warn!(
                 path = %path,

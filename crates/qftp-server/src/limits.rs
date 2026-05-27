@@ -326,6 +326,14 @@ mod tests {
             drop(slot);
         }
         assert_eq!(cnt.total(), 0, "Drop on uncommitted slot must release");
+        // Also verify the per-IP bookkeeping was reset, not just the
+        // global counter. A future refactor that special-cased
+        // `total` and forgot `per_ip` would pass the `total()` check
+        // but leak per-IP map entries.
+        assert!(
+            cnt.per_ip.is_empty(),
+            "Drop must clear the per-IP entry, not just decrement total"
+        );
     }
 
     #[test]
