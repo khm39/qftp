@@ -577,9 +577,13 @@ fn apply_common_config(config: &mut quiche::Config, allow_early_data: bool) -> R
     // the per-Request decode path (write ops refused while
     // `is_in_early_data()`). The client side gates this on whether
     // the TLS stack itself verifies the peer cert:
-    //   * verify_peer = true: a MitM cannot complete the resumed
-    //     handshake without the real server's private key, so 0-RTT
-    //     bytes stay confidential.
+    //   * verify_peer = true: BoringSSL validates the certificate
+    //     chain, and the client additionally binds the leaf to the
+    //     requested hostname after the handshake (see
+    //     qftp-client `connect::cert_matches_hostname`). A MitM lacking
+    //     a cert that both chains to a trusted CA *and* names this host
+    //     cannot complete the resumed handshake, so 0-RTT bytes stay
+    //     confidential.
     //   * verify_peer = false (--insecure or TOFU before pin-binding
     //     lands): an attacker who terminates the connection could
     //     receive the first Request bytes. Skip enable_early_data

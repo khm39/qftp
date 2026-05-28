@@ -258,6 +258,30 @@ fn try_connect(
         }
     }
 
+    // CA-mode hostname binding. quiche's `verify_peer(true)` makes
+    // BoringSSL validate the certificate *chain*, but it never checks
+    // that the leaf identifies the host we meant to reach -- the
+    // `server_name` passed to `quiche::connect` only sets the SNI, not
+    // a verification target. Without this any certificate that chains
+    // to a trusted CA, issued for *any* host, would be accepted, so a
+    // DNS-spoof / path-hijack peer could impersonate the server
+    // (CWE-295). TOFU and `--insecure` set `verify_peer = false` and do
+    // their own (or no) checks, so only enforce here when the TLS layer
+    // actually authenticated the chain.
+    if opts.verify_peer {
+        let der = conn.peer_cert().ok_or_else(|| {
+            anyhow!("{context_label}: server presented no certificate to verify hostname against")
+        })?;
+        if !cert_matches_hostname(der, &spec.server_name) {
+            conn.close(true, 0x0, b"server cert hostname mismatch").ok();
+            let _ = flush_egress(&mut conn, &socket);
+            return Err(anyhow!(
+                "{context_label}: server certificate does not match hostname '{}'",
+                spec.server_name
+            ));
+        }
+    }
+
     Ok(Established {
         conn,
         socket,
@@ -265,4 +289,200 @@ fn try_connect(
         events,
         resumed,
     })
+}
+
+/// Check whether the DER-encoded leaf certificate identifies `host`.
+///
+/// Follows RFC 6125 / 9525: a literal IP target is matched only against
+/// SAN iPAddress entries; a DNS target is matched against SAN dNSName
+/// entries (with a single left-most wildcard label), and the Subject CN
+/// is consulted only as a legacy fallback when the certificate carries
+/// no dNSName SANs at all.
+fn cert_matches_hostname(der: &[u8], host: &str) -> bool {
+    use x509_parser::prelude::*;
+
+    let Ok((_, cert)) = X509Certificate::from_der(der) else {
+        return false;
+    };
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if let Ok(Some(san)) = cert.subject_alternative_name() {
+            for gn in &san.value.general_names {
+                if let GeneralName::IPAddress(bytes) = gn {
+                    if ip_san_matches(bytes, &ip) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    let mut had_dns_san = false;
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for gn in &san.value.general_names {
+            if let GeneralName::DNSName(pat) = gn {
+                had_dns_san = true;
+                if dns_name_matches(pat, host) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Legacy CN fallback only when no dNSName SAN constrains the cert.
+    if !had_dns_san {
+        for attr in cert.subject().iter_common_name() {
+            if let Ok(cn) = attr.as_str() {
+                if dns_name_matches(cn, host) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Match a SAN iPAddress octet string against a parsed IP literal.
+fn ip_san_matches(san: &[u8], ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => san == v4.octets(),
+        std::net::IpAddr::V6(v6) => san == v6.octets(),
+    }
+}
+
+/// Match a certificate DNS name (possibly a `*.example.com` wildcard)
+/// against the requested host. Comparison is ASCII case-insensitive;
+/// a wildcard matches exactly one left-most label and never the bare
+/// parent domain.
+fn dns_name_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.trim_end_matches('.');
+    let host = host.trim_end_matches('.');
+    if pattern.is_empty() || host.is_empty() {
+        return false;
+    }
+
+    if let Some(rest) = pattern.strip_prefix("*.") {
+        // A wildcard label may not match a host that has fewer labels
+        // than the pattern, and the wildcard only covers the single
+        // left-most label of `host`.
+        let Some((host_label, host_rest)) = host.split_once('.') else {
+            return false;
+        };
+        if host_label.is_empty() {
+            return false;
+        }
+        return !rest.is_empty() && rest.eq_ignore_ascii_case(host_rest);
+    }
+
+    pattern.eq_ignore_ascii_case(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::{CertificateParams, KeyPair, SanType};
+
+    fn cert_with_dns(names: &[&str]) -> Vec<u8> {
+        let params =
+            CertificateParams::new(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .expect("rcgen new");
+        let key = KeyPair::generate().expect("rcgen keypair");
+        params
+            .self_signed(&key)
+            .expect("self_signed")
+            .der()
+            .to_vec()
+    }
+
+    fn cert_with_sans(sans: Vec<SanType>) -> Vec<u8> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("rcgen new");
+        params.subject_alt_names = sans;
+        let key = KeyPair::generate().expect("rcgen keypair");
+        params
+            .self_signed(&key)
+            .expect("self_signed")
+            .der()
+            .to_vec()
+    }
+
+    #[test]
+    fn exact_dns_san_matches_and_other_host_rejected() {
+        let der = cert_with_dns(&["files.example.com"]);
+        assert!(cert_matches_hostname(&der, "files.example.com"));
+        assert!(cert_matches_hostname(&der, "FILES.EXAMPLE.COM"));
+        // CWE-295 regression: a cert for one host must not authenticate
+        // a connection meant for a different host.
+        assert!(!cert_matches_hostname(&der, "evil.example.com"));
+        assert!(!cert_matches_hostname(&der, "example.com"));
+    }
+
+    #[test]
+    fn wildcard_san_matches_one_label_only() {
+        let der = cert_with_dns(&["*.example.com"]);
+        assert!(cert_matches_hostname(&der, "a.example.com"));
+        assert!(cert_matches_hostname(&der, "files.example.com"));
+        // Wildcard never matches the bare parent or a multi-label child.
+        assert!(!cert_matches_hostname(&der, "example.com"));
+        assert!(!cert_matches_hostname(&der, "a.b.example.com"));
+    }
+
+    #[test]
+    fn dns_san_present_disables_cn_fallback() {
+        // A cert with a dNSName SAN that does not name the host must be
+        // rejected even if its CN happens to match -- SAN wins.
+        let mut params =
+            CertificateParams::new(vec!["other.example.com".to_string()]).expect("rcgen new");
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "target.example.com");
+        params.distinguished_name = dn;
+        let key = KeyPair::generate().expect("rcgen keypair");
+        let der = params
+            .self_signed(&key)
+            .expect("self_signed")
+            .der()
+            .to_vec();
+        assert!(!cert_matches_hostname(&der, "target.example.com"));
+        assert!(cert_matches_hostname(&der, "other.example.com"));
+    }
+
+    #[test]
+    fn cn_fallback_only_without_dns_san() {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("rcgen new");
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "legacy.example.com");
+        params.distinguished_name = dn;
+        let key = KeyPair::generate().expect("rcgen keypair");
+        let der = params
+            .self_signed(&key)
+            .expect("self_signed")
+            .der()
+            .to_vec();
+        assert!(cert_matches_hostname(&der, "legacy.example.com"));
+        assert!(!cert_matches_hostname(&der, "elsewhere.example.com"));
+    }
+
+    #[test]
+    fn ip_target_matches_ip_san_only() {
+        let der = cert_with_sans(vec![SanType::IpAddress("192.0.2.1".parse().unwrap())]);
+        assert!(cert_matches_hostname(&der, "192.0.2.1"));
+        assert!(!cert_matches_hostname(&der, "192.0.2.2"));
+    }
+
+    #[test]
+    fn ip_target_does_not_match_dns_san() {
+        // RFC 9525: an IP literal target is matched against iPAddress
+        // SANs only, never against dNSName entries. Force a dNSName
+        // carrying an IP-shaped string (rcgen would otherwise classify
+        // a bare IP literal as an iPAddress SAN).
+        let der = cert_with_sans(vec![SanType::DnsName("192.0.2.1".try_into().unwrap())]);
+        assert!(!cert_matches_hostname(&der, "192.0.2.1"));
+    }
+
+    #[test]
+    fn garbage_cert_never_matches() {
+        assert!(!cert_matches_hostname(b"not a cert", "example.com"));
+        assert!(!cert_matches_hostname(&[], "example.com"));
+    }
 }
