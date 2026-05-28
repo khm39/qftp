@@ -18,6 +18,8 @@ mod limits;
 mod metrics;
 mod retry;
 mod server;
+mod transfer_get;
+mod transfer_put;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
