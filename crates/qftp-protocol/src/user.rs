@@ -183,6 +183,71 @@ impl User {
     }
 }
 
+/// RAII reservation against [`User::in_flight_bytes`].
+///
+/// A Put reserves its declared bytes against the user's in-flight
+/// counter *before* the quota check, so two concurrent Puts can't both
+/// pass a check-then-reserve race and together overshoot the limit. The
+/// reservation must be released on every path that doesn't commit it
+/// into `used_bytes`; this guard does that on drop unless [`disarm`]ed.
+///
+/// Both transports use this as the single definition of the in-flight
+/// reservation lifecycle: the native server anchors it in `start_put`'s
+/// early-return window, and the WebTransport bridge embeds it in its
+/// upload guard. The transport-specific accounting (committing the
+/// partial vs. removing it, charging `used_bytes`) stays in each driver
+/// because the on-disk policies differ; only the in-flight reservation
+/// is shared.
+///
+/// [`disarm`]: InFlightReservation::disarm
+#[derive(Debug)]
+pub struct InFlightReservation {
+    user: Arc<User>,
+    bytes: u64,
+    armed: bool,
+}
+
+impl InFlightReservation {
+    /// Reserve `bytes` against `user`'s in-flight counter.
+    pub fn reserve(user: Arc<User>, bytes: u64) -> Self {
+        user.in_flight_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Self {
+            user,
+            bytes,
+            armed: true,
+        }
+    }
+
+    /// Stop the guard from releasing the reservation on drop. Call this
+    /// once ownership of the reserved bytes has been handed off — either
+    /// to a longer-lived owner (the native server's `ReadingFileData`
+    /// state) or to the commit path that converts them into
+    /// `used_bytes`.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// True while the guard would still release its reservation on drop.
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// The user the reservation is held against.
+    pub fn user(&self) -> &Arc<User> {
+        &self.user
+    }
+}
+
+impl Drop for InFlightReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.user
+                .in_flight_bytes
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Walk `root` and return `(total_bytes, file_count)`. Used to
 /// initialize a user's cached `used_bytes` at startup, and (until
 /// the cache lands) for `Request::Quota` replies. We deliberately

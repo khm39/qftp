@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
@@ -22,7 +21,7 @@ mod sync;
 mod transfer;
 mod watch;
 
-use proto::{join_remote, request_response, take_stream};
+use proto::{join_remote, Session};
 
 /// Long-form `--version` body. Built from the package version plus
 /// the build-time facts injected by `build.rs`.
@@ -418,16 +417,17 @@ fn main() -> Result<()> {
     let mut quit_requested = false;
     let mut local_cwd: PathBuf = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+    let mut session = Session {
+        conn: &mut conn,
+        socket: &socket,
+        poll: &mut poll,
+        events: &mut events,
+        next_stream_id: &mut next_stream_id,
+    };
+
     if let Some(path) = &spec.initial_path {
         let req = Request::Cd { path: path.clone() };
-        match request_response(
-            &mut conn,
-            &socket,
-            &mut poll,
-            &mut events,
-            &mut next_stream_id,
-            &req,
-        )? {
+        match session.request_response(&req)? {
             Response::Ok => {}
             Response::Err(e) => {
                 eprintln!("initial cd {} failed: [{:?}] {}", path, e.code, e.message);
@@ -443,16 +443,7 @@ fn main() -> Result<()> {
             if quit_requested {
                 break;
             }
-            run_one_line(
-                line,
-                &mut conn,
-                &socket,
-                &mut poll,
-                &mut events,
-                &mut next_stream_id,
-                &mut quit_requested,
-                &mut local_cwd,
-            )?;
+            run_one_line(line, &mut session, &mut quit_requested, &mut local_cwd)?;
         }
     } else if args.batch || !std::io::stdin().is_terminal() {
         let stdin = std::io::stdin();
@@ -462,35 +453,18 @@ fn main() -> Result<()> {
                 break;
             }
             let line = line.context("reading stdin")?;
-            run_one_line(
-                &line,
-                &mut conn,
-                &socket,
-                &mut poll,
-                &mut events,
-                &mut next_stream_id,
-                &mut quit_requested,
-                &mut local_cwd,
-            )?;
+            run_one_line(&line, &mut session, &mut quit_requested, &mut local_cwd)?;
         }
     } else {
-        run_interactive(
-            &args,
-            &mut conn,
-            &socket,
-            &mut poll,
-            &mut events,
-            &mut next_stream_id,
-            &mut local_cwd,
-        )?;
+        run_interactive(&args, &mut session, &mut local_cwd)?;
     }
 
     if !quit_requested {
         // Try a polite Quit so the server logs a clean close.
-        let stream_id = take_stream(&mut next_stream_id);
-        let _ = send_message(&mut conn, stream_id, &Request::Quit);
-        let _ = stream_send_all(&mut conn, stream_id, &[], true);
-        let _ = flush_egress(&mut conn, &socket);
+        let stream_id = session.take_stream();
+        let _ = send_message(session.conn, stream_id, &Request::Quit);
+        let _ = stream_send_all(session.conn, stream_id, &[], true);
+        let _ = flush_egress(session.conn, session.socket);
     }
 
     // Persist the latest session ticket so the next connect can
@@ -499,7 +473,7 @@ fn main() -> Result<()> {
     // means we keep the post-handshake-rotated ticket too.
     if !args.no_zero_rtt {
         if let Some(dir) = &ticket_dir {
-            if let Err(e) = session_store::save_from_conn(dir, &spec.host, &conn) {
+            if let Err(e) = session_store::save_from_conn(dir, &spec.host, session.conn) {
                 tracing::warn!(error = ?e, "failed to persist session ticket");
             }
         }
@@ -509,15 +483,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_interactive(
-    args: &Args,
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
-    local_cwd: &mut PathBuf,
-) -> Result<()> {
+fn run_interactive(args: &Args, session: &mut Session, local_cwd: &mut PathBuf) -> Result<()> {
     // Tab completion wired through `ReplHelper`. Without an
     // explicit helper rustyline emits a beep on TAB; with it we get
     // first-word command completion + local-path completion for the
@@ -544,16 +510,7 @@ fn run_interactive(
             }
         };
         let _ = rl.add_history_entry(&line);
-        run_one_line(
-            &line,
-            conn,
-            socket,
-            poll,
-            events,
-            next_stream_id,
-            &mut quit,
-            local_cwd,
-        )?;
+        run_one_line(&line, session, &mut quit, local_cwd)?;
     }
     if let Some(p) = hist_path {
         let _ = rl.save_history(&p);
@@ -569,14 +526,9 @@ fn history_path(args: &Args) -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".qftp_history"))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_one_line(
     line: &str,
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
+    session: &mut Session,
     quit_out: &mut bool,
     local_cwd: &mut PathBuf,
 ) -> Result<()> {
@@ -665,7 +617,7 @@ fn run_one_line(
         }
         repl::Command::Remote(req) => {
             let is_quit = matches!(req, Request::Quit);
-            let resp = request_response(conn, socket, poll, events, next_stream_id, &req)?;
+            let resp = session.request_response(&req)?;
             repl::display_response(&resp);
             if is_quit {
                 *quit_out = true;
@@ -679,11 +631,7 @@ fn run_one_line(
             if recursive {
                 let local_root = local.map(|s| resolve_local(local_cwd, &s));
                 do_recursive_get(
-                    conn,
-                    socket,
-                    poll,
-                    events,
-                    next_stream_id,
+                    session,
                     &remote,
                     local_root.map(|p| p.to_string_lossy().into_owned()),
                 )?;
@@ -698,15 +646,7 @@ fn run_one_line(
                         local_cwd.join(name)
                     }
                 };
-                if let Err(e) = transfer::do_get(
-                    conn,
-                    socket,
-                    poll,
-                    events,
-                    next_stream_id,
-                    &remote,
-                    &local_path,
-                ) {
+                if let Err(e) = transfer::do_get(session, &remote, &local_path) {
                     println!("get failed: {e}");
                 }
             }
@@ -733,15 +673,7 @@ fn run_one_line(
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| ".".to_string())
                     });
-                    if let Err(e) = do_recursive_put(
-                        conn,
-                        socket,
-                        poll,
-                        events,
-                        next_stream_id,
-                        &path,
-                        &remote_root,
-                    ) {
+                    if let Err(e) = do_recursive_put(session, &path, &remote_root) {
                         println!("put -r {} failed: {e}", path.display());
                     }
                 }
@@ -755,19 +687,9 @@ fn run_one_line(
                     // Auto-resume an interrupted upload, mirroring the
                     // way `get` resumes from a partial local file.
                     let local_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    let offset = transfer::probe_put_resume_offset(
-                        conn,
-                        socket,
-                        poll,
-                        events,
-                        next_stream_id,
-                        &target,
-                        local_size,
-                    );
-                    let stream_id = take_stream(next_stream_id);
-                    match transfer::do_put(
-                        conn, socket, poll, events, stream_id, &path, &target, offset, false,
-                    ) {
+                    let offset = transfer::probe_put_resume_offset(session, &target, local_size);
+                    let stream_id = session.take_stream();
+                    match transfer::do_put(session, stream_id, &path, &target, offset, false) {
                         Ok(()) => {}
                         Err(e)
                             if offset > 0
@@ -776,10 +698,10 @@ fn run_one_line(
                             println!(
                                 "put {target}: server partial is stale, re-uploading from scratch"
                             );
-                            let sid = take_stream(next_stream_id);
-                            if let Err(e2) = transfer::do_put(
-                                conn, socket, poll, events, sid, &path, &target, 0, false,
-                            ) {
+                            let sid = session.take_stream();
+                            if let Err(e2) =
+                                transfer::do_put(session, sid, &path, &target, 0, false)
+                            {
                                 println!("put {} failed: {e2}", path.display());
                             }
                         }
@@ -789,16 +711,7 @@ fn run_one_line(
             }
         }
         repl::Command::Mget { pattern, local_dir } => {
-            do_mget(
-                conn,
-                socket,
-                poll,
-                events,
-                next_stream_id,
-                &pattern,
-                local_dir.as_deref(),
-                local_cwd,
-            )?;
+            do_mget(session, &pattern, local_dir.as_deref(), local_cwd)?;
         }
     }
     Ok(())
@@ -842,13 +755,8 @@ fn expand_glob(pattern: &str) -> Vec<PathBuf> {
 /// glob (`mget`). Unlike `put`'s local glob, the wildcard is expanded
 /// against a server `Ls`, so only the final path component may carry
 /// glob metacharacters; the directory part is taken verbatim.
-#[allow(clippy::too_many_arguments)]
 fn do_mget(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
+    session: &mut Session,
     pattern: &str,
     local_dir: Option<&str>,
     local_cwd: &Path,
@@ -884,16 +792,9 @@ fn do_mget(
         return Ok(());
     }
 
-    let resp = request_response(
-        conn,
-        socket,
-        poll,
-        events,
-        next_stream_id,
-        &Request::Ls {
-            path: rdir.to_string(),
-        },
-    )?;
+    let resp = session.request_response(&Request::Ls {
+        path: rdir.to_string(),
+    })?;
     let entries = match resp {
         Response::DirListing(e) => e,
         Response::Err(e) => {
@@ -953,15 +854,7 @@ fn do_mget(
         } else {
             format!("{rdir}/{}", entry.name)
         };
-        match transfer::do_get(
-            conn,
-            socket,
-            poll,
-            events,
-            next_stream_id,
-            &remote_child,
-            &local_child,
-        ) {
+        match transfer::do_get(session, &remote_child, &local_child) {
             Ok(()) => ok += 1,
             Err(e) => println!("mget: {remote_child} failed: {e}"),
         }
@@ -994,15 +887,7 @@ fn do_mget(
 /// Walk the remote directory tree, downloading every file under `remote`
 /// into `local_root`. The remote layout is preserved relative to
 /// `remote`.
-fn do_recursive_get(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
-    remote: &str,
-    local_root: Option<String>,
-) -> Result<()> {
+fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<String>) -> Result<()> {
     let local_root = local_root.map(PathBuf::from).unwrap_or_else(|| {
         Path::new(remote)
             .file_name()
@@ -1027,7 +912,7 @@ fn do_recursive_get(
             );
         }
         let req = Request::Ls { path: rdir.clone() };
-        let resp = request_response(conn, socket, poll, events, next_stream_id, &req)?;
+        let resp = session.request_response(&req)?;
         let entries = match resp {
             Response::DirListing(e) => e,
             Response::Err(e) => {
@@ -1057,15 +942,7 @@ fn do_recursive_get(
             if entry.is_dir {
                 queue.push((remote_child, local_child));
             } else {
-                if let Err(e) = transfer::do_get(
-                    conn,
-                    socket,
-                    poll,
-                    events,
-                    next_stream_id,
-                    &remote_child,
-                    &local_child,
-                ) {
+                if let Err(e) = transfer::do_get(session, &remote_child, &local_child) {
                     println!("get {} failed: {e}", remote_child);
                 }
             }
@@ -1076,41 +953,16 @@ fn do_recursive_get(
 
 /// Walk a local directory and upload every regular file under it,
 /// mirroring its structure under `remote_root`.
-fn do_recursive_put(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
-    local: &Path,
-    remote_root: &str,
-) -> Result<()> {
+fn do_recursive_put(session: &mut Session, local: &Path, remote_root: &str) -> Result<()> {
     if !local.is_dir() {
         // -r on a file degrades to a normal put.
-        let stream_id = take_stream(next_stream_id);
-        return transfer::do_put(
-            conn,
-            socket,
-            poll,
-            events,
-            stream_id,
-            local,
-            remote_root,
-            0,
-            false,
-        );
+        let stream_id = session.take_stream();
+        return transfer::do_put(session, stream_id, local, remote_root, 0, false);
     }
     // Ensure top-level mkdir.
-    let _ = request_response(
-        conn,
-        socket,
-        poll,
-        events,
-        next_stream_id,
-        &Request::Mkdir {
-            path: remote_root.to_string(),
-        },
-    )?;
+    let _ = session.request_response(&Request::Mkdir {
+        path: remote_root.to_string(),
+    })?;
 
     // BFS local.
     let mut queue: Vec<(PathBuf, String)> = vec![(local.to_path_buf(), remote_root.to_string())];
@@ -1128,30 +980,14 @@ fn do_recursive_put(
             let name_str = name.to_string_lossy().into_owned();
             let remote_child = join_remote(&rremote, Path::new(&name_str));
             if path.is_dir() {
-                let _ = request_response(
-                    conn,
-                    socket,
-                    poll,
-                    events,
-                    next_stream_id,
-                    &Request::Mkdir {
-                        path: remote_child.clone(),
-                    },
-                )?;
+                let _ = session.request_response(&Request::Mkdir {
+                    path: remote_child.clone(),
+                })?;
                 queue.push((path, remote_child));
             } else {
-                let stream_id = take_stream(next_stream_id);
-                if let Err(e) = transfer::do_put(
-                    conn,
-                    socket,
-                    poll,
-                    events,
-                    stream_id,
-                    &path,
-                    &remote_child,
-                    0,
-                    false,
-                ) {
+                let stream_id = session.take_stream();
+                if let Err(e) = transfer::do_put(session, stream_id, &path, &remote_child, 0, false)
+                {
                     println!("put {} failed: {e}", path.display());
                 }
             }

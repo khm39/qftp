@@ -65,6 +65,37 @@ mod temp_path_tests {
     }
 }
 
+/// Apply a client-requested file mode after a Put commit, stripping the
+/// suid/sgid/sticky bits first.
+///
+/// Letting clients land `04xxx` / `02xxx` / `01xxx` on files inside the
+/// served tree supplies a setuid primitive to any downstream process
+/// that later copies it (rsync `--preserve-permissions`, nightly
+/// backups, indexers running as root, ...). Operators who genuinely need
+/// special bits should set them out of band.
+///
+/// Failures are logged at `warn!` and swallowed: the rename already
+/// committed the file, so bubbling an error would either orphan it at
+/// `final_path` with the temp's mode or block the upload from being
+/// reported complete. Both transports (the native server's poll loop and
+/// the WebTransport bridge's commit `spawn_blocking`) call this so the
+/// suid-stripping policy lives in one place.
+#[cfg(unix)]
+pub fn apply_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(mode & 0o0777);
+    if let Err(e) = std::fs::set_permissions(path, perms) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "apply_mode: set_permissions failed; file kept its current mode",
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub fn apply_mode(_path: &Path, _mode: u32) {}
+
 /// Maximum file size accepted by Get/Put.
 pub const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 

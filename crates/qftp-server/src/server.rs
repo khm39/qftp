@@ -45,7 +45,7 @@ use qftp_protocol::stream::{
     temp_path_for, ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE,
     SEND_CHUNK_SIZE,
 };
-use qftp_protocol::user::{self, User, UserDirectory};
+use qftp_protocol::user::{self, InFlightReservation, User, UserDirectory};
 
 /// Which Request variants are safe to serve while the connection is
 /// still in the 0-RTT phase. The rule is "read-only / no
@@ -1707,47 +1707,6 @@ fn drive_one_sender(
     SendOutcome::Finished
 }
 
-/// RAII guard for an `in_flight_bytes` quota reservation.
-///
-/// `start_put` reserves `new_bytes` against the user's quota before it
-/// has a `StreamState::ReadingFileData` to anchor the reservation to.
-/// Several early-return failure paths sit between the reservation and
-/// that state; this guard returns the bytes on every one of them.
-/// Once `ReadingFileData` exists its own Drop owns the reservation, so
-/// the guard is disarmed.
-struct InFlightReservation {
-    user: Arc<User>,
-    bytes: u64,
-    armed: bool,
-}
-
-impl InFlightReservation {
-    fn reserve(user: Arc<User>, bytes: u64) -> Self {
-        user.in_flight_bytes.fetch_add(bytes, Ordering::Relaxed);
-        Self {
-            user,
-            bytes,
-            armed: true,
-        }
-    }
-
-    /// Hand ownership of the reservation to the constructed
-    /// `ReadingFileData` state; the guard becomes a no-op on drop.
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for InFlightReservation {
-    fn drop(&mut self) {
-        if self.armed {
-            self.user
-                .in_flight_bytes
-                .fetch_sub(self.bytes, Ordering::Relaxed);
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn start_put(
     ctx: &mut ConnectionContext,
@@ -2366,7 +2325,7 @@ fn drive_put(
                 format!("Failed to finalize file: {e}"),
             )));
         }
-        apply_mode(final_path, *mode);
+        qftp_protocol::stream::apply_mode(final_path, *mode);
         *completed = true;
         // Hand the reservation over to the persistent cache.
         // Once `completed` is true the Drop impl no longer touches
@@ -2384,25 +2343,6 @@ fn drive_put(
 
     Ok(None)
 }
-
-#[cfg(unix)]
-fn apply_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    // Strip suid/sgid/sticky bits before applying. Letting
-    // clients land 04xxx / 02xxx / 01xxx on files inside the server
-    // root supplies a setuid primitive to any downstream process
-    // that later copies the tree (rsync --preserve-permissions,
-    // nightly backups, indexers running as root, ...). Operators
-    // who genuinely need special bits should set them out of band.
-    let masked = mode & 0o0777;
-    let perms = fs::Permissions::from_mode(masked);
-    if let Err(e) = fs::set_permissions(path, perms) {
-        warn!(path = %path.display(), error = %e, "failed to set permissions");
-    }
-}
-
-#[cfg(not(unix))]
-fn apply_mode(_path: &Path, _mode: u32) {}
 
 /// Open the resumable Put temp file at `path`.
 ///
