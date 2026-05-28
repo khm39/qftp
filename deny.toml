@@ -1,0 +1,43 @@
+# cargo-deny configuration. Runs in CI (PRs + daily schedule) to catch
+# new RUSTSEC advisories against the QUIC/crypto dependency stack
+# (quiche/BoringSSL, wtransport, blake3) and to keep the license set
+# under control.
+
+[advisories]
+# Pull the advisory DB and fail on any vulnerability. `unmaintained`
+# and `unsound` are reported but not failed on initially so a single
+# stale transitive dep can't block every PR; tighten later.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses compatible with the crate's own MIT OR Apache-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn (don't fail) on duplicate versions so the dep tree's natural
+# churn doesn't block PRs; surfaces the worst offenders for cleanup.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -10,7 +10,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 bincode = "1"
+tempfile = "3"
 qftp-common = { path = "../crates/qftp-common" }
+qftp-protocol = { path = "../crates/qftp-protocol" }
 
 [[bin]]
 name = "request_deser"
@@ -22,6 +24,13 @@ bench = false
 [[bin]]
 name = "response_deser"
 path = "fuzz_targets/response_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "walk_safe"
+path = "fuzz_targets/walk_safe.rs"
 test = false
 doc = false
 bench = false
