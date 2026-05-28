@@ -54,7 +54,14 @@ impl Session<'_> {
         stream_id: u64,
         buf: &mut Vec<u8>,
     ) -> Result<Response> {
-        poll_response_with_buf(self.conn, self.socket, self.poll, self.events, stream_id, buf)
+        poll_response_with_buf(
+            self.conn,
+            self.socket,
+            self.poll,
+            self.events,
+            stream_id,
+            buf,
+        )
     }
 
     /// Send `req` on a fresh stream and block for its single `Response`.

@@ -557,14 +557,9 @@ fn run_put(
                 Err(e) if offset > 0 && e.downcast_ref::<transfer::StalePartial>().is_some() => {
                     eprintln!("put {local} -> {dest}: server partial is stale, re-uploading");
                     let sid = session.take_stream();
-                    if let Err(e2) = transfer::do_put(
-                        session,
-                        sid,
-                        &local_path,
-                        &dest,
-                        0,
-                        effective_no_clobber,
-                    ) {
+                    if let Err(e2) =
+                        transfer::do_put(session, sid, &local_path, &dest, 0, effective_no_clobber)
+                    {
                         eprintln!("put {local} -> {dest} failed: {e2}");
                         worst = exit::DATA;
                     }

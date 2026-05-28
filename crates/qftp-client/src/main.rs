@@ -887,11 +887,7 @@ fn do_mget(
 /// Walk the remote directory tree, downloading every file under `remote`
 /// into `local_root`. The remote layout is preserved relative to
 /// `remote`.
-fn do_recursive_get(
-    session: &mut Session,
-    remote: &str,
-    local_root: Option<String>,
-) -> Result<()> {
+fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<String>) -> Result<()> {
     let local_root = local_root.map(PathBuf::from).unwrap_or_else(|| {
         Path::new(remote)
             .file_name()
@@ -990,8 +986,7 @@ fn do_recursive_put(session: &mut Session, local: &Path, remote_root: &str) -> R
                 queue.push((path, remote_child));
             } else {
                 let stream_id = session.take_stream();
-                if let Err(e) =
-                    transfer::do_put(session, stream_id, &path, &remote_child, 0, false)
+                if let Err(e) = transfer::do_put(session, stream_id, &path, &remote_child, 0, false)
                 {
                     println!("put {} failed: {e}", path.display());
                 }

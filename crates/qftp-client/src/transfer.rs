@@ -198,12 +198,7 @@ pub fn do_get(session: &mut Session, remote: &str, local: &Path) -> Result<()> {
     result
 }
 
-fn do_get_inner(
-    session: &mut Session,
-    stream_id: u64,
-    remote: &str,
-    local: &Path,
-) -> Result<()> {
+fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Path) -> Result<()> {
     let resume_offset = match std::fs::metadata(local) {
         Ok(m) if m.is_file() => m.len(),
         _ => 0,
