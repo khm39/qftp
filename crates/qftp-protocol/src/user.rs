@@ -470,10 +470,36 @@ impl UserDirectory {
             })
         };
 
-        let mut by_name = HashMap::new();
+        // Resolve every home up-front so we can check for overlap
+        // BEFORE priming any `used_bytes` caches. Two users whose
+        // homes are equal or nested share a directory tree; each
+        // gets an independent `AtomicU64` quota cache, so a Put by
+        // user A updates only A's view and B's cache silently
+        // diverges from the on-disk reality (both can exceed
+        // quota). Refuse this configuration at parse time.
+        let mut resolved: Vec<(String, PathBuf)> = Vec::with_capacity(cfg.users.len() + 1);
         for spec in &cfg.users {
             let home = resolve_home(spec)?;
-            let user = build_user(spec, home);
+            for (other_name, other_home) in &resolved {
+                if home.starts_with(other_home) || other_home.starts_with(&home) {
+                    return Err(UserDirectoryError::Config(format!(
+                        "user {} home {} overlaps with user {} home {} \
+                         (homes must not be equal or nested -- they \
+                         would share storage but maintain independent \
+                         quota counters)",
+                        spec.name,
+                        home.display(),
+                        other_name,
+                        other_home.display(),
+                    )));
+                }
+            }
+            resolved.push((spec.name.clone(), home));
+        }
+
+        let mut by_name = HashMap::new();
+        for (spec, (_, home)) in cfg.users.iter().zip(resolved.iter()) {
+            let user = build_user(spec, home.clone());
             if by_name.insert(spec.name.clone(), user).is_some() {
                 return Err(UserDirectoryError::Config(format!(
                     "duplicate user name in config: {}",
@@ -485,6 +511,16 @@ impl UserDirectory {
         let anonymous = match &cfg.anonymous {
             Some(spec) => {
                 let home = resolve_home(spec)?;
+                for (other_name, other_home) in &resolved {
+                    if home.starts_with(other_home) || other_home.starts_with(&home) {
+                        return Err(UserDirectoryError::Config(format!(
+                            "anonymous user home {} overlaps with user {} home {}",
+                            home.display(),
+                            other_name,
+                            other_home.display(),
+                        )));
+                    }
+                }
                 build_user(spec, home)
             }
             None => {
@@ -553,6 +589,17 @@ impl UserDirectory {
 pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
     use x509_parser::prelude::*;
 
+    // Reject any peer-controlled identity string carrying ASCII
+    // control characters. The string ends up in tracing output
+    // (server.rs upgrade_user_from_cert logs `matched = %id`) so
+    // an attacker-issued cert with an embedded `\n` or `\r` in CN
+    // / SAN could forge log lines visible to log parsers and SIEM
+    // rules. `.trim()` only strips edge whitespace -- it leaves
+    // embedded control bytes intact. Filter explicitly.
+    fn is_safe(s: &str) -> bool {
+        !s.bytes().any(|b| b < 0x20 || b == 0x7f)
+    }
+
     let mut out: Vec<String> = Vec::new();
     let Ok((_, cert)) = X509Certificate::from_der(der) else {
         return out;
@@ -565,7 +612,7 @@ pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
         for gn in &san.value.general_names {
             if let GeneralName::DNSName(s) = gn {
                 let trimmed = s.trim();
-                if !trimmed.is_empty() {
+                if !trimmed.is_empty() && is_safe(trimmed) {
                     out.push(trimmed.to_string());
                 }
             }
@@ -573,7 +620,7 @@ pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
         for gn in &san.value.general_names {
             if let GeneralName::RFC822Name(s) = gn {
                 let trimmed = s.trim();
-                if !trimmed.is_empty() {
+                if !trimmed.is_empty() && is_safe(trimmed) {
                     out.push(trimmed.to_string());
                 }
             }
@@ -581,7 +628,7 @@ pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
         for gn in &san.value.general_names {
             if let GeneralName::URI(s) = gn {
                 let trimmed = s.trim();
-                if !trimmed.is_empty() {
+                if !trimmed.is_empty() && is_safe(trimmed) {
                     out.push(trimmed.to_string());
                 }
             }
@@ -592,7 +639,7 @@ pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
     for attr in cert.subject().iter_common_name() {
         if let Ok(s) = attr.as_str() {
             let trimmed = s.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && is_safe(trimmed) {
                 out.push(trimmed.to_string());
             }
         }

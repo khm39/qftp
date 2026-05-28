@@ -476,19 +476,18 @@ fn ensure_remote_dir(
     use qftp_common::protocol::ErrorCode;
     match resp {
         Response::Ok => Ok(()),
-        // Fatal codes -- continuing would either fail every subsequent
-        // request the same way (Unauthorized: auth gone) or indicate a
-        // protocol-level mismatch we should not paper over (Malformed:
-        // our wire format disagrees with the server; Unsupported:
-        // server is too old / lacks Mkdir entirely). Bail at the first
-        // one so the operator sees the root cause instead of N
+        // Session-fatal codes: continuing would fail every
+        // subsequent request the same way. Bail at the first one
+        // so the operator sees the root cause instead of N
         // confusing per-file do_put errors.
-        Response::Err(e)
-            if matches!(
-                e.code,
-                ErrorCode::Unauthorized | ErrorCode::Malformed | ErrorCode::Unsupported
-            ) =>
-        {
+        //
+        // Note: `Malformed` is intentionally NOT in this set. The
+        // server emits Malformed for per-path issues too (a
+        // `Component::Prefix` in one path, a parent-less path, ...
+        // -- see qftp-protocol handler.rs walk_safe /
+        // resolve_parent), so bailing on the first one would abort
+        // the whole sync when 999/1000 paths are fine.
+        Response::Err(e) if matches!(e.code, ErrorCode::Unauthorized | ErrorCode::Unsupported) => {
             anyhow::bail!(
                 "sync: Mkdir({path}) failed with fatal code [{:?}] {}",
                 e.code,
