@@ -94,6 +94,14 @@ const WAKER_TOKEN: Token = Token(1);
 /// connection (H-1).
 const HANDLER_WORKERS: usize = 4;
 
+/// How long a connection may stay un-established (handshake not
+/// complete) before the reap loop force-drops it and releases its cap
+/// slot. Much shorter than the QUIC idle timeout (30s) so a flood of
+/// spoofed Initials that each commit a connection slot can't pin the
+/// global table for the full idle window (#266). Legitimate handshakes
+/// complete in well under a second even on lossy links.
+const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Static knobs the loop reads on every iteration.
 pub struct ServerConfig {
     pub caps: Caps,
@@ -553,7 +561,25 @@ pub fn run(
             }
         }
 
-        let shortest_timeout = connections.values().filter_map(|c| c.conn.timeout()).min();
+        // The shortest QUIC timeout, but also bounded by the time left
+        // until the soonest half-open connection must be reaped (#266):
+        // a flood of un-established connections produces no network
+        // events, so without this the loop would sleep until the QUIC
+        // idle timeout and the half-open reap would be ineffective.
+        let shortest_timeout = connections
+            .values()
+            .filter_map(|c| {
+                let quic = c.conn.timeout();
+                let half_open = (!c.conn.is_established())
+                    .then(|| HALF_OPEN_TIMEOUT.saturating_sub(c.created_at.elapsed()));
+                match (quic, half_open) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                }
+            })
+            .min();
         // A resumed Put re-hashing its on-disk prefix has pure local
         // work to do that no network event will wake the loop for; spin
         // at a zero timeout until that re-hash finishes.
@@ -714,8 +740,15 @@ pub fn run(
         // 6. Reap closed / timed-out connections.
         let before = connections.len();
         connections.retain(|_, ctx| {
-            let alive = !ctx.conn.is_closed();
+            let half_open = half_open_expired(ctx.conn.is_established(), ctx.created_at.elapsed());
+            let alive = !ctx.conn.is_closed() && !half_open;
             if !alive {
+                if half_open {
+                    debug!(
+                        peer = %ctx.peer_addr,
+                        "reaping half-open connection (handshake never completed)"
+                    );
+                }
                 let peer_ip = ctx.peer_addr.ip();
                 counter.release(peer_ip);
                 metrics.dec_connections_open();
@@ -903,6 +936,17 @@ fn try_accept(
     ax.metrics.inc_connections_open();
     slot.commit();
     Ok(())
+}
+
+/// True when a connection has been alive for longer than
+/// [`HALF_OPEN_TIMEOUT`] without completing its handshake. Such a
+/// connection still occupies a global + per-IP cap slot, so a flood of
+/// spoofed Initials that each commit a slot but never finish the
+/// handshake could otherwise pin the table for the full QUIC idle
+/// timeout (#266). Reaping these early bounds the exposure to
+/// `HALF_OPEN_TIMEOUT`.
+fn half_open_expired(established: bool, age: Duration) -> bool {
+    !established && age >= HALF_OPEN_TIMEOUT
 }
 
 /// Deterministically derive a server SCID from the client's DCID using
@@ -2378,6 +2422,30 @@ fn open_temp(path: &Path, resume: bool) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_open_expired_reaps_unestablished_after_timeout() {
+        // An un-established connection past the half-open window must be
+        // reaped so spoofed Initials can't pin cap slots (#266).
+        assert!(half_open_expired(false, HALF_OPEN_TIMEOUT));
+        assert!(half_open_expired(
+            false,
+            HALF_OPEN_TIMEOUT + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn half_open_does_not_reap_fresh_or_established() {
+        // A connection still inside the window survives.
+        assert!(!half_open_expired(false, Duration::ZERO));
+        assert!(!half_open_expired(
+            false,
+            HALF_OPEN_TIMEOUT - Duration::from_millis(1)
+        ));
+        // An established connection is never half-open-reaped, no matter
+        // how long it has been alive.
+        assert!(!half_open_expired(true, HALF_OPEN_TIMEOUT * 100));
+    }
 
     #[test]
     fn replay_safe_allows_readonly_ops() {

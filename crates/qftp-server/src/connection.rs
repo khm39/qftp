@@ -24,8 +24,9 @@ pub struct ConnectionContext {
     /// Current working directory. Always inside `user.home`.
     pub cwd: PathBuf,
     pub streams: HashMap<u64, StreamState>,
-    /// When the connection was accepted. Used for soak-test diagnostics.
-    #[allow(dead_code)]
+    /// When the connection was accepted. Used to reap half-open
+    /// connections that never complete their handshake (#266) and for
+    /// soak-test diagnostics.
     pub created_at: Instant,
     /// The SCID the server issued for this connection -- the key it is
     /// stored under in the connection table. Held here so an offloaded
