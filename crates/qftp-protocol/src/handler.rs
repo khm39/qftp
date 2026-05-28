@@ -840,4 +840,39 @@ mod tests {
             other => panic!("expected DirListing for root, got {other:?}"),
         }
     }
+
+    /// A directory padded with many `.qftp.partial` temp files (which
+    /// the Ls handler filters out before incrementing `listing.len`)
+    /// must trip the total-scan cap, not pin the worker thread doing
+    /// per-entry syscalls for an unbounded count. Regression test for
+    /// the cycle-6 P3 fix.
+    #[test]
+    fn ls_caps_total_scan_when_directory_is_partials_padded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // 4 * MAX_DIR_ENTRIES + 1 puts us just past MAX_DIR_SCAN.
+        let pad = MAX_DIR_ENTRIES * 4 + 1;
+        for i in 0..pad {
+            std::fs::write(root.join(format!("a{i}.qftp.partial")), b"").unwrap();
+        }
+        let mut cwd = root.clone();
+        let resp = handle_request(
+            &Request::Ls {
+                path: String::new(),
+            },
+            &mut cwd,
+            &root,
+        );
+        match resp {
+            Response::Err(e) => {
+                assert_eq!(e.code, ErrorCode::Internal);
+                assert!(
+                    e.message.contains("directory scan exceeded"),
+                    "expected scan-cap error, got: {}",
+                    e.message,
+                );
+            }
+            other => panic!("expected Internal error, got {other:?}"),
+        }
+    }
 }
