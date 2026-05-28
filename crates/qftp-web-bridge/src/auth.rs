@@ -131,11 +131,16 @@ fn extract_token(path: &str) -> Option<String> {
     // `+`; a literal `+` arrives as `%2B`. Translate `+` back to a
     // space before percent-decoding so the round-trip is exact.
     let space_decoded = raw.replace('+', " ");
-    Some(
-        percent_encoding::percent_decode_str(&space_decoded)
-            .decode_utf8_lossy()
-            .into_owned(),
-    )
+    // Reject malformed UTF-8 outright rather than coercing it with
+    // U+FFFD: a token is compared byte-for-byte against the configured
+    // value, so a lossy decode would only ever produce a non-matching
+    // string while masking the fact that the input wasn't a valid
+    // token. `decode_utf8` returns `Err` on invalid bytes, which maps
+    // cleanly to `None` (no usable token).
+    percent_encoding::percent_decode_str(&space_decoded)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
 }
 
 #[cfg(test)]
@@ -168,6 +173,16 @@ mod tests {
             extract_token("/?token=one+two"),
             Some("one two".to_string())
         );
+    }
+
+    #[test]
+    fn extract_token_rejects_invalid_utf8() {
+        // `%FF` is not valid UTF-8 on its own. A lossy decode would
+        // turn it into U+FFFD and yield `Some`; the strict decode must
+        // reject it with `None` so a malformed token never reaches the
+        // constant-time comparison as a coerced string (L-2).
+        assert_eq!(extract_token("/?token=%FF"), None);
+        assert_eq!(extract_token("/?token=good%FFbad"), None);
     }
 
     #[test]

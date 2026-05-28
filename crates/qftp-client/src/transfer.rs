@@ -16,19 +16,19 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
+use qftp_protocol::stream::FILE_CHUNK_SIZE;
 
 use crate::proto::Session;
 
-const CHUNK: usize = 64 * 1024;
-
-/// Outer-loop buffer for the upload body. Sized much larger than the
-/// generic `CHUNK` so a 64 MiB put runs the outer event-loop step ~64
-/// times instead of ~1024: each extra trip costs a `read_exact`,
-/// stream_send call, ingress drain, and flush_egress, and at small
-/// chunk sizes the fixed overhead — not flow-control — was capping
-/// loopback put at ~65 MiB/s. quiche handles partial accepts
-/// via the inner stream_send loop, so a larger buffer is purely a
-/// win when cwnd is open and degrades gracefully when it isn't.
+/// Outer-loop buffer for the upload body. Deliberately larger than the
+/// protocol's generic `FILE_CHUNK_SIZE` so a 64 MiB put runs the outer
+/// event-loop step ~64 times instead of ~1024: each extra trip costs a
+/// `read_exact`, stream_send call, ingress drain, and flush_egress, and
+/// at small chunk sizes the fixed overhead — not flow-control — was
+/// capping loopback put at ~65 MiB/s. quiche handles partial accepts
+/// via the inner stream_send loop, so a larger buffer is purely a win
+/// when cwnd is open and degrades gracefully when it isn't. This is the
+/// one place the client intentionally diverges from `FILE_CHUNK_SIZE`.
 const UPLOAD_CHUNK: usize = 1024 * 1024;
 
 /// Process-wide flag set from `--quiet`. When true, `make_bar`
@@ -283,7 +283,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     if resume_offset > 0 {
         file.seek(SeekFrom::Start(0))
             .context("seeking to start of local prefix")?;
-        let mut buf = [0u8; CHUNK];
+        let mut buf = [0u8; FILE_CHUNK_SIZE];
         let mut left = resume_offset;
         while left > 0 {
             let want = (left as usize).min(buf.len());
@@ -301,7 +301,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
 
     let mut received: u64 = 0;
     let mut trailer = Vec::<u8>::new();
-    let mut tmp = [0u8; CHUNK];
+    let mut tmp = [0u8; FILE_CHUNK_SIZE];
     let mut recv_buf = [0u8; 65535];
 
     let want_trailer = if checksum_follows { 32 } else { 0 };
@@ -523,7 +523,7 @@ fn do_put_inner(
     // the trailer covers the same byte range. Read once for hashing
     // only, then seek to `offset` for the actual send.
     if offset > 0 {
-        let mut prefix_buf = [0u8; CHUNK];
+        let mut prefix_buf = [0u8; FILE_CHUNK_SIZE];
         let mut left = offset;
         while left > 0 {
             let want = (left as usize).min(prefix_buf.len());
