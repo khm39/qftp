@@ -323,7 +323,6 @@ impl Drop for StreamState {
             completed,
             remaining,
             reserved_bytes,
-            prior_bytes,
             writer,
             temp_path,
             owner,
@@ -334,32 +333,34 @@ impl Drop for StreamState {
                 owner
                     .in_flight_bytes
                     .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-                // Flush the buffered writer, then charge the bytes
-                // actually on disk this session -- the file size minus
-                // the prefix a prior session already counted. Counting
-                // the real file rather than the logical write_all total
-                // keeps `used_bytes` correct even if a buffered write
-                // never reached disk.
+                // Flush the buffered writer so the bytes we charge below
+                // are actually on disk for a later resume. Then charge
+                // the *logical* bytes received this session
+                // (`reserved_bytes - remaining`) rather than re-`stat`ing
+                // the file.
+                //
+                // Drop runs on the server's single event-loop thread
+                // (a connection-reap can drop a `ReadingFileData`), so a
+                // synchronous `fs::metadata()` on slow/hung storage would
+                // stall every other connection (HOL blocking, #268). On
+                // a successful flush the logical count equals the
+                // on-disk size minus `prior_bytes` exactly; on a flush
+                // failure it can over-charge by at most one BufWriter
+                // capacity, which is the safe direction for quota
+                // defense. `prior_bytes` (the resume prefix already in
+                // `used_bytes`) is excluded by construction since
+                // `reserved_bytes`/`remaining` only count this session's
+                // body.
                 if let Err(e) = writer.flush() {
                     tracing::warn!(
                         path = %temp_path.display(),
                         error = %e,
                         "StreamState::drop: flush of aborted upload buffer failed; \
-                         quota accounting will fall back to logical byte count",
+                         quota will be charged the logical byte count, which may \
+                         over-count un-flushed bytes",
                     );
                 }
-                let written = match std::fs::metadata(&*temp_path) {
-                    Ok(m) => m.len().saturating_sub(*prior_bytes),
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %temp_path.display(),
-                            error = %e,
-                            "StreamState::drop: cannot stat partial; \
-                             charging logical byte count to used_bytes",
-                        );
-                        reserved_bytes.saturating_sub(*remaining)
-                    }
-                };
+                let written = reserved_bytes.saturating_sub(*remaining);
                 if written > 0 {
                     owner.used_bytes.fetch_add(written, Ordering::Relaxed);
                 }
@@ -442,6 +443,32 @@ mod tests {
         drop(state);
         assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn abort_charges_logical_bytes_without_stat() {
+        // #268: Drop must not synchronously `stat` the partial on the
+        // event-loop thread. Proven by deleting the temp file *before*
+        // Drop runs: a metadata-based accounting would see len 0 (or
+        // error) and under-charge, while the logical count
+        // (reserved - remaining) still charges the bytes received this
+        // session.
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        user.in_flight_bytes.fetch_add(1000, Ordering::Relaxed);
+        let temp = dir.path().join("f");
+        let state = reading_state(Arc::clone(&user), temp.clone(), 1000, 400, false);
+        // Remove the on-disk partial so any `fs::metadata` would fail or
+        // report 0; the logical path is independent of it.
+        std::fs::remove_file(&temp).unwrap();
+        drop(state);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            user.used_bytes.load(Ordering::Relaxed),
+            600,
+            "logical byte count (reserved - remaining) must be charged \
+             regardless of the partial's on-disk presence"
+        );
     }
 
     #[test]
