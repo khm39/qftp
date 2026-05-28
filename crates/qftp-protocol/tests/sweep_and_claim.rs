@@ -97,7 +97,10 @@ fn try_claim_refuses_second_put_to_same_path() {
     assert!(first.is_some(), "first claim must succeed");
 
     let second = UploadClaim::try_claim(Arc::clone(&user), path.clone());
-    assert!(second.is_none(), "second claim to same path must be refused");
+    assert!(
+        second.is_none(),
+        "second claim to same path must be refused"
+    );
 }
 
 #[test]
