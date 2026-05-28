@@ -13,6 +13,7 @@
 //! qftp-admin remove-user   <name>
 //! qftp-admin list-users
 //! qftp-admin set-permissions <name> [--read/--write/...]
+//! qftp-admin set-quota       <name> (--bytes N | --unlimited)
 //! qftp-admin generate-completions <SHELL>
 //! ```
 //!
@@ -28,6 +29,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+// The permission-flag key set is owned by `qftp-protocol` so this CLI
+// (the only writer of users.toml) can't drift from the server's
+// `Permissions` schema, which is `#[serde(deny_unknown_fields)]` (#269).
+use qftp_protocol::user::PERM_KEYS;
 
 const DEFAULT_USERS_PATH: &str = "/etc/qftp/users.toml";
 
@@ -99,6 +104,21 @@ enum Command {
         #[arg(long)]
         chmod: Option<bool>,
     },
+    /// Set or clear a user's storage quota (bytes). Pass `--bytes N`
+    /// to set a limit, or `--unlimited` to remove the quota key.
+    SetQuota {
+        name: String,
+        /// Quota in bytes. Mutually exclusive with --unlimited.
+        #[arg(
+            long,
+            conflicts_with = "unlimited",
+            required_unless_present = "unlimited"
+        )]
+        bytes: Option<u64>,
+        /// Remove the quota entirely (unlimited).
+        #[arg(long, default_value_t = false)]
+        unlimited: bool,
+    },
     /// Print a shell-completion script and exit.
     GenerateCompletions { shell: Shell },
 }
@@ -161,6 +181,11 @@ fn main() -> Result<()> {
                 chmod,
             },
         ),
+        Command::SetQuota {
+            name,
+            bytes,
+            unlimited,
+        } => set_quota(&args.users, &name, if unlimited { None } else { bytes }),
     }
 }
 
@@ -185,10 +210,6 @@ struct PartialPerms {
     rename: Option<bool>,
     chmod: Option<bool>,
 }
-
-const PERM_KEYS: &[&str] = &[
-    "read", "write", "delete", "mkdir", "rmdir", "rename", "chmod",
-];
 
 fn init_users(path: &Path) -> Result<()> {
     if path.exists() {
@@ -335,6 +356,32 @@ fn set_permissions(path: &Path, name: &str, partial: PartialPerms) -> Result<()>
     Ok(())
 }
 
+fn set_quota(path: &Path, name: &str, bytes: Option<u64>) -> Result<()> {
+    let mut doc = load_existing(path)?;
+    let users = ensure_users_array(&mut doc)?;
+    let idx = find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))?;
+    let entry = users.get_mut(idx).expect("idx in bounds");
+    match bytes {
+        // `quota_bytes` is the schema key on `UserSpec` (Option<u64>,
+        // #[serde(default)]); writing/removing it keeps the file valid
+        // under the server's deny_unknown_fields (#269).
+        Some(n) => {
+            entry.insert("quota_bytes", toml_edit::value(n as i64));
+            write_atomic(path, &doc.to_string())?;
+            println!("Set quota for '{name}' to {n} bytes in {}.", path.display());
+        }
+        None => {
+            entry.remove("quota_bytes");
+            write_atomic(path, &doc.to_string())?;
+            println!(
+                "Cleared quota for '{name}' (now unlimited) in {}.",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn load_existing(path: &Path) -> Result<toml_edit::DocumentMut> {
     let s = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -408,6 +455,11 @@ fn write_atomic(path: &Path, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Round-trip through the server's real config types now that
+    // qftp-protocol is a dependency, so a schema drift (a renamed
+    // permission key, a quota field change) fails these tests at the
+    // exact deny_unknown_fields boundary the server enforces (#269).
+    use qftp_protocol::user::UserConfig;
 
     fn tmp() -> tempfile::TempDir {
         tempfile::TempDir::new().unwrap()
@@ -438,14 +490,13 @@ mod tests {
         assert!(body.contains("write = true"));
         // Round-trip parse with the server's UserConfig to make sure
         // the file is consumable as-is.
-        let cfg: ServerCompatConfig = toml::from_str(&body).unwrap();
+        let cfg: UserConfig = toml::from_str(&body).unwrap();
         assert_eq!(cfg.users.len(), 1);
         assert_eq!(cfg.users[0].name, "alice");
         assert!(cfg.users[0].permissions.write);
 
         remove_user(&p, "alice").unwrap();
-        let cfg: ServerCompatConfig =
-            toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert!(cfg.users.is_empty());
     }
 
@@ -497,8 +548,7 @@ mod tests {
             },
         )
         .unwrap();
-        let cfg: ServerCompatConfig =
-            toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert!(cfg.users[0].permissions.read);
         assert!(cfg.users[0].permissions.write);
     }
@@ -512,26 +562,41 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
-    // Minimal mirror of qftp-server::user::UserConfig so the round-
-    // trip assertion above compiles without a workspace dependency
-    // that would create a cycle. If the server schema changes, this
-    // mirror must follow.
-    #[derive(serde::Deserialize, Default)]
-    struct ServerCompatConfig {
-        #[serde(default)]
-        users: Vec<ServerCompatUser>,
+    #[test]
+    fn set_quota_round_trips_and_clears() {
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        add_user(
+            &p,
+            "alice",
+            None,
+            Perms {
+                read: true,
+                write: true,
+                delete: false,
+                mkdir: false,
+                rmdir: false,
+                rename: false,
+                chmod: false,
+            },
+        )
+        .unwrap();
+        set_quota(&p, "alice", Some(4096)).unwrap();
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(cfg.users[0].quota_bytes, Some(4096));
+        // Clearing removes the key -> unlimited (None).
+        set_quota(&p, "alice", None).unwrap();
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(cfg.users[0].quota_bytes, None);
     }
-    #[derive(serde::Deserialize)]
-    struct ServerCompatUser {
-        name: String,
-        #[serde(default)]
-        permissions: ServerCompatPerms,
-    }
-    #[derive(serde::Deserialize, Default)]
-    struct ServerCompatPerms {
-        #[serde(default)]
-        read: bool,
-        #[serde(default)]
-        write: bool,
+
+    #[test]
+    fn set_quota_missing_user_errors() {
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        let err = set_quota(&p, "ghost", Some(10)).unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }

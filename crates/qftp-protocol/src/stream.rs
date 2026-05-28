@@ -164,6 +164,89 @@ impl Default for TrailerBuf {
     }
 }
 
+/// Why a Put chunk was rejected. Mirrors the `ErrorCode` the drivers
+/// emit, but kept transport-agnostic so the pure classifier in this
+/// crate doesn't depend on the wire `ErrorCode` enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutOverflow {
+    /// Bytes past the declared body arrived but the client did not opt
+    /// into the streaming checksum trailer.
+    BodyExceeded,
+    /// Bytes past the declared body + 32-byte trailer arrived.
+    TrailerExceeded,
+}
+
+/// How a single received Put chunk should be split between the file
+/// body and the streaming-checksum trailer. The pure policy is shared
+/// by the native server (`start_put`/`drive_put`) and the WebTransport
+/// bridge (`route_put_chunk`) so the "what counts as body vs. trailer
+/// vs. overflow" rule has a single source of truth (#269). The drivers
+/// own the actual I/O (writing `to_body` bytes, extending the trailer
+/// buffer); this function only decides the split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutChunkSplit {
+    /// Number of leading chunk bytes that belong to the file body.
+    pub to_body: usize,
+    /// Number of bytes after the body that belong to the trailer.
+    /// Always 0 when `overflow` is set.
+    pub to_trailer: usize,
+}
+
+/// Decide how `chunk_len` received bytes split across the remaining
+/// body and (optionally) the streaming checksum trailer.
+///
+/// * `body_remaining`: declared body bytes not yet received.
+/// * `checksum_trailer`: whether the client opted into the 32-byte
+///   streaming BLAKE3 trailer after the body.
+/// * `trailer_remaining`: trailer bytes the buffer can still accept
+///   (`TrailerBuf::remaining()`); ignored when `checksum_trailer` is
+///   false.
+///
+/// Returns `Ok(split)` describing how many bytes go to the body and how
+/// many to the trailer, or `Err(PutOverflow)` when the chunk carries
+/// more than body (+ trailer) can hold.
+pub fn classify_put_chunk(
+    chunk_len: usize,
+    body_remaining: u64,
+    checksum_trailer: bool,
+    trailer_remaining: usize,
+) -> Result<PutChunkSplit, PutOverflow> {
+    let to_body = (chunk_len as u64).min(body_remaining) as usize;
+    let after_body = chunk_len - to_body;
+    if after_body == 0 {
+        return Ok(PutChunkSplit {
+            to_body,
+            to_trailer: 0,
+        });
+    }
+    if !checksum_trailer {
+        return Err(PutOverflow::BodyExceeded);
+    }
+    if after_body > trailer_remaining {
+        return Err(PutOverflow::TrailerExceeded);
+    }
+    Ok(PutChunkSplit {
+        to_body,
+        to_trailer: after_body,
+    })
+}
+
+/// Determine the checksum a completed Put must verify against, applying
+/// the precedence rule shared by both transports: a fully-received
+/// streaming trailer overrides the legacy header checksum (#269). The
+/// `header_checksum` is used only when no complete trailer is present.
+pub fn resolve_put_checksum(
+    checksum_trailer: bool,
+    trailer: &TrailerBuf,
+    header_checksum: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    if checksum_trailer && trailer.is_full() {
+        Some(trailer.as_array())
+    } else {
+        header_checksum
+    }
+}
+
 /// Incremental re-hash of a resumed upload's on-disk prefix.
 ///
 /// A resume continues an existing `.qftp.partial`; the server must feed
@@ -443,6 +526,74 @@ mod tests {
         drop(state);
         assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn classify_all_body_when_within_remaining() {
+        // chunk fully fits in the body; nothing for the trailer.
+        let s = classify_put_chunk(10, 100, false, 0).unwrap();
+        assert_eq!(s.to_body, 10);
+        assert_eq!(s.to_trailer, 0);
+    }
+
+    #[test]
+    fn classify_overflow_without_trailer() {
+        // 5 bytes past the body and no trailer opted in -> overflow.
+        let e = classify_put_chunk(10, 5, false, 0).unwrap_err();
+        assert_eq!(e, PutOverflow::BodyExceeded);
+    }
+
+    #[test]
+    fn classify_body_then_trailer_split() {
+        // 4 body + 32 trailer in one chunk, trailer mode on.
+        let s = classify_put_chunk(36, 4, true, 32).unwrap();
+        assert_eq!(s.to_body, 4);
+        assert_eq!(s.to_trailer, 32);
+    }
+
+    #[test]
+    fn classify_trailer_overflow() {
+        // body done (0 remaining), 33 trailer bytes but only 32 fit.
+        let e = classify_put_chunk(33, 0, true, 32).unwrap_err();
+        assert_eq!(e, PutOverflow::TrailerExceeded);
+    }
+
+    #[test]
+    fn classify_partial_trailer_fits() {
+        // 16 trailer bytes when 32 remain: accepted, no overflow.
+        let s = classify_put_chunk(16, 0, true, 32).unwrap();
+        assert_eq!(s.to_body, 0);
+        assert_eq!(s.to_trailer, 16);
+    }
+
+    #[test]
+    fn resolve_checksum_trailer_overrides_header() {
+        let mut tb = TrailerBuf::new();
+        tb.extend(&[7u8; 32]);
+        assert!(tb.is_full());
+        let header = Some([1u8; 32]);
+        assert_eq!(
+            resolve_put_checksum(true, &tb, header),
+            Some([7u8; 32]),
+            "a complete trailer must override the header checksum"
+        );
+    }
+
+    #[test]
+    fn resolve_checksum_falls_back_to_header() {
+        // Incomplete trailer -> header checksum is used.
+        let mut tb = TrailerBuf::new();
+        tb.extend(&[7u8; 10]);
+        assert!(!tb.is_full());
+        let header = Some([1u8; 32]);
+        assert_eq!(resolve_put_checksum(true, &tb, header), Some([1u8; 32]));
+        // No trailer mode at all -> header checksum.
+        assert_eq!(
+            resolve_put_checksum(false, &TrailerBuf::new(), header),
+            header
+        );
+        // Neither -> None (verification skipped).
+        assert_eq!(resolve_put_checksum(false, &TrailerBuf::new(), None), None);
     }
 
     #[test]

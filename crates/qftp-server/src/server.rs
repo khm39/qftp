@@ -1751,6 +1751,22 @@ fn drive_one_sender(
     SendOutcome::Finished
 }
 
+/// Map the transport-agnostic [`PutOverflow`] from the shared
+/// classifier (#269) onto the wire `Response::Err` the native server
+/// emits.
+fn put_overflow_err(o: qftp_protocol::stream::PutOverflow) -> Response {
+    use qftp_protocol::stream::PutOverflow;
+    match o {
+        PutOverflow::BodyExceeded => {
+            err(ErrorCode::UploadOverflow, "Upload exceeded declared size")
+        }
+        PutOverflow::TrailerExceeded => err(
+            ErrorCode::UploadOverflow,
+            "Upload exceeded declared size + trailer",
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_put(
     ctx: &mut ConnectionContext,
@@ -2035,40 +2051,28 @@ fn start_put(
         {
             // Bytes coalesced into the same recv as the Put request
             // frame can hold the body *and* the 32-byte streaming
-            // checksum trailer. Split them exactly as `drive_put`'s
-            // Phase A does -- counting the trailer against the body
+            // checksum trailer. Use the shared classifier so the split
+            // policy matches `drive_put`'s Phase A and the web bridge
+            // exactly (#269) -- counting the trailer against the body
             // length would spuriously reject the upload with
             // UploadOverflow (and a checksum_trailer Put always sends
             // that trailer in-band right after the body).
-            let to_take = (leftover.len() as u64).min(*remaining) as usize;
-            let after_body = &leftover[to_take..];
-            if !after_body.is_empty() {
-                match trailer_buf {
-                    Some(buf) => {
-                        let consumed = buf.extend(after_body);
-                        if consumed < after_body.len() {
-                            return fail_stream(
-                                ctx,
-                                stream_id,
-                                metrics,
-                                err(
-                                    ErrorCode::UploadOverflow,
-                                    "Upload exceeded declared size + trailer",
-                                ),
-                            );
-                        }
-                    }
-                    None => {
-                        return fail_stream(
-                            ctx,
-                            stream_id,
-                            metrics,
-                            err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
-                        );
-                    }
+            let trailer_remaining = trailer_buf.as_ref().map(|b| b.remaining()).unwrap_or(0);
+            let split = match qftp_protocol::stream::classify_put_chunk(
+                leftover.len(),
+                *remaining,
+                trailer_buf.is_some(),
+                trailer_remaining,
+            ) {
+                Ok(s) => s,
+                Err(o) => return fail_stream(ctx, stream_id, metrics, put_overflow_err(o)),
+            };
+            if split.to_trailer > 0 {
+                if let Some(buf) = trailer_buf {
+                    buf.extend(&leftover[split.to_body..split.to_body + split.to_trailer]);
                 }
             }
-            let body = &leftover[..to_take];
+            let body = &leftover[..split.to_body];
             if let Some(rh) = rehash {
                 // Resume: the prefix isn't hashed yet, so these body
                 // bytes can't be hashed in order now. Hold them; the
@@ -2086,8 +2090,8 @@ fn start_put(
                     );
                 }
                 hasher.update(body);
-                *remaining -= to_take as u64;
-                metrics.add_bytes_received(to_take as u64);
+                *remaining -= split.to_body as u64;
+                metrics.add_bytes_received(split.to_body as u64);
             }
         }
     }
@@ -2224,33 +2228,31 @@ fn drive_put(
         }
         match conn.stream_recv(stream_id, tmp) {
             Ok((len, fin)) => {
-                let to_take = (len as u64).min(*remaining) as usize;
-                if let Err(e) = writer.write_all(&tmp[..to_take]) {
+                // Shared split policy (#269): body bytes first, the
+                // remainder into the streaming trailer when the client
+                // opted in, overflow otherwise.
+                let trailer_remaining = trailer_buf.as_ref().map(|b| b.remaining()).unwrap_or(0);
+                let split = match qftp_protocol::stream::classify_put_chunk(
+                    len,
+                    *remaining,
+                    trailer_buf.is_some(),
+                    trailer_remaining,
+                ) {
+                    Ok(s) => s,
+                    Err(o) => return Ok(Some(put_overflow_err(o))),
+                };
+                if let Err(e) = writer.write_all(&tmp[..split.to_body]) {
                     return Ok(Some(err(
                         ErrorCode::Internal,
                         format!("Failed to write file: {e}"),
                     )));
                 }
-                hasher.update(&tmp[..to_take]);
-                *remaining -= to_take as u64;
-                metrics.add_bytes_received(to_take as u64);
-                let after_body = len - to_take;
-                if after_body > 0 {
-                    // Bytes past the body. Legitimate only when the
-                    // client opted into the streaming trailer.
+                hasher.update(&tmp[..split.to_body]);
+                *remaining -= split.to_body as u64;
+                metrics.add_bytes_received(split.to_body as u64);
+                if split.to_trailer > 0 {
                     if let Some(buf) = trailer_buf {
-                        let consumed = buf.extend(&tmp[to_take..len]);
-                        if consumed < after_body {
-                            return Ok(Some(err(
-                                ErrorCode::UploadOverflow,
-                                "Upload exceeded declared size + trailer",
-                            )));
-                        }
-                    } else {
-                        return Ok(Some(err(
-                            ErrorCode::UploadOverflow,
-                            "Upload exceeded declared size",
-                        )));
+                        buf.extend(&tmp[split.to_body..split.to_body + split.to_trailer]);
                     }
                 }
                 if fin && *remaining > 0 {
@@ -2314,14 +2316,14 @@ fn drive_put(
             )));
         }
         // Verify checksum before rename -- never reveal a corrupted
-        // body at `final_path`. Trailer takes precedence over the
-        // legacy header checksum when both are present (defensive;
-        // client shouldn't set both).
-        let expected: Option<[u8; 32]> = trailer_buf
-            .as_ref()
-            .filter(|b| b.is_full())
-            .map(|b| b.as_array())
-            .or(*expected_checksum);
+        // body at `final_path`. The shared precedence rule (#269): a
+        // complete streaming trailer overrides the legacy header
+        // checksum when both are present (defensive; client shouldn't
+        // set both).
+        let expected: Option<[u8; 32]> = match trailer_buf.as_ref() {
+            Some(buf) => qftp_protocol::stream::resolve_put_checksum(true, buf, *expected_checksum),
+            None => *expected_checksum,
+        };
         if let Some(expected) = expected {
             let got = *hasher.finalize().as_bytes();
             if got != expected {
