@@ -12,7 +12,7 @@
 //! with absolute paths (the SPA tracks its own location). This lets the
 //! session loop run streams concurrently without a shared, mutable cwd.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -20,8 +20,10 @@ use anyhow::{Context, Result};
 use qftp_common::protocol::{validate_request, ErrorCode, ErrorResponse, Request, Response};
 use qftp_common::transport::{decode_framed_message, MAX_MESSAGE_SIZE};
 use qftp_protocol::handler;
-use qftp_protocol::stream::{temp_path_for, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
-use qftp_protocol::user::User;
+use qftp_protocol::stream::{
+    apply_mode, temp_path_for, TrailerBuf, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+};
+use qftp_protocol::user::{InFlightReservation, User};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use wtransport::{RecvStream, SendStream};
@@ -303,23 +305,27 @@ async fn do_get(
 }
 
 /// Release the in-flight quota reservation and remove the partial temp
-/// file unless the upload committed. Mirrors the `Drop` impl that
-/// `qftp_protocol::stream::StreamState` relies on in the native server.
+/// file unless the upload committed. The in-flight reservation is held
+/// in a shared [`InFlightReservation`] (the same guard the native server
+/// uses); the partial-file cleanup and `used_bytes` accounting below are
+/// web-bridge-specific because, unlike the native server, the bridge has
+/// no upload resume and always removes the partial on abort.
 struct PutGuard {
-    user: Arc<User>,
-    reserved: u64,
+    reservation: InFlightReservation,
     temp_path: Option<PathBuf>,
-    completed: bool,
 }
 
 impl Drop for PutGuard {
     fn drop(&mut self) {
-        if self.completed {
+        // A disarmed reservation means the upload committed: the commit
+        // path already settled both counters, and the embedded
+        // `InFlightReservation::drop` is a no-op.
+        if !self.reservation.is_armed() {
             return;
         }
-        self.user
-            .in_flight_bytes
-            .fetch_sub(self.reserved, Ordering::Relaxed);
+        // Not committed. The embedded `InFlightReservation::drop` (which
+        // runs after this body) releases the in-flight reservation; here
+        // we only handle the on-disk partial.
         if let Some(p) = &self.temp_path {
             // Before removing the partial, charge whatever bytes
             // already landed on disk to `used_bytes`. The web-bridge
@@ -332,6 +338,7 @@ impl Drop for PutGuard {
             // accounting stays at zero. Mirrors
             // `StreamState::ReadingFileData::Drop` in the native
             // server (qftp-protocol/src/stream.rs).
+            let user = self.reservation.user();
             let written = match std::fs::metadata(p) {
                 Ok(m) => m.len(),
                 Err(e) => {
@@ -347,7 +354,7 @@ impl Drop for PutGuard {
                 }
             };
             if written > 0 {
-                self.user.used_bytes.fetch_add(written, Ordering::Relaxed);
+                user.used_bytes.fetch_add(written, Ordering::Relaxed);
             }
             if let Err(e) = std::fs::remove_file(p) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -360,7 +367,7 @@ impl Drop for PutGuard {
                 // check sees the correct on-disk state (the partial
                 // is gone). If the remove failed above, the bytes
                 // stay charged -- which is the safe direction.
-                self.user.used_bytes.fetch_sub(written, Ordering::Relaxed);
+                user.used_bytes.fetch_sub(written, Ordering::Relaxed);
             }
         }
     }
@@ -410,14 +417,11 @@ async fn do_put(
     // *first*, then check the total. A check-then-reserve sequence
     // races: two concurrent uploads can both pass the check before
     // either reservation lands and together overshoot the limit.
-    user.in_flight_bytes.fetch_add(size, Ordering::Relaxed);
     // From here every early return drops `guard`, which releases the
     // reservation and removes the temp file if one was created.
     let mut guard = PutGuard {
-        user: Arc::clone(user),
-        reserved: size,
+        reservation: InFlightReservation::reserve(Arc::clone(user), size),
         temp_path: None,
-        completed: false,
     };
     if let Some(limit) = user.quota_bytes {
         let used = user.used_bytes.load(Ordering::Relaxed);
@@ -556,8 +560,7 @@ async fn do_put(
 
     let mut hasher = blake3::Hasher::new();
     let mut body_remaining = size;
-    let mut trailer = [0u8; 32];
-    let mut trailer_filled = 0usize;
+    let mut trailer_buf = TrailerBuf::new();
 
     // Route the bytes that arrived alongside the request frame, then
     // keep reading until the body and (when requested) the 32-byte
@@ -567,8 +570,7 @@ async fn do_put(
         &mut file,
         &mut hasher,
         &mut body_remaining,
-        &mut trailer,
-        &mut trailer_filled,
+        &mut trailer_buf,
         checksum_trailer,
     )
     .await?
@@ -576,7 +578,7 @@ async fn do_put(
         return reply_err(send, e).await;
     }
     let mut tmp = vec![0u8; FILE_CHUNK_SIZE];
-    while body_remaining > 0 || (checksum_trailer && trailer_filled < 32) {
+    while body_remaining > 0 || (checksum_trailer && !trailer_buf.is_full()) {
         let n = match recv.read(&mut tmp).await.context("stream read failed")? {
             Some(0) => {
                 // A zero-length read on an open stream is anomalous --
@@ -608,8 +610,7 @@ async fn do_put(
             &mut file,
             &mut hasher,
             &mut body_remaining,
-            &mut trailer,
-            &mut trailer_filled,
+            &mut trailer_buf,
             checksum_trailer,
         )
         .await?
@@ -624,8 +625,8 @@ async fn do_put(
     // Verify the checksum before the rename: a corrupt body must never
     // become visible at `final_path`. A streamed trailer takes
     // precedence over the legacy header checksum when both are present.
-    let expected = if checksum_trailer && trailer_filled == 32 {
-        Some(trailer)
+    let expected = if checksum_trailer && trailer_buf.is_full() {
+        Some(trailer_buf.as_array())
     } else {
         expected_checksum
     };
@@ -663,10 +664,11 @@ async fn do_put(
             std::fs::rename(&temp_for_commit, &final_for_commit).map_err(|e| {
                 ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}"))
             })?;
-            // apply_mode_sync logs and continues on failure (matches
-            // the native server); never bubbles an error so we can't
-            // leave an orphan file at final_path after rename.
-            apply_mode_sync(&final_for_commit, mode);
+            // apply_mode logs and continues on failure; never bubbles an
+            // error so we can't leave an orphan file at final_path after
+            // rename. The suid-stripping policy is shared with the native
+            // server (qftp_protocol::stream::apply_mode).
+            apply_mode(&final_for_commit, mode);
             Ok(())
         }),
         "do_put commit",
@@ -676,9 +678,10 @@ async fn do_put(
         return reply_err(send, e).await;
     }
 
-    // The upload committed: stop the guard from undoing it, then hand
-    // the reservation over to the persistent used-bytes counter.
-    guard.completed = true;
+    // The upload committed: disarm the guard so its drop won't undo it,
+    // then hand the reservation over to the persistent used-bytes
+    // counter.
+    guard.reservation.disarm();
     user.in_flight_bytes.fetch_sub(size, Ordering::Relaxed);
     user.used_bytes.fetch_add(size, Ordering::Relaxed);
 
@@ -690,14 +693,12 @@ async fn do_put(
 /// full, into the 32-byte BLAKE3 trailer buffer. Returns `Ok(Some(_))`
 /// for a protocol error (the caller turns it into an error response),
 /// `Ok(None)` on success, and `Err` for an I/O failure.
-#[allow(clippy::too_many_arguments)]
 async fn route_put_chunk(
     chunk: &[u8],
     file: &mut tokio::fs::File,
     hasher: &mut blake3::Hasher,
     body_remaining: &mut u64,
-    trailer: &mut [u8; 32],
-    trailer_filled: &mut usize,
+    trailer_buf: &mut TrailerBuf,
     checksum_trailer: bool,
 ) -> Result<Option<ErrorResponse>> {
     let to_body = (chunk.len() as u64).min(*body_remaining) as usize;
@@ -718,46 +719,16 @@ async fn route_put_chunk(
             "Upload exceeded declared size",
         )));
     }
-    if rest.len() > 32 - *trailer_filled {
+    // `extend` caps at the 32-byte trailer; a short consume means the
+    // peer sent more than body + trailer.
+    if trailer_buf.extend(rest) < rest.len() {
         return Ok(Some(ErrorResponse::new(
             ErrorCode::UploadOverflow,
             "Upload exceeded declared size + trailer",
         )));
     }
-    trailer[*trailer_filled..*trailer_filled + rest.len()].copy_from_slice(rest);
-    *trailer_filled += rest.len();
     Ok(None)
 }
-
-/// Apply the client-requested mode, stripping suid/sgid/sticky bits so
-/// an upload can't plant a setuid primitive inside the served tree.
-/// Synchronous: called from inside the commit `spawn_blocking` block
-/// so it executes back-to-back with the rename, with no await between.
-///
-/// Failures here are logged at warn! and the upload still completes
-/// successfully -- matching the native server's `apply_mode`
-/// (server.rs ~2270). Bubbling the error up would leave the renamed
-/// file at `final_path` (rename already succeeded) with the temp's
-/// 0o600 mode and no quota charge, because the surrounding
-/// `PutGuard::drop` is unable to recover the file once rename has
-/// moved it. Logging-and-continuing keeps server-side state
-/// consistent and the user's file accessible at the cost of an
-/// (rare) wrong-mode landing.
-#[cfg(unix)]
-fn apply_mode_sync(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(mode & 0o0777);
-    if let Err(e) = std::fs::set_permissions(path, perms) {
-        tracing::warn!(
-            path = %path.display(),
-            error = %e,
-            "apply_mode_sync: set_permissions failed; file landed with the temp's 0o600 mode",
-        );
-    }
-}
-
-#[cfg(not(unix))]
-fn apply_mode_sync(_path: &Path, _mode: u32) {}
 
 /// Await a `tokio::task::JoinHandle` and turn a panic payload into a
 /// readable error string. The default `JoinError::Display` produces
@@ -783,4 +754,74 @@ pub async fn await_blocking<T: Send + 'static>(
 }
 
 // `temp_path_for` lives in `qftp_protocol::stream` and is tested
-// there (cycle-2 review #14). No test module needed in this file.
+// there (cycle-2 review #14).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qftp_protocol::user::Permissions;
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex;
+
+    fn test_user() -> Arc<User> {
+        Arc::new(User {
+            name: "t".to_string(),
+            home: PathBuf::from("/tmp"),
+            permissions: Permissions::full(),
+            quota_bytes: Some(1_000_000),
+            used_bytes: AtomicU64::new(0),
+            in_flight_bytes: AtomicU64::new(0),
+            active_uploads: Mutex::new(HashSet::new()),
+        })
+    }
+
+    fn partial_with(dir: &std::path::Path, bytes: usize) -> PathBuf {
+        let p = dir.join("upload.qftp.partial");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&vec![0u8; bytes]).unwrap();
+        p
+    }
+
+    // An aborted upload must release the in-flight reservation and, after
+    // removing the partial it cleaned up, leave `used_bytes` unchanged
+    // (charged, then refunded once the file is gone).
+    #[test]
+    fn abort_releases_reservation_and_removes_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        let temp = partial_with(dir.path(), 600);
+        let guard = PutGuard {
+            reservation: InFlightReservation::reserve(Arc::clone(&user), 600),
+            temp_path: Some(temp.clone()),
+        };
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 600);
+        drop(guard);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
+        assert!(!temp.exists(), "aborted partial should be removed");
+    }
+
+    // A committed upload disarms the guard; its drop must touch neither
+    // counter (the commit path already settled them) nor the file.
+    #[test]
+    fn committed_guard_drop_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user();
+        let temp = partial_with(dir.path(), 600);
+        let mut guard = PutGuard {
+            reservation: InFlightReservation::reserve(Arc::clone(&user), 600),
+            temp_path: Some(temp.clone()),
+        };
+        // Simulate the commit path: disarm the reservation, then hand the
+        // reserved bytes over to the persistent counter.
+        guard.reservation.disarm();
+        user.in_flight_bytes.fetch_sub(600, Ordering::Relaxed);
+        user.used_bytes.fetch_add(600, Ordering::Relaxed);
+        drop(guard);
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 600);
+        assert!(temp.exists(), "committed file must not be removed");
+    }
+}
