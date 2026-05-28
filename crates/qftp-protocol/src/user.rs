@@ -937,6 +937,95 @@ mod tests {
         assert_eq!(user.current_usage(), 100);
     }
 
+    /// Two users with equal homes share their on-disk tree but
+    /// keep independent `AtomicU64` quota caches, so each can
+    /// silently exceed quota. Regression test for the cycle-6 P3
+    /// fix: `from_config` must reject overlapping homes at parse
+    /// time.
+    #[test]
+    fn from_config_rejects_equal_homes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![
+                UserSpec {
+                    name: "alice".to_string(),
+                    home: Some(PathBuf::from("shared")),
+                    permissions: Permissions::full(),
+                    quota_bytes: None,
+                },
+                UserSpec {
+                    name: "bob".to_string(),
+                    home: Some(PathBuf::from("shared")),
+                    permissions: Permissions::full(),
+                    quota_bytes: None,
+                },
+            ],
+        };
+        let err = UserDirectory::from_config(tmp.path(), cfg)
+            .err()
+            .expect("expected overlap rejection");
+        assert!(err.to_string().contains("overlap"), "unexpected: {err}");
+    }
+
+    /// Nested homes (`data` and `data/sub`) silently share storage
+    /// too -- a Put under `data/sub` updates only that user's
+    /// counter while `data`'s view diverges. Reject nesting.
+    #[test]
+    fn from_config_rejects_nested_homes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![
+                UserSpec {
+                    name: "outer".to_string(),
+                    home: Some(PathBuf::from("data")),
+                    permissions: Permissions::full(),
+                    quota_bytes: None,
+                },
+                UserSpec {
+                    name: "inner".to_string(),
+                    home: Some(PathBuf::from("data/sub")),
+                    permissions: Permissions::full(),
+                    quota_bytes: None,
+                },
+            ],
+        };
+        let err = UserDirectory::from_config(tmp.path(), cfg)
+            .err()
+            .expect("expected nested-home rejection");
+        assert!(err.to_string().contains("overlap"), "unexpected: {err}");
+    }
+
+    /// Sibling homes that share a common prefix as bytes but
+    /// differ at a path boundary (`data` vs `data2`) must NOT be
+    /// flagged as overlapping. Verifies the check uses
+    /// `Path::starts_with` semantics (component-aware), not raw
+    /// byte-prefix comparison.
+    #[test]
+    fn from_config_accepts_sibling_homes_with_shared_byte_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![
+                UserSpec {
+                    name: "a".to_string(),
+                    home: Some(PathBuf::from("data")),
+                    permissions: Permissions::full(),
+                    quota_bytes: None,
+                },
+                UserSpec {
+                    name: "b".to_string(),
+                    home: Some(PathBuf::from("data2")),
+                    permissions: Permissions::full(),
+                    quota_bytes: None,
+                },
+            ],
+        };
+        UserDirectory::from_config(tmp.path(), cfg)
+            .expect("siblings differing at a path boundary must be accepted");
+    }
+
     #[test]
     fn from_config_rejects_absolute_home_outside_root() {
         // Even an absolute home must canonicalize to inside the
@@ -1042,6 +1131,44 @@ mod tests {
     fn extract_identity_candidates_returns_empty_on_garbage() {
         assert!(extract_identity_candidates(&[]).is_empty());
         assert!(extract_identity_candidates(b"not a cert").is_empty());
+    }
+
+    /// A CN containing ASCII control bytes (here, `\n`) must NOT
+    /// surface in the identity list -- otherwise the `tracing!`
+    /// call at server.rs upgrade_user_from_cert would let a peer
+    /// cert forge log lines (log-injection). Regression test for
+    /// the cycle-6 P2 fix. We post-process the rcgen-generated DER
+    /// to splice a `\n` into the CN string the encoder produced;
+    /// rcgen rejects control chars at construction time, so we
+    /// can't ask it to build one for us directly.
+    #[test]
+    fn extract_identity_candidates_rejects_control_chars_in_cn() {
+        // Cleanly built cert with a placeholder CN, then patch a
+        // single byte to a `\n` (0x0A) so the parser still parses
+        // but the identity contains a control char. The placeholder
+        // is unique enough that we can find it in the DER.
+        let placeholder = "X-CN-PATCH-TARGET-X";
+        let mut der = make_cert_with_identities(placeholder, &[], &[], &[]);
+        let needle = placeholder.as_bytes();
+        let pos = der
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("placeholder must appear once in the DER");
+        // Overwrite the first byte with 0x0A (LF). Self-signed
+        // certs aren't re-verified by extract_identity_candidates,
+        // so corrupting the body is safe for this test.
+        der[pos] = 0x0A;
+        let ids = extract_identity_candidates(&der);
+        // The patched CN must NOT survive the control-byte filter.
+        // (The substring matches the patched form, not the
+        // original placeholder, but either way we want the LF
+        // string out.)
+        for id in &ids {
+            assert!(
+                !id.as_bytes().iter().any(|b| *b < 0x20 || *b == 0x7f),
+                "control-char identity leaked into output: {id:?}",
+            );
+        }
     }
 
     fn directory_with(users: &[&str]) -> UserDirectory {
