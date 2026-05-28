@@ -32,6 +32,15 @@ pub struct ConnectionContext {
     /// stored under in the connection table. Held here so an offloaded
     /// handler job can be routed back to this connection (H-1).
     pub scid: quiche::ConnectionId<'static>,
+    /// Monotonic generation assigned at accept time. `derive_scid` is
+    /// deterministic and (with `require_retry=false`) the client
+    /// controls its DCID, so a reaped connection's SCID can be re-derived
+    /// for a brand-new connection. A `HandlerResult` carries the
+    /// generation of the connection that dispatched it; on apply we
+    /// discard it if the live connection's generation differs, so a
+    /// delayed response can't be misdelivered to the resurrected SCID
+    /// (L-6).
+    pub generation: u64,
     /// True while a generic handler request for this connection is
     /// running on a worker thread. Generic requests are processed one
     /// at a time per connection so `cwd` updates from `Cd` stay
@@ -48,6 +57,7 @@ impl ConnectionContext {
         peer_addr: SocketAddr,
         user: Arc<User>,
         scid: quiche::ConnectionId<'static>,
+        generation: u64,
     ) -> Self {
         let cwd = user.home.clone();
         Self {
@@ -58,6 +68,7 @@ impl ConnectionContext {
             streams: HashMap::new(),
             created_at: Instant::now(),
             scid,
+            generation,
             handler_in_flight: false,
             pending_handler_jobs: VecDeque::new(),
         }

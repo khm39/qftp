@@ -123,6 +123,8 @@ pub struct ServerConfig {
 /// execution (H-1).
 struct HandlerJob {
     conn_key: quiche::ConnectionId<'static>,
+    /// Generation of the connection that dispatched this job (L-6).
+    generation: u64,
     stream_id: u64,
     req: Request,
     cwd: PathBuf,
@@ -132,6 +134,10 @@ struct HandlerJob {
 /// The result of a `HandlerJob`, routed back to the event loop.
 struct HandlerResult {
     conn_key: quiche::ConnectionId<'static>,
+    /// Echoed from the originating `HandlerJob`; compared against the
+    /// live connection's generation on apply to drop a response that
+    /// would otherwise be misdelivered to a resurrected SCID (L-6).
+    generation: u64,
     stream_id: u64,
     response: Response,
     /// `cwd` after running the request -- changed only by `Cd`.
@@ -139,6 +145,14 @@ struct HandlerResult {
     /// The user the job ran as. Used to detect a mid-flight auth
     /// upgrade so a stale `cwd` doesn't clobber the upgraded one.
     user: Arc<User>,
+}
+
+/// True when a completed handler result belongs to an older generation
+/// than the connection currently occupying its SCID -- i.e. the
+/// dispatching connection was reaped and a new one resurrected the
+/// (deterministic) SCID before the response came back (L-6).
+fn handler_result_is_stale(ctx_generation: u64, result_generation: u64) -> bool {
+    ctx_generation != result_generation
 }
 
 /// Pool of worker threads that execute blocking filesystem requests
@@ -239,6 +253,7 @@ fn handler_worker(
             }
         };
         let conn_key = job.conn_key.clone();
+        let generation = job.generation;
         let stream_id = job.stream_id;
         let user = Arc::clone(&job.user);
         let req_dbg = format!("{:?}", job.req);
@@ -294,6 +309,7 @@ fn handler_worker(
         };
         let result = HandlerResult {
             conn_key,
+            generation,
             stream_id,
             response,
             new_cwd,
@@ -401,6 +417,7 @@ fn dispatch_handler_job(
 ) {
     let job = HandlerJob {
         conn_key: ctx.scid.clone(),
+        generation: ctx.generation,
         stream_id,
         req,
         cwd: ctx.cwd.clone(),
@@ -470,6 +487,17 @@ fn apply_handler_result(
         // Connection was reaped while the job ran; drop the response.
         return;
     };
+    // The SCID lookup can succeed against a *different* connection that
+    // reused the same deterministic SCID after the original was reaped
+    // (L-6). Drop the stale response rather than misdeliver it on the
+    // resurrected connection's stream.
+    if handler_result_is_stale(ctx.generation, result.generation) {
+        debug!(
+            stream_id = result.stream_id,
+            "dropping handler result from a reaped connection generation"
+        );
+        return;
+    }
     // Commit the cwd only if the connection still belongs to the same
     // user. A handshake completing mid-flight can upgrade the user (and
     // reset cwd to the authenticated home); a stale anonymous cwd must
@@ -529,6 +557,10 @@ pub fn run(
 
     // Connection table keyed by the SCID we issued (= derive_scid(seed, dcid)).
     let mut connections: HashMap<quiche::ConnectionId<'static>, ConnectionContext> = HashMap::new();
+    // Monotonic generation handed to each accepted connection so a
+    // delayed handler response can't be misdelivered to a different
+    // connection that later reused the same (deterministic) SCID (L-6).
+    let mut next_generation: u64 = 0;
 
     let mut buf = [0u8; 65536];
     let mut out_pkt = [0u8; 1350];
@@ -667,6 +699,7 @@ pub fn run(
                 metrics: &metrics,
                 rng: &rng,
                 socket: &socket,
+                next_generation: &mut next_generation,
             };
             // An accept-time failure (a transient UDP send error while
             // issuing a RETRY, a quiche::accept rejection) must stay
@@ -789,6 +822,9 @@ struct AcceptCtx<'a> {
     metrics: &'a Metrics,
     rng: &'a ring::rand::SystemRandom,
     socket: &'a mio::net::UdpSocket,
+    /// Monotonic source for per-connection generations (L-6). Bumped
+    /// only when a connection is actually inserted into the table.
+    next_generation: &'a mut u64,
 }
 
 fn try_accept(
@@ -905,21 +941,24 @@ fn try_accept(
         return Ok(());
     }
 
-    // mTLS identity isn't ready until the handshake completes; start the
-    // connection as the anonymous user and upgrade later if we can.
-    let ctx = ConnectionContext::new(conn, from, ax.users.anonymous(), scid.clone());
-
     // If a previous Initial from this peer already created the slot
     // (the deterministic SCID collapses retransmits onto the same key),
     // just drop the duplicate accept. The slot drops here, releasing
     // the duplicate count so a retransmitted Initial that derives the
     // same SCID doesn't leak a `connections_open` gauge unit for a
     // `ConnectionContext` that is dropped here and never enters the
-    // `connections` map.
+    // `connections` map. Checked before constructing the context so the
+    // duplicate path doesn't burn a generation.
     if ax.connections.contains_key(&scid) {
         // `slot` drops here -> release happens automatically.
         return Ok(());
     }
+    // Assign this connection's generation and advance the source (L-6).
+    let generation = *ax.next_generation;
+    *ax.next_generation = ax.next_generation.wrapping_add(1);
+    // mTLS identity isn't ready until the handshake completes; start the
+    // connection as the anonymous user and upgrade later if we can.
+    let ctx = ConnectionContext::new(conn, from, ax.users.anonymous(), scid.clone(), generation);
     info!(peer = %from, "connection accepted");
     // Order: insert FIRST so the metrics gauge and the cap counter
     // both reflect a live map entry. If `connections.insert` panics
@@ -975,7 +1014,15 @@ fn send_retry(
     out: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<bool> {
     let mut new_scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-    ring::rand::SecureRandom::fill(rng, &mut new_scid_bytes).expect("system RNG failed");
+    // This runs once per unauthenticated peer's first Initial. A
+    // transient system-RNG failure must not panic the whole server on
+    // that hostile-controlled path (L-4): drop the packet and report
+    // "no retry emitted", mirroring the `mint` None branch below. The
+    // peer simply retransmits its Initial and we try again.
+    if ring::rand::SecureRandom::fill(rng, &mut new_scid_bytes).is_err() {
+        warn!(peer = %from, "send_retry: system RNG failed; dropping Initial without retry");
+        return Ok(false);
+    }
     let new_scid = quiche::ConnectionId::from_ref(&new_scid_bytes);
     // quiche v0.24 does NOT enforce a minimum DCID length on Initial
     // parse. The pre-rate-limit check in `try_accept` filters these
@@ -2424,6 +2471,16 @@ fn open_temp(path: &Path, resume: bool) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handler_result_stale_across_generations() {
+        // A result whose generation matches the live connection applies;
+        // a mismatch (the SCID was reused by a newer connection) is
+        // stale and must be dropped (L-6).
+        assert!(!handler_result_is_stale(7, 7));
+        assert!(handler_result_is_stale(8, 7));
+        assert!(handler_result_is_stale(7, 8));
+    }
 
     #[test]
     fn half_open_expired_reaps_unestablished_after_timeout() {
