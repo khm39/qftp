@@ -25,7 +25,7 @@ use qftp_protocol::stream::{
 };
 use qftp_protocol::user::{InFlightReservation, User};
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wtransport::{RecvStream, SendStream};
 
 /// Handle one WebTransport bidirectional stream. Errors are logged
@@ -268,11 +268,6 @@ async fn do_get(
     let to_send = length.map_or(remaining, |n| n.min(remaining));
 
     let mut file = tokio::fs::File::from_std(std_file);
-    if offset > 0 {
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .with_context(|| format!("seek to offset {offset}"))?;
-    }
 
     send_framed(
         send,
@@ -286,6 +281,20 @@ async fn do_get(
 
     let mut hasher = blake3::Hasher::new();
     let mut chunk = vec![0u8; SEND_CHUNK_SIZE];
+    // Re-hash the [0..offset) prefix into the trailer hasher so a resumed
+    // Get sends a whole-file BLAKE3, matching the native server and what
+    // the native client verifies its local prefix against (#221). The
+    // prefix read also leaves the file positioned at `offset`, so the body
+    // loop below streams from there without a separate seek.
+    let mut prefix_remaining = offset;
+    while prefix_remaining > 0 {
+        let want = (prefix_remaining as usize).min(chunk.len());
+        file.read_exact(&mut chunk[..want])
+            .await
+            .context("prefix re-hash read failed")?;
+        hasher.update(&chunk[..want]);
+        prefix_remaining -= want as u64;
+    }
     let mut sent = 0u64;
     while sent < to_send {
         let want = ((to_send - sent) as usize).min(chunk.len());

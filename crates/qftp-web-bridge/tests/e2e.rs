@@ -160,6 +160,27 @@ async fn get(conn: &Connection, path: &str) -> (Response, Vec<u8>) {
     )
 }
 
+/// Like [`get`] but resumes from `offset`, exercising the whole-file
+/// BLAKE3 trailer path for a partial download.
+async fn get_at(conn: &Connection, path: &str, offset: u64) -> (Response, Vec<u8>) {
+    let (mut send, mut recv) = open_bi(conn).await;
+    let req = Request::Get {
+        path: path.to_string(),
+        offset,
+        length: None,
+    };
+    send.write_all(&frame(&bincode::serialize(&req).unwrap()))
+        .await
+        .expect("write get");
+    send.finish().await.expect("finish get");
+    let data = read_to_end(&mut recv).await;
+    let (payload, rest) = split_frame(&data);
+    (
+        bincode::deserialize(&payload).expect("decode get response"),
+        rest,
+    )
+}
+
 fn expect_ok(resp: Response, ctx: &str) {
     match resp {
         Response::Ok => {}
@@ -355,6 +376,36 @@ async fn end_to_end_webtransport() {
             );
         }
         other => panic!("get: expected FileReady, got {other:?}"),
+    }
+
+    // Resumed get (offset > 0) -- the body is the [offset..] suffix but the
+    // trailer must be the WHOLE-file BLAKE3 (the prefix re-hashed), so the
+    // native client can verify its local [0..offset) prefix against it
+    // (#265). The old code hashed only the suffix, which always mismatched.
+    {
+        let offset = (body.len() / 3) as u64;
+        let (resp, rest) = get_at(&alice, "/sub/big.bin", offset).await;
+        match resp {
+            Response::FileReady {
+                size, total_size, ..
+            } => {
+                let size = size as usize;
+                assert_eq!(total_size, body.len() as u64, "resumed get total_size");
+                assert_eq!(size, body.len() - offset as usize, "resumed get size");
+                assert_eq!(rest.len(), size + 32, "resumed body + trailer length");
+                assert_eq!(
+                    &rest[..size],
+                    &body[offset as usize..],
+                    "resumed body must be the [offset..] suffix"
+                );
+                assert_eq!(
+                    &rest[size..size + 32],
+                    blake3::hash(&body).as_bytes(),
+                    "resumed get must send whole-file BLAKE3, not suffix-only"
+                );
+            }
+            other => panic!("resumed get: expected FileReady, got {other:?}"),
+        }
     }
 
     // A wrong header checksum must be refused and must not appear on disk.
