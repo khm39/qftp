@@ -942,6 +942,18 @@ fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<Stri
             if entry.is_dir {
                 queue.push((remote_child, local_child));
             } else {
+                // Same existing-destination guard as `do_mget`: never
+                // resume/append onto an already-present local name.
+                // `do_get` appends to whatever bytes are there and
+                // deletes the file on a trailer mismatch, so a same-named
+                // but unrelated local file would be destroyed. Use
+                // `symlink_metadata` so the decision is about the local
+                // *name* (a symlink occupies it too) rather than its
+                // target.
+                if std::fs::symlink_metadata(&local_child).is_ok() {
+                    println!("get: skipping {remote_child} (local file exists)");
+                    continue;
+                }
                 if let Err(e) = transfer::do_get(session, &remote_child, &local_child) {
                     println!("get {} failed: {e}", remote_child);
                 }
@@ -951,22 +963,39 @@ fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<Stri
     Ok(())
 }
 
-/// Walk a local directory and upload every regular file under it,
-/// mirroring its structure under `remote_root`.
-fn do_recursive_put(session: &mut Session, local: &Path, remote_root: &str) -> Result<()> {
-    if !local.is_dir() {
-        // -r on a file degrades to a normal put.
-        let stream_id = session.take_stream();
-        return transfer::do_put(session, stream_id, local, remote_root, 0, false);
-    }
-    // Ensure top-level mkdir.
-    let _ = session.request_response(&Request::Mkdir {
-        path: remote_root.to_string(),
-    })?;
+/// A single planned operation in a recursive upload, in the order it
+/// must be issued so that a directory always exists before its
+/// children are uploaded into it.
+#[derive(Debug, PartialEq, Eq)]
+enum PutOp {
+    Mkdir(String),
+    PutFile { local: PathBuf, remote: String },
+}
 
-    // BFS local.
+/// Visit cap shared with `do_recursive_get`'s `MAX_REMOTE_DIRS`: a
+/// symlink cycle (`dir/loop -> .`) or a pathologically deep tree must
+/// terminate with a clear error instead of recursing without bound.
+const MAX_LOCAL_DIRS: usize = 10_000;
+
+/// Walk `local` and produce the ordered upload plan for `remote_root`,
+/// skipping symlinks and bounding the number of directories visited.
+///
+/// Pure (no network): the side effects of `do_recursive_put` are the
+/// `Mkdir`/`Put` requests it issues, and those map one-to-one onto the
+/// returned `Vec`, so the cycle-termination and symlink-exclusion
+/// behaviour is testable against a real on-disk tree.
+fn plan_recursive_put(local: &Path, remote_root: &str) -> Result<Vec<PutOp>> {
+    let mut ops = vec![PutOp::Mkdir(remote_root.to_string())];
     let mut queue: Vec<(PathBuf, String)> = vec![(local.to_path_buf(), remote_root.to_string())];
+    let mut visited: usize = 0;
     while let Some((dir, rremote)) = queue.pop() {
+        visited += 1;
+        if visited > MAX_LOCAL_DIRS {
+            anyhow::bail!(
+                "recursive put aborted: local directory tree too large \
+                 or cyclic (exceeded {MAX_LOCAL_DIRS} directories)"
+            );
+        }
         let read = match std::fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
@@ -979,19 +1008,119 @@ fn do_recursive_put(session: &mut Session, local: &Path, remote_root: &str) -> R
             let name = entry.file_name();
             let name_str = name.to_string_lossy().into_owned();
             let remote_child = join_remote(&rremote, Path::new(&name_str));
-            if path.is_dir() {
-                let _ = session.request_response(&Request::Mkdir {
-                    path: remote_child.clone(),
-                })?;
+            // Use the entry's own file type (a no-follow lstat) rather
+            // than `path.is_dir()`, which follows symlinks: a symlink
+            // pointing at a directory (or an ancestor, forming a cycle)
+            // would otherwise be descended into. Skip symlinks entirely
+            // so the walk stays within the real on-disk tree.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => {
+                    println!("stat {} failed: {e}", path.display());
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                println!("put: skipping symlink {}", path.display());
+                continue;
+            }
+            if file_type.is_dir() {
+                ops.push(PutOp::Mkdir(remote_child.clone()));
                 queue.push((path, remote_child));
             } else {
+                ops.push(PutOp::PutFile {
+                    local: path,
+                    remote: remote_child,
+                });
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// Walk a local directory and upload every regular file under it,
+/// mirroring its structure under `remote_root`.
+fn do_recursive_put(session: &mut Session, local: &Path, remote_root: &str) -> Result<()> {
+    if !local.is_dir() {
+        // -r on a file degrades to a normal put.
+        let stream_id = session.take_stream();
+        return transfer::do_put(session, stream_id, local, remote_root, 0, false);
+    }
+
+    for op in plan_recursive_put(local, remote_root)? {
+        match op {
+            PutOp::Mkdir(path) => {
+                let _ = session.request_response(&Request::Mkdir { path })?;
+            }
+            PutOp::PutFile { local, remote } => {
                 let stream_id = session.take_stream();
-                if let Err(e) = transfer::do_put(session, stream_id, &path, &remote_child, 0, false)
-                {
-                    println!("put {} failed: {e}", path.display());
+                if let Err(e) = transfer::do_put(session, stream_id, &local, &remote, 0, false) {
+                    println!("put {} failed: {e}", local.display());
                 }
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_recursive_put, PutOp};
+    use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_put_terminates_on_symlink_cycle() {
+        // #267: a self-referential symlink (`dir/loop -> .`) used to make
+        // the BFS recurse without bound because `path.is_dir()` follows
+        // the link. The walk must now skip the symlink and finish.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("data");
+        fs::create_dir_all(&root).expect("mkdir root");
+        fs::write(root.join("file.txt"), b"hello").expect("write file");
+        std::os::unix::fs::symlink(&root, root.join("loop")).expect("symlink");
+
+        let ops = plan_recursive_put(&root, "/remote").expect("plan must terminate");
+
+        // The symlink is never descended into and never uploaded.
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                PutOp::PutFile { remote, .. } if remote.contains("loop")
+            )),
+            "symlink should be skipped: {ops:?}"
+        );
+        // The single real file is planned exactly once.
+        let file_puts = ops
+            .iter()
+            .filter(
+                |op| matches!(op, PutOp::PutFile { remote, .. } if remote.ends_with("file.txt")),
+            )
+            .count();
+        assert_eq!(file_puts, 1, "real file uploaded exactly once: {ops:?}");
+    }
+
+    #[test]
+    fn recursive_put_plans_dirs_before_their_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("data");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).expect("mkdir sub");
+        fs::write(sub.join("nested.txt"), b"x").expect("write nested");
+
+        let ops = plan_recursive_put(&root, "/remote").expect("plan");
+
+        let mkdir_sub = ops
+            .iter()
+            .position(|op| matches!(op, PutOp::Mkdir(p) if p == "/remote/sub"));
+        let put_nested = ops.iter().position(
+            |op| matches!(op, PutOp::PutFile { remote, .. } if remote == "/remote/sub/nested.txt"),
+        );
+        let (m, p) = (
+            mkdir_sub.expect("mkdir for sub planned"),
+            put_nested.expect("put for nested file planned"),
+        );
+        assert!(m < p, "mkdir must precede the put into it: {ops:?}");
+        assert_eq!(ops.first(), Some(&PutOp::Mkdir("/remote".to_string())));
+    }
 }
