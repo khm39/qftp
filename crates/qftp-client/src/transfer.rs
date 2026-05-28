@@ -14,11 +14,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
-use crate::proto::{poll_response, poll_response_with_buf, take_stream};
+use crate::proto::Session;
 
 const CHUNK: usize = 64 * 1024;
 
@@ -175,29 +174,21 @@ fn make_bar(total: u64, label: &str) -> ProgressBar {
 /// Download `remote` to `local`. If `local` already exists, resume from
 /// its current length. Verifies the server-supplied BLAKE3 trailer once
 /// the body is fully received and refuses to keep the file on mismatch.
-pub fn do_get(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
-    remote: &str,
-    local: &Path,
-) -> Result<()> {
+pub fn do_get(session: &mut Session, remote: &str, local: &Path) -> Result<()> {
     // Parent span for the whole download so structured logs group the
     // FileReady / chunk / verify events under a single (op=get,
     // path=...) header.
     let _span = tracing::info_span!("transfer", op = "get", path = %remote).entered();
-    let stream_id = take_stream(next_stream_id);
-    let mut result = do_get_inner(conn, socket, poll, events, stream_id, remote, local);
+    let stream_id = session.take_stream();
+    let mut result = do_get_inner(session, stream_id, remote, local);
     // A resumed download whose local partial is longer than the (now
     // shorter) remote file is refused with InvalidRange; `do_get_inner`
     // deletes the stale local file and signals `StalePartial`. Retry
     // once from scratch on a fresh stream so the transfer isn't stuck
     // failing forever on the leftover partial.
     if result.as_ref().is_err_and(|e| e.is::<StalePartial>()) {
-        let stream_id = take_stream(next_stream_id);
-        result = do_get_inner(conn, socket, poll, events, stream_id, remote, local);
+        let stream_id = session.take_stream();
+        result = do_get_inner(session, stream_id, remote, local);
     }
     if let Err(e) = &result {
         if !e.is::<StalePartial>() {
@@ -208,10 +199,7 @@ pub fn do_get(
 }
 
 fn do_get_inner(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
+    session: &mut Session,
     stream_id: u64,
     remote: &str,
     local: &Path,
@@ -226,9 +214,9 @@ fn do_get_inner(
         offset: resume_offset,
         length: None,
     };
-    send_message(conn, stream_id, &req)?;
-    stream_send_all(conn, stream_id, &[], true)?;
-    flush_egress(conn, socket)?;
+    send_message(session.conn, stream_id, &req)?;
+    stream_send_all(session.conn, stream_id, &[], true)?;
+    flush_egress(session.conn, session.socket)?;
 
     // The FileReady response and the first chunk of body bytes can be
     // pulled off the stream together; capture whatever recv_message
@@ -236,7 +224,7 @@ fn do_get_inner(
     // consume it before going back to stream_recv. For tiny files the
     // entire body + trailer + FIN often arrives in the same ingress.
     let mut carryover: Vec<u8> = Vec::new();
-    let resp = poll_response_with_buf(conn, socket, poll, events, stream_id, &mut carryover)?;
+    let resp = session.poll_response_with_buf(stream_id, &mut carryover)?;
     let (size, total_size, checksum_follows) = match resp {
         Response::FileReady {
             size,
@@ -352,11 +340,11 @@ fn do_get_inner(
         // one in `poll_response_with_buf`); the response was sitting
         // on the stream and the kernel UDP buffer was empty, so
         // epoll had no edge event to fire.
-        handle_ingress(conn, socket, &mut recv_buf)?;
+        handle_ingress(session.conn, session.socket, &mut recv_buf)?;
 
         let mut drained_any = false;
         loop {
-            match conn.stream_recv(stream_id, &mut tmp) {
+            match session.conn.stream_recv(stream_id, &mut tmp) {
                 Ok((len, fin)) => {
                     drained_any = true;
                     if received < size {
@@ -394,7 +382,7 @@ fn do_get_inner(
                 Err(e) => bail!("stream_recv: {e}"),
             }
         }
-        flush_egress(conn, socket)?;
+        flush_egress(session.conn, session.socket)?;
 
         // If the server FIN'd the stream early without delivering the
         // full body + trailer, don't sit and spin waiting for bytes
@@ -410,15 +398,18 @@ fn do_get_inner(
             );
         }
 
-        if conn.is_closed() && (received < size || trailer.len() < want_trailer) {
+        if session.conn.is_closed() && (received < size || trailer.len() < want_trailer) {
             bail!("connection closed during download");
         }
 
         // If neither the socket nor the stream had anything ready,
         // sleep until the next event or the quiche timer fires.
         if !drained_any {
-            poll.poll(events, conn.timeout().or(Some(Duration::from_millis(100))))?;
-            conn.on_timeout();
+            session.poll.poll(
+                session.events,
+                session.conn.timeout().or(Some(Duration::from_millis(100))),
+            )?;
+            session.conn.on_timeout();
         }
     }
 
@@ -468,12 +459,8 @@ fn do_get_inner(
 /// server-side temp at `offset` is supported by passing it through.
 /// `no_clobber` asks the server to refuse the Put with
 /// `AlreadyExists` rather than overwrite a pre-existing destination.
-#[allow(clippy::too_many_arguments)]
 pub fn do_put(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
+    session: &mut Session,
     stream_id: u64,
     local: &Path,
     remote: &str,
@@ -482,9 +469,7 @@ pub fn do_put(
 ) -> Result<()> {
     // Parent span for the whole upload.
     let _span = tracing::info_span!("transfer", op = "put", stream_id, path = %remote).entered();
-    let result = do_put_inner(
-        conn, socket, poll, events, stream_id, local, remote, offset, no_clobber,
-    );
+    let result = do_put_inner(session, stream_id, local, remote, offset, no_clobber);
     if let Err(e) = &result {
         // A `StalePartial` error is a retry signal for the caller, not
         // an actual transfer failure -- the caller re-uploads from
@@ -498,12 +483,8 @@ pub fn do_put(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn do_put_inner(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
+    session: &mut Session,
     stream_id: u64,
     local: &Path,
     remote: &str,
@@ -538,8 +519,8 @@ fn do_put_inner(
         no_clobber,
         checksum_trailer: true,
     };
-    send_message(conn, stream_id, &req)?;
-    flush_egress(conn, socket)?;
+    send_message(session.conn, stream_id, &req)?;
+    flush_egress(session.conn, session.socket)?;
 
     let mut f = File::open(local).context("opening local for send")?;
     // For resume (offset > 0), the server reconstructed BLAKE3 over the
@@ -587,10 +568,10 @@ fn do_put_inner(
         if !wait.is_zero() {
             let deadline = std::time::Instant::now() + wait;
             while std::time::Instant::now() < deadline {
-                handle_ingress(conn, socket, &mut recv_buf)?;
-                flush_egress(conn, socket)?;
-                conn.on_timeout();
-                if conn.is_closed() {
+                handle_ingress(session.conn, session.socket, &mut recv_buf)?;
+                flush_egress(session.conn, session.socket)?;
+                session.conn.on_timeout();
+                if session.conn.is_closed() {
                     bail!("connection closed during bandwidth-limit wait");
                 }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -598,7 +579,7 @@ fn do_put_inner(
                 // sleep past the next quiche timer or the deadline.
                 let slice = remaining
                     .min(Duration::from_millis(50))
-                    .min(conn.timeout().unwrap_or(Duration::from_millis(50)));
+                    .min(session.conn.timeout().unwrap_or(Duration::from_millis(50)));
                 if !slice.is_zero() {
                     std::thread::sleep(slice);
                 }
@@ -618,13 +599,16 @@ fn do_put_inner(
         let mut sub = 0usize;
         while sub < want {
             let remaining = &buf[sub..want];
-            match conn.stream_send(stream_id, remaining, false) {
+            match session.conn.stream_send(stream_id, remaining, false) {
                 Ok(0) | Err(quiche::Error::Done) => {
-                    flush_egress(conn, socket)?;
-                    poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
-                    conn.on_timeout();
-                    handle_ingress(conn, socket, &mut recv_buf)?;
-                    if conn.is_closed() {
+                    flush_egress(session.conn, session.socket)?;
+                    session.poll.poll(
+                        session.events,
+                        session.conn.timeout().or(Some(Duration::from_millis(20))),
+                    )?;
+                    session.conn.on_timeout();
+                    handle_ingress(session.conn, session.socket, &mut recv_buf)?;
+                    if session.conn.is_closed() {
                         bail!("connection closed during upload");
                     }
                 }
@@ -632,7 +616,7 @@ fn do_put_inner(
                 Err(e) => bail!("stream_send failed: {e}"),
             }
         }
-        flush_egress(conn, socket)?;
+        flush_egress(session.conn, session.socket)?;
 
         sent += want as u64;
         bar.set_position(offset + sent);
@@ -643,8 +627,8 @@ fn do_put_inner(
         // mandatory per-chunk poll capped loopback put at ~65 MiB/s
         // by sleeping on `conn.timeout()` between chunks even
         // when send capacity was fine.
-        handle_ingress(conn, socket, &mut recv_buf)?;
-        flush_egress(conn, socket)?;
+        handle_ingress(session.conn, session.socket, &mut recv_buf)?;
+        flush_egress(session.conn, session.socket)?;
     }
 
     // Body fully queued. Push the 32-byte BLAKE3 trailer with FIN.
@@ -653,13 +637,16 @@ fn do_put_inner(
     while sub < trailer.len() {
         // The trailer is the last data on the stream, so every write
         // carries FIN; quiche keeps it pending across partial writes.
-        match conn.stream_send(stream_id, &trailer[sub..], true) {
+        match session.conn.stream_send(stream_id, &trailer[sub..], true) {
             Ok(0) | Err(quiche::Error::Done) => {
-                flush_egress(conn, socket)?;
-                poll.poll(events, conn.timeout().or(Some(Duration::from_millis(20))))?;
-                conn.on_timeout();
-                handle_ingress(conn, socket, &mut recv_buf)?;
-                if conn.is_closed() {
+                flush_egress(session.conn, session.socket)?;
+                session.poll.poll(
+                    session.events,
+                    session.conn.timeout().or(Some(Duration::from_millis(20))),
+                )?;
+                session.conn.on_timeout();
+                handle_ingress(session.conn, session.socket, &mut recv_buf)?;
+                if session.conn.is_closed() {
                     bail!("connection closed during trailer send");
                 }
             }
@@ -667,11 +654,11 @@ fn do_put_inner(
             Err(e) => bail!("stream_send (trailer) failed: {e}"),
         }
     }
-    flush_egress(conn, socket)?;
+    flush_egress(session.conn, session.socket)?;
 
     bar.finish_and_clear();
 
-    let resp = poll_response(conn, socket, poll, events, stream_id)?;
+    let resp = session.poll_response(stream_id)?;
     match resp {
         Response::Ok => {
             println!("Uploaded {bytes_to_send} bytes to {remote} (verified)");
@@ -726,15 +713,7 @@ fn is_stale_partial(offset: u64, code: ErrorCode) -> bool {
 /// that is empty or larger than the local file, or a probe error. An
 /// older server (whose partials carried a random suffix) simply
 /// answers `NotFound`, so this degrades cleanly to a fresh upload.
-pub fn probe_put_resume_offset(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next_stream_id: &mut u64,
-    remote: &str,
-    local_size: u64,
-) -> u64 {
+pub fn probe_put_resume_offset(session: &mut Session, remote: &str, local_size: u64) -> u64 {
     // Use the single source of truth `qftp_protocol::stream::temp_path_for`
     // so a future change to the partial naming scheme (suffix, layout)
     // can't drift between the server's commit path and this client probe.
@@ -742,7 +721,7 @@ pub fn probe_put_resume_offset(
     let req = Request::Stat {
         path: partial.to_string_lossy().into_owned(),
     };
-    match crate::proto::request_response(conn, socket, poll, events, next_stream_id, &req) {
+    match session.request_response(&req) {
         Ok(Response::FileStat(s)) if !s.is_dir && s.size > 0 && s.size <= local_size => s.size,
         _ => 0,
     }

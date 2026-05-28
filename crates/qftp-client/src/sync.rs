@@ -31,12 +31,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, Overrides};
-use crate::proto::{join_remote, request_response, take_stream};
+use crate::proto::{join_remote, Session};
 use crate::session_store;
 use crate::transfer;
 
@@ -94,6 +93,13 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
         crate::connect::EstablishOpts::for_spec(&spec),
     )?;
     let mut next: u64 = 0;
+    let mut session = Session {
+        conn: &mut conn,
+        socket: &socket,
+        poll: &mut poll,
+        events: &mut events,
+        next_stream_id: &mut next,
+    };
 
     // Remote index: relative-path -> (size, mtime). We walk the
     // remote tree breadth-first using Ls. A failed listing (network
@@ -101,15 +107,8 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     // sync: proceeding on a partial map would report a silently
     // incomplete mirror as success, and with `--delete` could remove
     // files that were merely never walked.
-    let remote_files = walk_remote(
-        &mut conn,
-        &socket,
-        &mut poll,
-        &mut events,
-        &mut next,
-        &remote_root,
-    )
-    .context("sync: failed to walk the remote directory tree")?;
+    let remote_files = walk_remote(&mut session, &remote_root)
+        .context("sync: failed to walk the remote directory tree")?;
     tracing::info!(count = remote_files.len(), "sync: remote files");
 
     let mut to_upload: Vec<PathBuf> = Vec::new();
@@ -177,14 +176,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     // AlreadyExists which we ignore; every other error (connection
     // dropped, malformed response, etc.) bubbles up so the caller
     // doesn't try to upload into a directory that doesn't exist.
-    ensure_remote_dir(
-        &mut conn,
-        &socket,
-        &mut poll,
-        &mut events,
-        &mut next,
-        remote_root.clone(),
-    )?;
+    ensure_remote_dir(&mut session, remote_root.clone())?;
 
     // Create the distinct parent directories once each. A flat
     // directory of N files would otherwise send N redundant Mkdir
@@ -198,14 +190,7 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
         }
     }
     for parent in mkdir_parents {
-        ensure_remote_dir(
-            &mut conn,
-            &socket,
-            &mut poll,
-            &mut events,
-            &mut next,
-            parent,
-        )?;
+        ensure_remote_dir(&mut session, parent)?;
     }
 
     // Upload.
@@ -213,18 +198,8 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     for rel in &to_upload {
         let local_path = local_root.join(rel);
         let remote_path = join_remote(&remote_root, rel);
-        let stream_id = take_stream(&mut next);
-        match transfer::do_put(
-            &mut conn,
-            &socket,
-            &mut poll,
-            &mut events,
-            stream_id,
-            &local_path,
-            &remote_path,
-            0,
-            false,
-        ) {
+        let stream_id = session.take_stream();
+        match transfer::do_put(&mut session, stream_id, &local_path, &remote_path, 0, false) {
             Ok(()) => tracing::info!(file = %remote_path, "sync: uploaded"),
             Err(e) => {
                 tracing::warn!(error = %e, file = %remote_path, "sync: upload failed");
@@ -247,16 +222,9 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     } else {
         for rel in &to_delete {
             let remote_path = join_remote(&remote_root, Path::new(rel));
-            match request_response(
-                &mut conn,
-                &socket,
-                &mut poll,
-                &mut events,
-                &mut next,
-                &Request::Rm {
-                    path: remote_path.clone(),
-                },
-            ) {
+            match session.request_response(&Request::Rm {
+                path: remote_path.clone(),
+            }) {
                 Ok(Response::Ok) => tracing::info!(file = %remote_path, "sync: deleted"),
                 Ok(Response::Err(e)) => {
                     tracing::warn!(?e.code, msg = %e.message, file = %remote_path, "sync: delete failed")
@@ -268,13 +236,13 @@ pub fn run(local: &str, remote_url: &str, opts: Opts, overrides: &Overrides) -> 
     }
 
     // Polite close.
-    let qid = take_stream(&mut next);
-    let _ = send_message(&mut conn, qid, &Request::Quit);
-    let _ = stream_send_all(&mut conn, qid, &[], true);
-    let _ = flush_egress(&mut conn, &socket);
+    let qid = session.take_stream();
+    let _ = send_message(session.conn, qid, &Request::Quit);
+    let _ = stream_send_all(session.conn, qid, &[], true);
+    let _ = flush_egress(session.conn, session.socket);
 
     if let Some(dir) = session_store::default_dir() {
-        let _ = session_store::save_from_conn(&dir, &spec.host, &conn);
+        let _ = session_store::save_from_conn(&dir, &spec.host, session.conn);
     }
 
     Ok(0)
@@ -456,23 +424,10 @@ impl IgnoreMatcher {
 /// pipelines that previously coped. The per-file `do_put` step that
 /// follows is what surfaces a truly broken path; we just need to
 /// log here so the operator can see the warning trail.
-fn ensure_remote_dir(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next: &mut u64,
-    path: String,
-) -> Result<()> {
-    let resp = request_response(
-        conn,
-        socket,
-        poll,
-        events,
-        next,
-        &Request::Mkdir { path: path.clone() },
-    )
-    .with_context(|| format!("sync: Mkdir({path}) request failed"))?;
+fn ensure_remote_dir(session: &mut Session, path: String) -> Result<()> {
+    let resp = session
+        .request_response(&Request::Mkdir { path: path.clone() })
+        .with_context(|| format!("sync: Mkdir({path}) request failed"))?;
     use qftp_common::protocol::ErrorCode;
     match resp {
         Response::Ok => Ok(()),
@@ -529,14 +484,7 @@ fn ensure_remote_dir(
 /// makes the walk terminate with a clear error instead.
 const MAX_REMOTE_DIRS: usize = 10_000;
 
-fn walk_remote(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next: &mut u64,
-    root: &str,
-) -> Result<HashMap<PathBuf, Meta>> {
+fn walk_remote(session: &mut Session, root: &str) -> Result<HashMap<PathBuf, Meta>> {
     let mut out: HashMap<PathBuf, Meta> = HashMap::new();
     // (remote-abs-path, relative-prefix)
     let mut stack: Vec<(String, PathBuf)> = vec![(root.to_string(), PathBuf::new())];
@@ -553,7 +501,7 @@ fn walk_remote(
             );
         }
         let req = Request::Ls { path: abs.clone() };
-        let resp = match request_response(conn, socket, poll, events, next, &req) {
+        let resp = match session.request_response(&req) {
             Ok(r) => r,
             Err(e) => {
                 // A swallowed failure here yields an incomplete map but

@@ -22,6 +22,54 @@ pub fn take_stream(next: &mut u64) -> u64 {
     cur
 }
 
+/// The QUIC pump handles (`conn`, `socket`, `poll`, `events`) plus the
+/// client stream-id cursor, bundled so transfer and orchestration code
+/// passes a single `&mut Session` instead of the same five handles. The
+/// transfer-specific arguments (`stream_id`, `local`, `remote`, ...)
+/// stay as explicit parameters on each call.
+pub struct Session<'a> {
+    pub conn: &'a mut quiche::Connection,
+    pub socket: &'a mio::net::UdpSocket,
+    pub poll: &'a mut Poll,
+    pub events: &'a mut Events,
+    pub next_stream_id: &'a mut u64,
+}
+
+impl Session<'_> {
+    /// Allocate the next client-initiated bidirectional stream id.
+    pub fn take_stream(&mut self) -> u64 {
+        take_stream(self.next_stream_id)
+    }
+
+    /// Block until a complete `Response` frame arrives on `stream_id`.
+    pub fn poll_response(&mut self, stream_id: u64) -> Result<Response> {
+        poll_response(self.conn, self.socket, self.poll, self.events, stream_id)
+    }
+
+    /// Like [`Session::poll_response`] but the caller owns the
+    /// accumulation buffer, so any bytes drained past the response
+    /// frame survive in `buf`.
+    pub fn poll_response_with_buf(
+        &mut self,
+        stream_id: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<Response> {
+        poll_response_with_buf(self.conn, self.socket, self.poll, self.events, stream_id, buf)
+    }
+
+    /// Send `req` on a fresh stream and block for its single `Response`.
+    pub fn request_response(&mut self, req: &Request) -> Result<Response> {
+        request_response(
+            self.conn,
+            self.socket,
+            self.poll,
+            self.events,
+            self.next_stream_id,
+            req,
+        )
+    }
+}
+
 /// Block until a complete `Response` frame arrives on `stream_id`.
 pub fn poll_response(
     conn: &mut quiche::Connection,

@@ -11,12 +11,11 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use mio::{Events, Poll};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, ConnectionSpec, Overrides};
-use crate::proto::{request_response, take_stream};
+use crate::proto::{take_stream, Session};
 use crate::session_store;
 use crate::transfer;
 use crate::OneShot;
@@ -74,13 +73,7 @@ fn spec_from_url(remote: &RemoteRef, overrides: &Overrides) -> Result<Connection
 /// `quiche::Connection`. Returns the callback's exit code.
 fn with_connection<F>(spec: &ConnectionSpec, body: F) -> Result<i32>
 where
-    F: FnOnce(
-        &mut quiche::Connection,
-        &mio::net::UdpSocket,
-        &mut Poll,
-        &mut Events,
-        &mut u64,
-    ) -> Result<i32>,
+    F: FnOnce(&mut Session) -> Result<i32>,
 {
     let crate::connect::Established {
         mut conn,
@@ -96,13 +89,16 @@ where
     let ticket_dir = session_store::default_dir();
 
     let mut next_stream_id: u64 = 0;
-    let code = body(
-        &mut conn,
-        &socket,
-        &mut poll,
-        &mut events,
-        &mut next_stream_id,
-    )?;
+    let code = {
+        let mut session = Session {
+            conn: &mut conn,
+            socket: &socket,
+            poll: &mut poll,
+            events: &mut events,
+            next_stream_id: &mut next_stream_id,
+        };
+        body(&mut session)?
+    };
 
     // Polite close.
     let qid = take_stream(&mut next_stream_id);
@@ -268,8 +264,8 @@ fn run_remote_oneshot(
     let r = parse_remote(url)?;
     let spec = spec_from_url(&r, overrides)?;
     let req = build(&r.path);
-    with_connection(&spec, |conn, socket, poll, events, next| {
-        let resp = request_response(conn, socket, poll, events, next, &req)?;
+    with_connection(&spec, |session| {
+        let resp = session.request_response(&req)?;
         // Special-case Response::Path for Pwd / Stat-like reads:
         // print the value so the user actually sees something.
         if let Response::Path(p) = &resp {
@@ -289,8 +285,8 @@ fn run_stat(url: &str, overrides: &Overrides) -> Result<i32> {
     let req = Request::Stat {
         path: r.path.clone(),
     };
-    with_connection(&spec, |conn, socket, poll, events, next| {
-        let resp = request_response(conn, socket, poll, events, next, &req)?;
+    with_connection(&spec, |session| {
+        let resp = session.request_response(&req)?;
         match &resp {
             Response::FileStat(s) => {
                 println!("size  {}", s.size);
@@ -319,8 +315,8 @@ fn run_rename(from_url: &str, to_url: &str, overrides: &Overrides) -> Result<i32
         from: from.path.clone(),
         to: to.path.clone(),
     };
-    with_connection(&spec, |conn, socket, poll, events, next| {
-        let resp = request_response(conn, socket, poll, events, next, &req)?;
+    with_connection(&spec, |session| {
+        let resp = session.request_response(&req)?;
         Ok(report_response_for_status(&resp))
     })
 }
@@ -414,13 +410,13 @@ fn run_get(
         }
     }
     let no_clobber_check = local_exists && matches!(clobber, ClobberPolicy::NoClobber);
-    with_connection(&spec, |conn, socket, poll, events, next| {
+    with_connection(&spec, |session| {
         if no_clobber_check {
             // Probe the remote size: --no-clobber should only refuse
             // overwriting an *already complete* file, not block
             // resuming an incomplete partial. Mirrors run_put's Stat
             // probe.
-            match remote_exists_size(conn, socket, poll, events, next, &r.path)? {
+            match remote_exists_size(session, &r.path)? {
                 Some(remote_size) => {
                     let local_len = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
                     if local_len >= remote_size {
@@ -439,7 +435,7 @@ fn run_get(
                 }
             }
         }
-        match transfer::do_get(conn, socket, poll, events, next, &r.path, &local_path) {
+        match transfer::do_get(session, &r.path, &local_path) {
             Ok(()) => Ok(exit::OK),
             Err(e) => {
                 eprintln!("get failed: {e}");
@@ -480,7 +476,7 @@ fn run_put(
     // For dry-run we still open the connection so the user sees auth
     // failures and remote-existence checks; the actual transfer is
     // gated on `!dry_run`.
-    with_connection(&spec, |conn, socket, poll, events, next| {
+    with_connection(&spec, |session| {
         let mut worst = exit::OK;
         for local in locals {
             let local_path = PathBuf::from(local);
@@ -506,8 +502,7 @@ fn run_put(
             // and pays no extra round-trip.
             let mut effective_no_clobber = false;
             if !matches!(clobber, ClobberPolicy::Force) {
-                let exists =
-                    remote_exists(conn, socket, poll, events, next, &dest)?.unwrap_or(false);
+                let exists = remote_exists(session, &dest)?.unwrap_or(false);
                 match clobber {
                     ClobberPolicy::Force => {}
                     ClobberPolicy::NoClobber => {
@@ -547,16 +542,11 @@ fn run_put(
             let offset = if matches!(clobber, ClobberPolicy::Force) {
                 0
             } else {
-                transfer::probe_put_resume_offset(
-                    conn, socket, poll, events, next, &dest, local_size,
-                )
+                transfer::probe_put_resume_offset(session, &dest, local_size)
             };
-            let stream_id = take_stream(next);
+            let stream_id = session.take_stream();
             match transfer::do_put(
-                conn,
-                socket,
-                poll,
-                events,
+                session,
                 stream_id,
                 &local_path,
                 &dest,
@@ -566,12 +556,9 @@ fn run_put(
                 Ok(()) => {}
                 Err(e) if offset > 0 && e.downcast_ref::<transfer::StalePartial>().is_some() => {
                     eprintln!("put {local} -> {dest}: server partial is stale, re-uploading");
-                    let sid = take_stream(next);
+                    let sid = session.take_stream();
                     if let Err(e2) = transfer::do_put(
-                        conn,
-                        socket,
-                        poll,
-                        events,
+                        session,
                         sid,
                         &local_path,
                         &dest,
@@ -597,24 +584,10 @@ fn run_put(
 /// answered with an error we couldn't interpret (treated as "unknown
 /// — don't skip the upload"). Used by `run_put` to short-circuit
 /// `--no-clobber` and `--interactive` without sending body bytes.
-fn remote_exists(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next: &mut u64,
-    path: &str,
-) -> Result<Option<bool>> {
-    let resp = request_response(
-        conn,
-        socket,
-        poll,
-        events,
-        next,
-        &Request::Stat {
-            path: path.to_string(),
-        },
-    )?;
+fn remote_exists(session: &mut Session, path: &str) -> Result<Option<bool>> {
+    let resp = session.request_response(&Request::Stat {
+        path: path.to_string(),
+    })?;
     Ok(match resp {
         Response::FileStat(_) => Some(true),
         Response::Err(e) if matches!(e.code, ErrorCode::NotFound) => Some(false),
@@ -627,24 +600,10 @@ fn remote_exists(
 /// (`NotFound`), and `None` for any error/response we couldn't
 /// interpret. Used by `run_get` to decide whether a pre-existing local
 /// file under `--no-clobber` is already a complete download.
-fn remote_exists_size(
-    conn: &mut quiche::Connection,
-    socket: &mio::net::UdpSocket,
-    poll: &mut Poll,
-    events: &mut Events,
-    next: &mut u64,
-    path: &str,
-) -> Result<Option<u64>> {
-    let resp = request_response(
-        conn,
-        socket,
-        poll,
-        events,
-        next,
-        &Request::Stat {
-            path: path.to_string(),
-        },
-    )?;
+fn remote_exists_size(session: &mut Session, path: &str) -> Result<Option<u64>> {
+    let resp = session.request_response(&Request::Stat {
+        path: path.to_string(),
+    })?;
     Ok(match resp {
         Response::FileStat(s) => Some(s.size),
         Response::Err(e) if matches!(e.code, ErrorCode::NotFound) => Some(0),

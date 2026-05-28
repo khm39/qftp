@@ -25,7 +25,7 @@ use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
 use crate::config::{self, ConnectionSpec, Overrides};
-use crate::proto::{join_remote, poll_response, take_stream};
+use crate::proto::{join_remote, Session};
 use crate::transfer;
 
 /// What we want done with one path after collapsing a burst of
@@ -288,6 +288,13 @@ fn run_session(
                 Err(_) => continue,
             };
             let remote_path = join_remote(remote_prefix, rel);
+            let mut session = Session {
+                conn: &mut conn,
+                socket: &socket,
+                poll: &mut poll,
+                events: &mut events,
+                next_stream_id: &mut next_stream_id,
+            };
             match action {
                 Action::Upload => {
                     if !path.is_file() {
@@ -295,35 +302,27 @@ fn run_session(
                         // window; skip silently.
                         continue;
                     }
-                    let stream_id = take_stream(&mut next_stream_id);
-                    if let Err(e) = transfer::do_put(
-                        &mut conn,
-                        &socket,
-                        &mut poll,
-                        &mut events,
-                        stream_id,
-                        &path,
-                        &remote_path,
-                        0,
-                        false,
-                    ) {
+                    let stream_id = session.take_stream();
+                    if let Err(e) =
+                        transfer::do_put(&mut session, stream_id, &path, &remote_path, 0, false)
+                    {
                         tracing::warn!(error = %e, path = %path.display(), "watch: put failed");
                     } else {
                         tracing::info!(path = %remote_path, "watch: uploaded");
                     }
                 }
                 Action::Delete => {
-                    let stream_id = take_stream(&mut next_stream_id);
+                    let stream_id = session.take_stream();
                     let req = Request::Rm {
                         path: remote_path.clone(),
                     };
-                    if let Err(e) = send_message(&mut conn, stream_id, &req) {
+                    if let Err(e) = send_message(session.conn, stream_id, &req) {
                         tracing::warn!(error = %e, "watch: rm send failed");
                         return Err(anyhow!(e));
                     }
-                    let _ = stream_send_all(&mut conn, stream_id, &[], true);
-                    flush_egress(&mut conn, &socket)?;
-                    match poll_response(&mut conn, &socket, &mut poll, &mut events, stream_id) {
+                    let _ = stream_send_all(session.conn, stream_id, &[], true);
+                    flush_egress(session.conn, session.socket)?;
+                    match session.poll_response(stream_id) {
                         Ok(Response::Ok) => {
                             tracing::info!(path = %remote_path, "watch: removed");
                         }

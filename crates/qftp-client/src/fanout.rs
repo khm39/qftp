@@ -191,18 +191,17 @@ fn do_put_once(
     )?;
 
     let mut next_stream_id: u64 = 0;
-    let put_stream = crate::proto::take_stream(&mut next_stream_id);
-    crate::transfer::do_put(
-        &mut conn,
-        &socket,
-        &mut poll,
-        &mut events,
-        put_stream,
-        local,
-        remote_path,
-        0,
-        false,
-    )?;
+    {
+        let mut session = crate::proto::Session {
+            conn: &mut conn,
+            socket: &socket,
+            poll: &mut poll,
+            events: &mut events,
+            next_stream_id: &mut next_stream_id,
+        };
+        let put_stream = session.take_stream();
+        crate::transfer::do_put(&mut session, put_stream, local, remote_path, 0, false)?;
+    }
 
     // Polite close.
     let quit_stream = crate::proto::take_stream(&mut next_stream_id);
