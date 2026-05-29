@@ -167,6 +167,29 @@ fn make_bar(total: u64, label: &str) -> ProgressBar {
     bar
 }
 
+/// Feed the first `len` bytes read from `r` into `hasher` in
+/// `FILE_CHUNK_SIZE`-sized reads. Used by both Get and Put to fold a
+/// resumed transfer's `[0..offset)` prefix into the whole-file BLAKE3
+/// before the suffix is streamed. `ctx` is the caller's `read_exact`
+/// error context so each side keeps its own message verbatim. Reads
+/// only; the caller is responsible for any seek positioning around it.
+fn hash_prefix<R: Read>(
+    r: &mut R,
+    len: u64,
+    hasher: &mut blake3::Hasher,
+    ctx: &'static str,
+) -> Result<()> {
+    let mut buf = [0u8; FILE_CHUNK_SIZE];
+    let mut left = len;
+    while left > 0 {
+        let want = (left as usize).min(buf.len());
+        r.read_exact(&mut buf[..want]).context(ctx)?;
+        hasher.update(&buf[..want]);
+        left -= want as u64;
+    }
+    Ok(())
+}
+
 /// Download `remote` to `local`. If `local` already exists, resume from
 /// its current length. Verifies the server-supplied BLAKE3 trailer once
 /// the body is fully received and refuses to keep the file on mismatch.
@@ -279,15 +302,12 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     if resume_offset > 0 {
         file.seek(SeekFrom::Start(0))
             .context("seeking to start of local prefix")?;
-        let mut buf = [0u8; FILE_CHUNK_SIZE];
-        let mut left = resume_offset;
-        while left > 0 {
-            let want = (left as usize).min(buf.len());
-            file.read_exact(&mut buf[..want])
-                .context("reading local prefix for hash")?;
-            hasher.update(&buf[..want]);
-            left -= want as u64;
-        }
+        hash_prefix(
+            &mut file,
+            resume_offset,
+            &mut hasher,
+            "reading local prefix for hash",
+        )?;
         file.seek(SeekFrom::Start(resume_offset))
             .with_context(|| format!("seeking to {resume_offset}"))?;
     }
@@ -519,15 +539,12 @@ fn do_put_inner(
     // the trailer covers the same byte range. Read once for hashing
     // only, then seek to `offset` for the actual send.
     if offset > 0 {
-        let mut prefix_buf = [0u8; FILE_CHUNK_SIZE];
-        let mut left = offset;
-        while left > 0 {
-            let want = (left as usize).min(prefix_buf.len());
-            f.read_exact(&mut prefix_buf[..want])
-                .context("reading local resume prefix for hash")?;
-            hasher.update(&prefix_buf[..want]);
-            left -= want as u64;
-        }
+        hash_prefix(
+            &mut f,
+            offset,
+            &mut hasher,
+            "reading local resume prefix for hash",
+        )?;
         // f is now positioned at offset, which is where the send loop
         // wants to start.
     }
