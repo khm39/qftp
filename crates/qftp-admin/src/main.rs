@@ -357,6 +357,28 @@ fn set_permissions(path: &Path, name: &str, partial: PartialPerms) -> Result<()>
 }
 
 fn set_quota(path: &Path, name: &str, bytes: Option<u64>) -> Result<()> {
+    // Validate before any file I/O so bad input fails fast.
+    if let Some(n) = bytes {
+        // The server treats `quota_bytes = 0` as ambiguous and bails at
+        // startup (#126); reject it here and point at the right flag.
+        if n == 0 {
+            bail!(
+                "quota of 0 is ambiguous; use `--unlimited` to remove the quota, \
+                 or pass a positive byte count"
+            );
+        }
+        // TOML integers are i64-range (toml_edit only exposes `From<i64>`),
+        // so a u64 above i64::MAX would serialize as a negative integer and
+        // the server's u64 deserialization would reject the file (#269).
+        if n > i64::MAX as u64 {
+            bail!(
+                "quota {n} exceeds the maximum representable TOML integer \
+                 ({}); pass a smaller value",
+                i64::MAX
+            );
+        }
+    }
+
     let mut doc = load_existing(path)?;
     let users = ensure_users_array(&mut doc)?;
     let idx = find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))?;
@@ -598,5 +620,26 @@ mod tests {
         init_users(&p).unwrap();
         let err = set_quota(&p, "ghost", Some(10)).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn set_quota_rejects_zero() {
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        // Rejected before the user lookup, so a missing user is irrelevant.
+        let err = set_quota(&p, "anyone", Some(0)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "got: {msg}");
+        assert!(msg.contains("--unlimited"), "got: {msg}");
+    }
+
+    #[test]
+    fn set_quota_rejects_overflow() {
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        let err = set_quota(&p, "anyone", Some(i64::MAX as u64 + 1)).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
     }
 }
