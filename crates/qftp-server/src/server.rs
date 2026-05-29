@@ -38,7 +38,7 @@ use crate::connection::ConnectionContext;
 use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
 use crate::retry::RetryKey;
-use qftp_protocol::handler::{self, err, io_code};
+use qftp_protocol::handler::{self, err};
 use qftp_protocol::stream::{StreamState, SEND_CHUNK_SIZE};
 use qftp_protocol::user::{self, User, UserDirectory};
 
@@ -331,80 +331,15 @@ fn handle_handler_panic(
 /// Run a generic (non-Get/Put/Quota/Quit) protocol request to a
 /// `Response`. This is the blocking-fs body the worker pool executes
 /// off the event-loop thread. `cwd` is updated in place for `Cd`.
+///
+/// `Rm` and `Rename` additionally keep the per-user `used_bytes` quota
+/// cache correct; that bookkeeping lives in `handler` so the FS op and
+/// the accounting stay co-located.
 fn run_handler(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
-    // Rm also decrements the per-user used-bytes cache, so it
-    // can't go through the generic handler (which never sees the
-    // deleted file's size). Everything else is plain handle_request.
-    if let Request::Rm { path } = req {
-        if handler::is_upload_temp(path) {
-            return err(
-                ErrorCode::PermissionDenied,
-                "cannot remove a server-internal upload temp file",
-            );
-        }
-        match handler::resolve(cwd, &user.home, path) {
-            Ok(target) => {
-                // Parent-dir symlink TOCTOU re-check.
-                if let Err(e) = handler::recheck_ancestors_no_symlinks(&target, &user.home) {
-                    Response::Err(e)
-                } else {
-                    let pre_size = std::fs::symlink_metadata(&target)
-                        .ok()
-                        .filter(|m| m.is_file())
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    match std::fs::remove_file(&target) {
-                        Ok(()) => {
-                            if pre_size > 0 {
-                                // Atomic saturating subtract: a plain
-                                // load/store loses concurrent Rm
-                                // decrements from other worker threads,
-                                // drifting `used_bytes` upward until the
-                                // user is falsely quota-locked.
-                                let _ = user.used_bytes.fetch_update(
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                    |v| Some(v.saturating_sub(pre_size)),
-                                );
-                            }
-                            Response::Ok
-                        }
-                        Err(e) => err(io_code(&e), format!("rm failed: {e}")),
-                    }
-                }
-            }
-            Err(e) => Response::Err(e),
-        }
-    } else if let Request::Rename { from, to } = req {
-        // Rename can overwrite an existing destination file, freeing
-        // that file's bytes on disk. `handle_request` never sees
-        // `user`, so capture the clobbered size here and refund it from
-        // `used_bytes` once the rename succeeds -- otherwise repeated
-        // overwrite-renames drift the quota upward until the user is
-        // falsely QuotaExceeded.
-        let from_path = handler::resolve(cwd, &user.home, from).ok();
-        let to_path = handler::resolve_parent(cwd, &user.home, to).ok();
-        let clobbered = match (&from_path, &to_path) {
-            // A rename onto itself frees nothing; only count a distinct
-            // destination that already holds a regular file.
-            (Some(f), Some(t)) if f != t => std::fs::symlink_metadata(t)
-                .ok()
-                .filter(|m| m.is_file())
-                .map(|m| m.len())
-                .unwrap_or(0),
-            _ => 0,
-        };
-        let resp = handler::handle_request(req, cwd, &user.home);
-        if matches!(resp, Response::Ok) && clobbered > 0 {
-            user.used_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(clobbered))
-                })
-                .ok();
-        }
-        resp
-    } else {
-        handler::handle_request(req, cwd, &user.home)
+    match req {
+        Request::Rm { path } => handler::quota_aware_remove(path, cwd, user),
+        Request::Rename { .. } => handler::quota_aware_rename(req, cwd, user),
+        _ => handler::handle_request(req, cwd, &user.home),
     }
 }
 
