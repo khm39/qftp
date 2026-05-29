@@ -186,7 +186,13 @@ impl KnownHosts {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+            if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to re-assert 0600 on known_hosts; file may be world-readable",
+                );
+            }
         }
         // Serialize concurrent `qftp-client -T` invocations so
         // we don't get duplicate or interleaved entries. flock is

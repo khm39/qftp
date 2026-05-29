@@ -4,12 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Daily run so a freshly published RUSTSEC advisory against a pinned
+  # dependency is caught even when no PR lands. 05:17 UTC, off-peak.
+  schedule:
+    - cron: "17 5 * * *"
 
 # Cancel in-progress runs when new commits land on the same ref so we don't
-# burn runner minutes on superseded commits.
+# burn runner minutes on superseded commits. Don't cancel scheduled runs.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,3 +52,50 @@ jobs:
 
       - name: Test web/blake3.js against Rust blake3 vectors
         run: node web/blake3.test.js
+
+  deny:
+    name: cargo-deny (advisories / licenses / sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources bans
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit
+
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      # Report coverage but don't gate on a threshold yet (start loose,
+      # tighten once a baseline exists). The e2e tests need a built
+      # client/server binary, so exclude them here -- they don't
+      # contribute line coverage of the crates under test anyway.
+      - name: Coverage
+        run: cargo llvm-cov --workspace --lib --summary-only
+      - name: Coverage (lcov artifact)
+        run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
+      - name: Upload lcov
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info

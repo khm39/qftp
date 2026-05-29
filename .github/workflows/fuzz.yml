@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [request_deser, response_deser]
+        target: [request_deser, response_deser, walk_safe]
     steps:
       - uses: actions/checkout@v4
 
@@ -41,9 +41,34 @@ jobs:
         with:
           workspaces: "fuzz -> target"
 
+      # Persist the per-target corpus across runs so each day's fuzzing
+      # builds on prior coverage instead of starting from zero. Keyed by
+      # target + run id with a target-scoped restore prefix so the newest
+      # cache for the same target is always restored.
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
       - name: Run fuzz target ${{ matrix.target }}
         working-directory: fuzz
         run: |
           cargo fuzz run ${{ matrix.target }} -- \
             -max_total_time=${{ inputs.max_total_seconds || 180 }} \
             -timeout=10
+
+      # On a crash, cargo-fuzz writes the reproducer under
+      # fuzz/artifacts/<target>/; preserve it (and the grown corpus) so a
+      # failure is debuggable instead of lost when the runner is torn down.
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: |
+            fuzz/artifacts/${{ matrix.target }}
+            fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: ignore
