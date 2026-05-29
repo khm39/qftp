@@ -13,14 +13,25 @@
 //!
 //! ## Wire format
 //!
-//! Each protocol message is bincode-serialized into a length-prefixed
-//! frame (4-byte big-endian length, then the payload). File body bytes
-//! follow the framed `FileReady` response on the same stream and are
-//! sized exactly by `FileReady::size`. When `checksum_follows` is set,
-//! 32 raw bytes (BLAKE3 of the streamed body) follow immediately after
-//! the body, with the QUIC stream FIN flag set on the last byte.
+//! Each protocol message is bincode-serialized (fixint, little-endian;
+//! enum tags are `u32`) into a length-prefixed frame (4-byte big-endian
+//! length, then the payload). File body bytes follow the framed
+//! `FileReady` response on the same stream and are sized exactly by
+//! `FileReady::size`. When `checksum_follows` is set, the digest of the
+//! streamed body follows immediately after the body (length = the
+//! negotiated [`HashAlgorithm`]'s [`HashAlgorithm::digest_len`], BLAKE3
+//! → 32 bytes), with the QUIC stream FIN flag set on the last byte.
+//!
+//! ## Numeric on-wire enums
+//!
+//! [`FileType`], [`HashAlgorithm`] and [`ErrorCode`] are encoded as a
+//! single `u32` value (not a positional bincode index) via hand-written
+//! [`Serialize`]/[`Deserialize`] impls, so unknown values decode to an
+//! `Unknown(n)` variant instead of failing. [`Request`]/[`Response`]/
+//! [`ErrorDetails`] keep derived serde; bincode already writes their
+//! variant tag as a `u32`.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Reject `name` as a directory-entry component if it can be used to
 /// escape its parent on either side of the protocol. The check is
@@ -107,7 +118,7 @@ fn check_path(field: &'static str, value: &str) -> Result<(), ValidationError> {
 /// fields are no-ops.
 pub fn validate_request(req: &Request) -> Result<(), ValidationError> {
     match req {
-        Request::Ls { path }
+        Request::Ls { path, .. }
         | Request::Cd { path }
         | Request::Get { path, .. }
         | Request::Put { path, .. }
@@ -138,7 +149,7 @@ pub fn validate_response(resp: &Response) -> Result<(), ValidationError> {
             }
             Ok(())
         }
-        Response::DirListing(entries) => {
+        Response::DirListing { entries, .. } => {
             if entries.len() > MAX_DIR_ENTRIES {
                 return Err(ValidationError::DirEntriesTooMany {
                     len: entries.len(),
@@ -166,10 +177,108 @@ pub const ALPN: &[u8] = b"qftp/1";
 /// compatibility with older clients.
 pub const PROTOCOL_MAJOR: u16 = 1;
 
-/// Machine-readable error category. Scripts and recursive transfers
-/// check this rather than parsing the human-readable message.
+/// File classification carried in [`DirEntry`] / [`FileStat`], encoded
+/// on the wire as a `u32`. Unknown values decode to `Unknown(n)` so a
+/// future server can add classifications without breaking old clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileType {
+    #[default]
+    Regular,
+    Directory,
+    Symlink,
+    Other,
+    Unknown(u32),
+}
+
+impl FileType {
+    pub fn to_u32(self) -> u32 {
+        match self {
+            FileType::Regular => 0,
+            FileType::Directory => 1,
+            FileType::Symlink => 2,
+            FileType::Other => 3,
+            FileType::Unknown(n) => n,
+        }
+    }
+
+    pub fn from_u32(n: u32) -> Self {
+        match n {
+            0 => FileType::Regular,
+            1 => FileType::Directory,
+            2 => FileType::Symlink,
+            3 => FileType::Other,
+            other => FileType::Unknown(other),
+        }
+    }
+}
+
+impl Serialize for FileType {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(self.to_u32())
+    }
+}
+
+impl<'de> Deserialize<'de> for FileType {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(FileType::from_u32(u32::deserialize(d)?))
+    }
+}
+
+/// Content-hash algorithm negotiated for a transfer, encoded on the
+/// wire as a `u32`. BLAKE3 is the only algorithm in qftp/1; the field
+/// exists so a future algorithm can be added without a wire-major bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashAlgorithm {
+    #[default]
+    Blake3,
+    Unknown(u32),
+}
+
+impl HashAlgorithm {
+    pub fn to_u32(self) -> u32 {
+        match self {
+            HashAlgorithm::Blake3 => 0,
+            HashAlgorithm::Unknown(n) => n,
+        }
+    }
+
+    pub fn from_u32(n: u32) -> Self {
+        match n {
+            0 => HashAlgorithm::Blake3,
+            other => HashAlgorithm::Unknown(other),
+        }
+    }
+
+    /// Length in bytes of this algorithm's digest, or `None` for an
+    /// algorithm this build doesn't know how to compute. This is the
+    /// size of the header `checksum` and the streamed trailer.
+    pub fn digest_len(self) -> Option<usize> {
+        match self {
+            HashAlgorithm::Blake3 => Some(32),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for HashAlgorithm {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(self.to_u32())
+    }
+}
+
+impl<'de> Deserialize<'de> for HashAlgorithm {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(HashAlgorithm::from_u32(u32::deserialize(d)?))
+    }
+}
+
+/// Machine-readable error category, encoded on the wire as a numeric
+/// `u32` status (class structure mirrors HTTP: `4xx` caller-caused,
+/// `5xx` server-caused). Scripts and recursive transfers check this
+/// rather than parsing the human-readable message. Unknown codes decode
+/// to `Unknown(n)` and are classified by their leading digit.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     /// Path resolution found no such file or directory.
     NotFound,
@@ -202,12 +311,105 @@ pub enum ErrorCode {
     Unsupported,
     /// The operation would push the user past their configured quota.
     QuotaExceeded,
+    /// A numeric status this build doesn't have a named variant for.
+    Unknown(u32),
+}
+
+/// Coarse classification of an [`ErrorCode`] by who caused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    Client,
+    Server,
+}
+
+impl ErrorCode {
+    pub fn to_u32(self) -> u32 {
+        match self {
+            ErrorCode::Malformed => 400,
+            ErrorCode::Unauthorized => 401,
+            ErrorCode::PermissionDenied => 403,
+            ErrorCode::NotFound => 404,
+            ErrorCode::Unsupported => 405,
+            ErrorCode::AlreadyExists => 409,
+            ErrorCode::FileTooLarge => 413,
+            ErrorCode::InvalidRange => 416,
+            ErrorCode::NotADirectory => 420,
+            ErrorCode::IsADirectory => 421,
+            ErrorCode::ChecksumMismatch => 422,
+            ErrorCode::UploadOverflow => 423,
+            ErrorCode::UploadTruncated => 424,
+            ErrorCode::RateLimited => 429,
+            ErrorCode::QuotaExceeded => 430,
+            ErrorCode::Internal => 500,
+            ErrorCode::Unknown(n) => n,
+        }
+    }
+
+    pub fn from_u32(n: u32) -> Self {
+        match n {
+            400 => ErrorCode::Malformed,
+            401 => ErrorCode::Unauthorized,
+            403 => ErrorCode::PermissionDenied,
+            404 => ErrorCode::NotFound,
+            405 => ErrorCode::Unsupported,
+            409 => ErrorCode::AlreadyExists,
+            413 => ErrorCode::FileTooLarge,
+            416 => ErrorCode::InvalidRange,
+            420 => ErrorCode::NotADirectory,
+            421 => ErrorCode::IsADirectory,
+            422 => ErrorCode::ChecksumMismatch,
+            423 => ErrorCode::UploadOverflow,
+            424 => ErrorCode::UploadTruncated,
+            429 => ErrorCode::RateLimited,
+            430 => ErrorCode::QuotaExceeded,
+            500 => ErrorCode::Internal,
+            other => ErrorCode::Unknown(other),
+        }
+    }
+
+    /// Who caused this error, by leading digit: `4xx` → client,
+    /// `5xx` → server. Anything else defaults to server.
+    pub fn class(self) -> ErrorClass {
+        match self.to_u32() / 100 {
+            4 => ErrorClass::Client,
+            5 => ErrorClass::Server,
+            _ => ErrorClass::Server,
+        }
+    }
+}
+
+impl Serialize for ErrorCode {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(self.to_u32())
+    }
+}
+
+impl<'de> Deserialize<'de> for ErrorCode {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(ErrorCode::from_u32(u32::deserialize(d)?))
+    }
+}
+
+/// Structured, machine-readable supplement to an [`ErrorResponse`].
+/// `u32`-tagged and `#[non_exhaustive]` so new detail kinds can be
+/// added without a wire-major bump.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorDetails {
+    /// Carried with [`ErrorCode::InvalidRange`].
+    Range { offset: u64, file_size: u64 },
+    /// Carried with [`ErrorCode::UploadOverflow`] / [`ErrorCode::UploadTruncated`].
+    Upload { received: u64, declared: u64 },
+    /// Carried with [`ErrorCode::RateLimited`].
+    RetryAfter { millis: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(default)]
+    pub details: Option<ErrorDetails>,
 }
 
 impl ErrorResponse {
@@ -215,6 +417,15 @@ impl ErrorResponse {
         Self {
             code,
             message: msg.into(),
+            details: None,
+        }
+    }
+
+    pub fn with_details(code: ErrorCode, msg: impl Into<String>, details: ErrorDetails) -> Self {
+        Self {
+            code,
+            message: msg.into(),
+            details: Some(details),
         }
     }
 }
@@ -224,6 +435,11 @@ impl ErrorResponse {
 pub enum Request {
     Ls {
         path: String,
+        /// Opaque, server-defined pagination cursor echoed back from a
+        /// prior `DirListing.next_cursor`. `None` requests the first
+        /// page.
+        #[serde(default)]
+        cursor: Option<String>,
     },
     Cd {
         path: String,
@@ -242,9 +458,9 @@ pub enum Request {
     /// Upload. `offset` lets clients append to a server-side `.partial`
     /// from where they left off; the server validates that the existing
     /// temp matches that offset before accepting more bytes. `checksum`
-    /// (BLAKE3) is verified after the last byte is written.
-    /// `no_clobber`: when true, the server refuses the upload
-    /// with `AlreadyExists` if `path` already exists. Pre-existing
+    /// (digest bytes for `hash_algorithm`) is verified after the last
+    /// byte is written. `no_clobber`: when true, the server refuses the
+    /// upload with `AlreadyExists` if `path` already exists. Pre-existing
     /// behavior (silent overwrite) is preserved by the `#[serde(default)]`
     /// `false`.
     Put {
@@ -253,17 +469,23 @@ pub enum Request {
         mode: u32,
         #[serde(default)]
         offset: u64,
+        /// Negotiated content-hash algorithm. Defaults to BLAKE3; the
+        /// server refuses anything else with `Unsupported`.
         #[serde(default)]
-        checksum: Option<[u8; 32]>,
+        hash_algorithm: HashAlgorithm,
+        /// Digest bytes (length = `hash_algorithm.digest_len()`).
+        #[serde(default)]
+        checksum: Option<Vec<u8>>,
         #[serde(default)]
         no_clobber: bool,
-        /// When true, the client appends a 32-byte BLAKE3 trailer on
-        /// the same stream after the `size` body bytes. This
-        /// lets the client hash as it sends instead of doing a full
-        /// pre-send pass to populate the header `checksum` field.
-        /// When false, `checksum` is authoritative (legacy path);
-        /// `None` here with `checksum_trailer = false` means no
-        /// verification at all (pre-existing behavior preserved).
+        /// When true, the client appends a digest trailer (length =
+        /// `hash_algorithm.digest_len()`) on the same stream after the
+        /// `size` body bytes. This lets the client hash as it sends
+        /// instead of doing a full pre-send pass to populate the header
+        /// `checksum` field. When false, `checksum` is authoritative
+        /// (legacy path); `None` here with `checksum_trailer = false`
+        /// means no verification at all (pre-existing behavior
+        /// preserved).
         #[serde(default)]
         checksum_trailer: bool,
     },
@@ -300,23 +522,32 @@ pub enum Request {
 pub enum Response {
     Ok,
     Err(ErrorResponse),
-    DirListing(Vec<DirEntry>),
+    /// Directory listing page. `next_cursor = Some(..)` signals more
+    /// pages follow (echo it back in `Request::Ls.cursor`); `None`
+    /// means this is the last page.
+    DirListing {
+        entries: Vec<DirEntry>,
+        #[serde(default)]
+        next_cursor: Option<String>,
+    },
     Path(String),
     FileStat(FileStat),
     /// Sent immediately before the body bytes for Get. `size` is the
     /// number of bytes the server is about to stream (post-offset and
     /// post-length clamping). `total_size` is the file's full size on
     /// disk so the client can detect truncation across resume sessions.
-    /// When `checksum_follows` is true, the 32 bytes immediately after
-    /// the body are the BLAKE3 hash of the streamed body; the client
-    /// verifies them. Computing the hash inline avoids a second file
-    /// read on the server side.
+    /// When `checksum_follows` is true, the digest bytes (length =
+    /// `hash_algorithm.digest_len()`) immediately after the body are the
+    /// hash of the streamed body; the client verifies them. Computing
+    /// the hash inline avoids a second file read on the server side.
     FileReady {
         size: u64,
         #[serde(default)]
         total_size: u64,
         #[serde(default)]
         checksum_follows: bool,
+        #[serde(default)]
+        hash_algorithm: HashAlgorithm,
     },
     /// Reply to `Request::Quota`. `limit_bytes = None` means "no
     /// quota configured" (unlimited).
@@ -331,18 +562,42 @@ pub enum Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntry {
     pub name: String,
-    pub is_dir: bool,
+    pub file_type: FileType,
     pub size: u64,
     pub modified: u64,
+    /// Nanosecond part of `modified` (`0..1_000_000_000`).
+    pub mtime_nanos: u32,
+    /// Owner uid; `0` where unavailable (e.g. Windows).
+    pub uid: u32,
+    /// Owner gid; `0` where unavailable (e.g. Windows).
+    pub gid: u32,
     pub mode: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl DirEntry {
+    pub fn is_dir(&self) -> bool {
+        self.file_type == FileType::Directory
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStat {
+    pub file_type: FileType,
     pub size: u64,
-    pub is_dir: bool,
     pub modified: u64,
+    /// Nanosecond part of `modified` (`0..1_000_000_000`).
+    pub mtime_nanos: u32,
+    /// Owner uid; `0` where unavailable (e.g. Windows).
+    pub uid: u32,
+    /// Owner gid; `0` where unavailable (e.g. Windows).
+    pub gid: u32,
     pub mode: u32,
+}
+
+impl FileStat {
+    pub fn is_dir(&self) -> bool {
+        self.file_type == FileType::Directory
+    }
 }
 
 #[cfg(test)]
@@ -366,7 +621,8 @@ mod tests {
             size: 12345,
             mode: 0o644,
             offset: 4096,
-            checksum: Some([7u8; 32]),
+            hash_algorithm: HashAlgorithm::Blake3,
+            checksum: Some(vec![7u8; 32]),
             no_clobber: true,
             checksum_trailer: false,
         };
@@ -376,6 +632,7 @@ mod tests {
                 size,
                 mode,
                 offset,
+                hash_algorithm,
                 checksum,
                 no_clobber,
                 checksum_trailer,
@@ -384,7 +641,8 @@ mod tests {
                 assert_eq!(size, 12345);
                 assert_eq!(mode, 0o644);
                 assert_eq!(offset, 4096);
-                assert_eq!(checksum, Some([7u8; 32]));
+                assert_eq!(hash_algorithm, HashAlgorithm::Blake3);
+                assert_eq!(checksum, Some(vec![7u8; 32]));
                 assert!(no_clobber);
                 assert!(!checksum_trailer);
             }
@@ -415,18 +673,30 @@ mod tests {
 
     #[test]
     fn dir_listing_round_trip() {
-        let resp = Response::DirListing(vec![DirEntry {
-            name: "a".into(),
-            is_dir: false,
-            size: 1,
-            modified: 2,
-            mode: 0o600,
-        }]);
+        let resp = Response::DirListing {
+            entries: vec![DirEntry {
+                name: "a".into(),
+                file_type: FileType::Regular,
+                size: 1,
+                modified: 2,
+                mtime_nanos: 3,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o600,
+            }],
+            next_cursor: None,
+        };
         match round_trip_response(&resp) {
-            Response::DirListing(entries) => {
+            Response::DirListing {
+                entries,
+                next_cursor,
+            } => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].name, "a");
                 assert_eq!(entries[0].mode, 0o600);
+                assert_eq!(entries[0].file_type, FileType::Regular);
+                assert!(!entries[0].is_dir());
+                assert_eq!(next_cursor, None);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -438,16 +708,19 @@ mod tests {
             size: 99,
             total_size: 200,
             checksum_follows: true,
+            hash_algorithm: HashAlgorithm::Blake3,
         };
         match round_trip_response(&resp) {
             Response::FileReady {
                 size,
                 total_size,
                 checksum_follows,
+                hash_algorithm,
             } => {
                 assert_eq!(size, 99);
                 assert_eq!(total_size, 200);
                 assert!(checksum_follows);
+                assert_eq!(hash_algorithm, HashAlgorithm::Blake3);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -475,9 +748,81 @@ mod tests {
             Response::Err(e) => {
                 assert_eq!(e.code, ErrorCode::NotFound);
                 assert_eq!(e.message, "missing");
+                assert_eq!(e.details, None);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn err_response_with_details_round_trip() {
+        let resp = Response::Err(ErrorResponse::with_details(
+            ErrorCode::InvalidRange,
+            "bad range",
+            ErrorDetails::Range {
+                offset: 10,
+                file_size: 5,
+            },
+        ));
+        match round_trip_response(&resp) {
+            Response::Err(e) => {
+                assert_eq!(e.code, ErrorCode::InvalidRange);
+                assert_eq!(
+                    e.details,
+                    Some(ErrorDetails::Range {
+                        offset: 10,
+                        file_size: 5,
+                    })
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_code_numeric_mapping() {
+        assert_eq!(ErrorCode::Malformed.to_u32(), 400);
+        assert_eq!(ErrorCode::NotFound.to_u32(), 404);
+        assert_eq!(ErrorCode::QuotaExceeded.to_u32(), 430);
+        assert_eq!(ErrorCode::Internal.to_u32(), 500);
+        assert_eq!(ErrorCode::from_u32(404), ErrorCode::NotFound);
+        assert_eq!(ErrorCode::from_u32(999), ErrorCode::Unknown(999));
+        assert_eq!(ErrorCode::NotFound.class(), ErrorClass::Client);
+        assert_eq!(ErrorCode::Internal.class(), ErrorClass::Server);
+        assert_eq!(ErrorCode::Unknown(999).class(), ErrorClass::Server);
+        assert_eq!(ErrorCode::Unknown(450).class(), ErrorClass::Client);
+    }
+
+    #[test]
+    fn error_code_serializes_as_u32() {
+        let bytes = bincode::serialize(&ErrorCode::NotFound).unwrap();
+        assert_eq!(bytes, 404u32.to_le_bytes());
+        let back: ErrorCode = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back, ErrorCode::NotFound);
+        // An unknown code on the wire decodes rather than failing.
+        let unknown = bincode::serialize(&777u32).unwrap();
+        let back: ErrorCode = bincode::deserialize(&unknown).unwrap();
+        assert_eq!(back, ErrorCode::Unknown(777));
+    }
+
+    #[test]
+    fn file_type_serializes_as_u32() {
+        let bytes = bincode::serialize(&FileType::Symlink).unwrap();
+        assert_eq!(bytes, 2u32.to_le_bytes());
+        let back: FileType = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back, FileType::Symlink);
+        let unknown = bincode::serialize(&9u32).unwrap();
+        let back: FileType = bincode::deserialize(&unknown).unwrap();
+        assert_eq!(back, FileType::Unknown(9));
+    }
+
+    #[test]
+    fn hash_algorithm_digest_len() {
+        assert_eq!(HashAlgorithm::Blake3.digest_len(), Some(32));
+        assert_eq!(HashAlgorithm::Unknown(1).digest_len(), None);
+        assert_eq!(HashAlgorithm::default(), HashAlgorithm::Blake3);
+        let bytes = bincode::serialize(&HashAlgorithm::Blake3).unwrap();
+        assert_eq!(bytes, 0u32.to_le_bytes());
     }
 
     #[test]
@@ -492,6 +837,7 @@ mod tests {
     fn validate_request_rejects_oversized_path() {
         let req = Request::Ls {
             path: "a".repeat(MAX_PATH_LEN + 1),
+            cursor: None,
         };
         let e = validate_request(&req).unwrap_err();
         assert!(e.to_string().contains("#140"), "unexpected error: {e}");
@@ -534,14 +880,20 @@ mod tests {
     fn validate_response_rejects_huge_listing() {
         let entry = DirEntry {
             name: "x".into(),
-            is_dir: false,
+            file_type: FileType::Regular,
             size: 0,
             modified: 0,
+            mtime_nanos: 0,
+            uid: 0,
+            gid: 0,
             mode: 0o644,
         };
         // Build a listing one entry over the cap.
         let entries = (0..MAX_DIR_ENTRIES + 1).map(|_| entry.clone()).collect();
-        let resp = Response::DirListing(entries);
+        let resp = Response::DirListing {
+            entries,
+            next_cursor: None,
+        };
         let e = validate_response(&resp).unwrap_err();
         assert!(
             matches!(e, ValidationError::DirEntriesTooMany { .. }),

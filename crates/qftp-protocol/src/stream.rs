@@ -238,10 +238,10 @@ pub fn classify_put_chunk(
 pub fn resolve_put_checksum(
     checksum_trailer: bool,
     trailer: &TrailerBuf,
-    header_checksum: Option<[u8; 32]>,
-) -> Option<[u8; 32]> {
+    header_checksum: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
     if checksum_trailer && trailer.is_full() {
-        Some(trailer.as_array())
+        Some(trailer.as_array().to_vec())
     } else {
         header_checksum
     }
@@ -324,7 +324,7 @@ pub enum StreamState {
         mode: u32,
         completed: bool,
         hasher: blake3::Hasher,
-        expected_checksum: Option<[u8; 32]>,
+        expected_checksum: Option<Vec<u8>>,
         /// When set, the client will send a 32-byte BLAKE3 trailer on
         /// the same stream after the body bytes. We accumulate
         /// it here as bytes arrive; once full it overrides
@@ -573,10 +573,10 @@ mod tests {
         let mut tb = TrailerBuf::new();
         tb.extend(&[7u8; 32]);
         assert!(tb.is_full());
-        let header = Some([1u8; 32]);
+        let header = Some(vec![1u8; 32]);
         assert_eq!(
             resolve_put_checksum(true, &tb, header),
-            Some([7u8; 32]),
+            Some(vec![7u8; 32]),
             "a complete trailer must override the header checksum"
         );
     }
@@ -587,11 +587,14 @@ mod tests {
         let mut tb = TrailerBuf::new();
         tb.extend(&[7u8; 10]);
         assert!(!tb.is_full());
-        let header = Some([1u8; 32]);
-        assert_eq!(resolve_put_checksum(true, &tb, header), Some([1u8; 32]));
+        let header = Some(vec![1u8; 32]);
+        assert_eq!(
+            resolve_put_checksum(true, &tb, header.clone()),
+            Some(vec![1u8; 32])
+        );
         // No trailer mode at all -> header checksum.
         assert_eq!(
-            resolve_put_checksum(false, &TrailerBuf::new(), header),
+            resolve_put_checksum(false, &TrailerBuf::new(), header.clone()),
             header
         );
         // Neither -> None (verification skipped).

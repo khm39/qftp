@@ -43,3 +43,83 @@ The first published wire version. The full specification is in
 
 `qftp/1` was previously documented in `docs/protocol.md`; the
 specification now lives in [`spec/`](spec/) as the source of truth.
+
+### 1.0 wire freeze
+
+Before tagging 1.0, every *now-or-never* breaking change was batched
+into one coordinated revision so that post-1.0 additions can be made
+within `qftp/1` by the append-only rule
+([spec/versioning.md](spec/versioning.md)) instead of each forcing an
+ALPN major bump. qftp is pre-1.0 and nothing is deployed against the
+earlier shape, so these breaks are acceptable. The batch **supersedes**
+the corresponding bullets in the `qftp/1` summary above (the 16-entry
+`ErrorCode` registry, the fixed 32-byte BLAKE3 trailer, and the
+`DirEntry`/`FileStat` field shape); the entries below are the frozen
+shape, and [`spec/`](spec/) plus [`test-vectors/`](test-vectors/) are
+authoritative.
+
+- **Status codes are numeric `u32`.** `ErrorResponse.code` is a `u32`
+  little-endian status (HTTP-like classes: `4xx` caller-caused, `5xx`
+  server-caused), no longer a positional enum index. A decoder that
+  receives an unrecognised value now decodes it as `Unknown(n)`
+  classified by range, rather than rejecting the frame — this replaces
+  the earlier "unknown `ErrorCode` = `Malformed`" rule. See
+  [spec/error-codes.md](spec/error-codes.md).
+- **Structured error details.** `ErrorResponse` gains an optional
+  `details: Option<ErrorDetails>`, a `u32`-tagged, non-exhaustive enum
+  carrying machine-readable context: `Range { offset, file_size }`
+  (InvalidRange), `Upload { received, declared }`
+  (UploadOverflow/UploadTruncated), and `RetryAfter { millis }`
+  (RateLimited). `message` stays operator/developer-facing English
+  diagnostics, not for end-user display.
+- **Richer `DirEntry` / `FileStat`.** `is_dir: bool` is **removed** and
+  replaced by an explicit `file_type` (`u32`: `Regular=0`,
+  `Directory=1`, `Symlink=2`, `Other=3`). Both structures gain
+  sub-second time (`mtime_nanos`, the nanosecond part of `modified`,
+  `0..1_000_000_000`) and ownership (`uid`, `gid`, `0` where
+  unavailable). See [spec/wire-format.md](spec/wire-format.md).
+- **Directory pagination.** `Request::Ls` gains `cursor:
+  Option<string>` and `Response::DirListing` changes from a bare
+  `seq<DirEntry>` to `{ entries, next_cursor: Option<string> }`. The
+  cursor is **opaque and server-defined**; clients echo it back
+  verbatim. `next_cursor = Some(..)` means more pages follow. Per-page
+  limits are implementation-defined.
+- **Hash-algorithm agility.** A `HashAlgorithm` enum (`u32`,
+  `Blake3=0`) is carried in `Request::Put` and `Response::FileReady`.
+  The header `checksum` and the streamed trailer become a variable
+  `seq<u8>` whose length is the algorithm's digest length (BLAKE3 →
+  32), replacing the fixed `[u8; 32]`. A future algorithm is added as a
+  new `HashAlgorithm` value and the trailer length follows from it.
+
+Compatible refinements landed in the same revision (not new breaks):
+the `Put` FIN/trailer framing was clarified (FIN on the last trailer
+byte when a trailer follows, else on the last body byte; `size == 0`
+skips the body phase; a short trailer is `UploadTruncated`, never a
+silent fall-back to the header checksum); resume checksum/`total_size`
+semantics were tightened (a shrink mid-resume is `InvalidRange`;
+`checksum_follows = false` is forbidden on a resumed `Get`); and a
+conformance test now asserts every variant's on-wire discriminant
+against [`test-vectors/`](test-vectors/).
+
+The `qftp/1` major version is **not** bumped: all of the above is folded
+into `qftp/1` while it is still pre-release.
+
+### Future directions (deferred to qftp/2)
+
+Recorded here so they are not relitigated as `qftp/1` minor revisions.
+Each is wire-breaking in a way the append-only rule cannot absorb, so
+each is reserved for the next ALPN major:
+
+- **Self-describing encoding.** Move off the positional, fixed-width
+  encoding toward a tagged wire format (CBOR / Protobuf-style) so
+  unknown fields and variants survive a round trip.
+- **Varint integers.** Replace the fixed-width `u32`/`u64` payload
+  integers with variable-length encodings.
+- **In-band capability negotiation.** A capability/feature exchange
+  beyond the ALPN major, so peers can advertise optional features
+  without an ALPN bump.
+- **Per-control-message MAC / signed manifests.** Authenticity at the
+  message layer (TLS already provides channel integrity; BLAKE3 is
+  integrity only — see [SECURITY.md](SECURITY.md)).
+- **New operations.** `Copy`, `Symlink`, and `Transaction`
+  (multi-operation atomicity).

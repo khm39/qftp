@@ -9,7 +9,10 @@
 //! re-derives the bytes the generator wrote, so a wire change that
 //! isn't reflected in `test-vectors/` fails CI.
 
-use qftp_common::protocol::{DirEntry, ErrorCode, ErrorResponse, FileStat, Request, Response};
+use qftp_common::protocol::{
+    DirEntry, ErrorCode, ErrorDetails, ErrorResponse, FileStat, FileType, HashAlgorithm, Request,
+    Response,
+};
 use serde::{Deserialize, Serialize};
 
 /// One golden vector: a protocol value, its serde-JSON form, and the
@@ -71,6 +74,7 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
             "List a directory.",
             Request::Ls {
                 path: "docs".into(),
+                cursor: None,
             },
         ),
         (
@@ -111,6 +115,7 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 size: 4096,
                 mode: 0o644,
                 offset: 0,
+                hash_algorithm: HashAlgorithm::Blake3,
                 checksum: None,
                 no_clobber: false,
                 checksum_trailer: false,
@@ -124,7 +129,8 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 size: 12345,
                 mode: 0o600,
                 offset: 4096,
-                checksum: Some([0x11; 32]),
+                hash_algorithm: HashAlgorithm::Blake3,
+                checksum: Some(vec![0x11; 32]),
                 no_clobber: true,
                 checksum_trailer: false,
             },
@@ -137,6 +143,7 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 size: 65536,
                 mode: 0o644,
                 offset: 0,
+                hash_algorithm: HashAlgorithm::Blake3,
                 checksum: None,
                 no_clobber: false,
                 checksum_trailer: true,
@@ -205,29 +212,53 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
             Response::Err(ErrorResponse::new(ErrorCode::NotFound, "no such file")),
         ),
         (
+            "err_details",
+            "Structured error reply carrying ErrorDetails::Range.",
+            Response::Err(ErrorResponse::with_details(
+                ErrorCode::InvalidRange,
+                "offset past end of file",
+                ErrorDetails::Range {
+                    offset: 4096,
+                    file_size: 1024,
+                },
+            )),
+        ),
+        (
             "dir_listing",
             "Directory listing with a file and a subdirectory.",
-            Response::DirListing(vec![
-                DirEntry {
-                    name: "file.txt".into(),
-                    is_dir: false,
-                    size: 1024,
-                    modified: 1_700_000_000,
-                    mode: 0o644,
-                },
-                DirEntry {
-                    name: "subdir".into(),
-                    is_dir: true,
-                    size: 0,
-                    modified: 1_700_000_500,
-                    mode: 0o755,
-                },
-            ]),
+            Response::DirListing {
+                entries: vec![
+                    DirEntry {
+                        name: "file.txt".into(),
+                        file_type: FileType::Regular,
+                        size: 1024,
+                        modified: 1_700_000_000,
+                        mtime_nanos: 0,
+                        uid: 1000,
+                        gid: 1000,
+                        mode: 0o644,
+                    },
+                    DirEntry {
+                        name: "subdir".into(),
+                        file_type: FileType::Directory,
+                        size: 0,
+                        modified: 1_700_000_500,
+                        mtime_nanos: 0,
+                        uid: 1000,
+                        gid: 1000,
+                        mode: 0o755,
+                    },
+                ],
+                next_cursor: None,
+            },
         ),
         (
             "dir_listing_empty",
             "Empty directory listing.",
-            Response::DirListing(vec![]),
+            Response::DirListing {
+                entries: vec![],
+                next_cursor: None,
+            },
         ),
         (
             "path",
@@ -238,9 +269,12 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
             "file_stat",
             "Stat result for a regular file.",
             Response::FileStat(FileStat {
+                file_type: FileType::Regular,
                 size: 4096,
-                is_dir: false,
                 modified: 1_700_000_000,
+                mtime_nanos: 0,
+                uid: 1000,
+                gid: 1000,
                 mode: 0o644,
             }),
         ),
@@ -251,6 +285,7 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
                 size: 8_388_608,
                 total_size: 10_000_000,
                 checksum_follows: true,
+                hash_algorithm: HashAlgorithm::Blake3,
             },
         ),
         (
@@ -260,6 +295,7 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
                 size: 1024,
                 total_size: 0,
                 checksum_follows: false,
+                hash_algorithm: HashAlgorithm::Blake3,
             },
         ),
         (

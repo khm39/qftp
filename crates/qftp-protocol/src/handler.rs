@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
 
 use qftp_common::protocol::{
-    DirEntry, ErrorCode, ErrorResponse, FileStat, Request, Response, MAX_DIR_ENTRIES,
+    DirEntry, ErrorCode, ErrorResponse, FileStat, FileType, Request, Response, MAX_DIR_ENTRIES,
 };
 
 use crate::user::{Op, User};
@@ -21,6 +21,43 @@ fn mode_of(meta: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn mode_of(_meta: &fs::Metadata) -> u32 {
     0o644
+}
+
+/// Classify a `std::fs::FileType` into the wire [`FileType`]. Symlinks
+/// are reported as such only when the metadata was obtained without
+/// following the final link (`symlink_metadata`); a followed link
+/// reports the target's type.
+fn file_type_of(ft: std::fs::FileType) -> FileType {
+    if ft.is_dir() {
+        FileType::Directory
+    } else if ft.is_symlink() {
+        FileType::Symlink
+    } else if ft.is_file() {
+        FileType::Regular
+    } else {
+        FileType::Other
+    }
+}
+
+/// Owner uid/gid where the OS exposes them; `(0, 0)` elsewhere.
+#[cfg(unix)]
+fn owner_of(meta: &fs::Metadata) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.uid(), meta.gid())
+}
+#[cfg(not(unix))]
+fn owner_of(_meta: &fs::Metadata) -> (u32, u32) {
+    (0, 0)
+}
+
+/// Split a metadata mtime into `(seconds, nanos)` since the Unix epoch,
+/// falling back to `(0, 0)` when the OS can't report it.
+fn mtime_of(meta: &fs::Metadata) -> (u64, u32) {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0))
 }
 
 /// Apply a Unix mode where the OS supports it; otherwise refuse so callers
@@ -471,7 +508,7 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             Err(e) => Response::Err(e),
         },
 
-        Request::Ls { path } => {
+        Request::Ls { path, .. } => {
             let dir: Result<Cow<Path>, ErrorResponse> = if path.is_empty() {
                 Ok(Cow::Borrowed(cwd.as_path()))
             } else {
@@ -550,22 +587,33 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                 Ok(m) => m,
                                 Err(e) => return err(io_code(&e), format!("Metadata error: {e}")),
                             };
-                            let modified = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
+                            let (modified, mtime_nanos) = mtime_of(&meta);
+                            let (uid, gid) = owner_of(&meta);
+                            // Both `entry.metadata()` and
+                            // `entry.file_type()` are non-following
+                            // (lstat-equivalent), so a symlink reports
+                            // `Symlink` with its own size/mtime, not the
+                            // target's.
+                            let file_type = match entry.file_type() {
+                                Ok(ft) => file_type_of(ft),
+                                Err(e) => return err(io_code(&e), format!("Metadata error: {e}")),
+                            };
                             listing.push(DirEntry {
                                 name,
-                                is_dir: meta.is_dir(),
+                                file_type,
                                 size: meta.len(),
                                 modified,
+                                mtime_nanos,
+                                uid,
+                                gid,
                                 mode: mode_of(&meta),
                             });
                         }
                         listing.sort_by(|a, b| a.name.cmp(&b.name));
-                        Response::DirListing(listing)
+                        Response::DirListing {
+                            entries: listing,
+                            next_cursor: None,
+                        }
                     }
                     Err(e) => err(io_code(&e), format!("Cannot list directory: {e}")),
                 },
@@ -676,16 +724,15 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                             "target became a symlink between resolve and stat (#106)",
                         );
                     }
-                    let modified = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                    let (modified, mtime_nanos) = mtime_of(&meta);
+                    let (uid, gid) = owner_of(&meta);
                     Response::FileStat(FileStat {
+                        file_type: file_type_of(meta.file_type()),
                         size: meta.len(),
-                        is_dir: meta.is_dir(),
                         modified,
+                        mtime_nanos,
+                        uid,
+                        gid,
                         mode: mode_of(&meta),
                     })
                 }
@@ -889,6 +936,7 @@ mod tests {
         let resp = handle_request(
             &Request::Ls {
                 path: String::new(),
+                cursor: None,
             },
             &mut cwd,
             &root,
@@ -906,17 +954,25 @@ mod tests {
         let (_dir, root) = setup_root();
         let mut cwd = root.clone();
         assert!(matches!(
-            handle_request(&Request::Ls { path: "sub".into() }, &mut cwd, &root),
-            Response::DirListing(_)
+            handle_request(
+                &Request::Ls {
+                    path: "sub".into(),
+                    cursor: None,
+                },
+                &mut cwd,
+                &root,
+            ),
+            Response::DirListing { .. }
         ));
         match handle_request(
             &Request::Ls {
                 path: String::new(),
+                cursor: None,
             },
             &mut cwd,
             &root,
         ) {
-            Response::DirListing(entries) => assert!(!entries.is_empty()),
+            Response::DirListing { entries, .. } => assert!(!entries.is_empty()),
             other => panic!("expected DirListing for root, got {other:?}"),
         }
     }
@@ -939,6 +995,7 @@ mod tests {
         let resp = handle_request(
             &Request::Ls {
                 path: String::new(),
+                cursor: None,
             },
             &mut cwd,
             &root,

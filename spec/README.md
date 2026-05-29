@@ -11,6 +11,18 @@ without reading Rust.
 The current wire version is **`qftp/1`** (the major version is carried
 in the QUIC ALPN identifier; see [versioning.md](versioning.md)).
 
+> **`qftp/1.0` wire freeze — 2026-05-30.** The `qftp/1` wire is frozen
+> as of this date. The coordinated pre-1.0 break that produced this
+> shape (numeric `u32` status codes, structured `ErrorDetails`, richer
+> `DirEntry`/`FileStat`, directory pagination, and hash-algorithm
+> agility) is recorded in
+> [PROTOCOL-CHANGELOG.md](../PROTOCOL-CHANGELOG.md). From here on:
+> within `qftp/1`, only **backward-compatible, append-only** changes
+> are permitted, under the rules in [versioning.md](versioning.md);
+> any change an existing `qftp/1` decoder cannot accept **MUST** be
+> made in a new ALPN major (`qftp/2`). Deferred directions for that
+> next major are listed in the protocol changelog.
+
 The key words **MUST**, **MUST NOT**, **SHOULD**, **MAY**, etc. in
 these documents are to be interpreted as described in RFC 2119.
 

@@ -248,6 +248,7 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
         ),
         OneShot::Ls { remote } => run_remote_oneshot(&remote, &overrides, |path| Request::Ls {
             path: path.into(),
+            cursor: None,
         }),
         OneShot::Rm { remote } => run_remote_oneshot(&remote, &overrides, |path| Request::Rm {
             path: path.into(),
@@ -305,9 +306,14 @@ fn run_remote_oneshot(
         // print the value so the user actually sees something.
         if let Response::Path(p) = &resp {
             println!("{p}");
-        } else if let Response::DirListing(entries) = &resp {
+        } else if let Response::DirListing { entries, .. } = &resp {
             for e in entries {
-                println!("{} {} {}", if e.is_dir { 'd' } else { '-' }, e.size, e.name);
+                println!(
+                    "{} {} {}",
+                    if e.is_dir() { 'd' } else { '-' },
+                    e.size,
+                    e.name
+                );
             }
         }
         Ok(report_response_for_status(&resp))
@@ -325,7 +331,7 @@ fn run_stat(url: &str, overrides: &Overrides) -> Result<i32> {
         match &resp {
             Response::FileStat(s) => {
                 println!("size  {}", s.size);
-                println!("kind  {}", if s.is_dir { "directory" } else { "file" });
+                println!("kind  {}", if s.is_dir() { "directory" } else { "file" });
                 println!("mode  {:o}", s.mode & 0o777);
                 println!("mtime {}", s.modified);
                 Ok(exit::OK)

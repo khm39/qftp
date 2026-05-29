@@ -96,7 +96,8 @@ async fn put(conn: &Connection, path: &str, body: &[u8], checksum: Option<[u8; 3
         size: body.len() as u64,
         mode: 0o644,
         offset: 0,
-        checksum,
+        hash_algorithm: qftp_common::protocol::HashAlgorithm::Blake3,
+        checksum: checksum.map(|c| c.to_vec()),
         no_clobber: false,
         checksum_trailer: false,
     };
@@ -124,6 +125,7 @@ async fn put_with_trailer(
         size: body.len() as u64,
         mode: 0o644,
         offset: 0,
+        hash_algorithm: qftp_common::protocol::HashAlgorithm::Blake3,
         checksum: None,
         no_clobber: false,
         checksum_trailer: true,
@@ -342,15 +344,16 @@ async fn end_to_end_webtransport() {
         &alice,
         &Request::Ls {
             path: "/sub".into(),
+            cursor: None,
         },
     )
     .await
     {
-        Response::DirListing(entries) => {
+        Response::DirListing { entries, .. } => {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].name, "big.bin");
             assert_eq!(entries[0].size, body.len() as u64);
-            assert!(!entries[0].is_dir);
+            assert!(!entries[0].is_dir());
         }
         other => panic!("ls: expected DirListing, got {other:?}"),
     }

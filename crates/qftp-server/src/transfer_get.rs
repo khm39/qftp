@@ -93,10 +93,18 @@ pub(crate) fn start_get(
         );
     }
     if offset > meta.len() {
-        return send_err(
+        return fail_stream(
             ctx,
-            ErrorCode::InvalidRange,
-            format!("offset {} past end of file (size {})", offset, meta.len()),
+            stream_id,
+            metrics,
+            Response::Err(ErrorResponse::with_details(
+                ErrorCode::InvalidRange,
+                format!("offset {} past end of file (size {})", offset, meta.len()),
+                ErrorDetails::Range {
+                    offset,
+                    file_size: meta.len(),
+                },
+            )),
         );
     }
     let remaining = meta.len() - offset;
@@ -111,6 +119,7 @@ pub(crate) fn start_get(
             size: bytes_to_send,
             total_size: meta.len(),
             checksum_follows: true,
+            hash_algorithm: HashAlgorithm::Blake3,
         },
     )?;
     // The reader stays at position 0 even for a resumed Get: the
