@@ -65,6 +65,15 @@ pub fn run(local: &str, remote_url: &str, debounce_ms: u64, overrides: &Override
         target,
     );
 
+    // Block SIGINT/SIGTERM on the main thread *before* spawning any
+    // thread (notify watcher below, sigwait thread in install_sigint).
+    // pthread_sigmask only affects the calling thread, and the block
+    // is inherited by threads spawned afterwards — so every thread
+    // alive at signal-delivery time has the signal blocked and it is
+    // delivered deterministically to the sigwait thread instead of
+    // triggering the default terminate action somewhere else.
+    block_signals();
+
     // notify crate produces events on a channel.
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -112,10 +121,30 @@ fn install_sigint() -> Result<Arc<AtomicBool>> {
     Ok(stop)
 }
 
-/// Tiny stand-in for the `ctrlc` crate: spawns a thread that blocks
-/// on `signal_hook`'s SIGINT/SIGTERM iterator. We already depend on
-/// the equivalent on the server side; here we keep the wrapper
-/// inline so qftp-client doesn't pull in another crate.
+/// Block SIGINT/SIGTERM on the current (main) thread. Must be called
+/// before spawning the notify watcher and the sigwait thread so they
+/// inherit the mask; otherwise a process-directed signal could be
+/// delivered to an unblocked thread and terminate the process before
+/// the stop flag is ever set.
+fn block_signals() {
+    #[cfg(unix)]
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Tiny stand-in for the `ctrlc` crate: spawns a thread that blocks in
+/// a raw `sigwait` for SIGINT/SIGTERM and runs `cb` once one arrives.
+/// SIGINT/SIGTERM must already be blocked process-wide via
+/// `block_signals` (called before any thread is spawned) so the signal
+/// is steered to this dedicated thread rather than acted on elsewhere.
+/// We keep the wrapper inline so qftp-client doesn't pull in another
+/// crate (the server uses `signal_hook::flag::register` for the same
+/// effect).
 fn ctrlc_handler(cb: impl Fn() + Send + 'static) {
     #[cfg(unix)]
     {
@@ -124,7 +153,6 @@ fn ctrlc_handler(cb: impl Fn() + Send + 'static) {
             libc::sigemptyset(&mut set);
             libc::sigaddset(&mut set, libc::SIGINT);
             libc::sigaddset(&mut set, libc::SIGTERM);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
             let mut sig: i32 = 0;
             libc::sigwait(&set, &mut sig);
             cb();
@@ -339,5 +367,34 @@ fn run_session(
             }
         }
         last_event_at = None;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_signals_masks_sigint_and_sigterm() {
+        // `block_signals` mutates the *calling* thread's mask, and cargo
+        // reuses test threads, so snapshot the mask and restore it after
+        // asserting to avoid leaking a blocked state into other tests.
+        unsafe {
+            let mut saved: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut saved);
+
+            block_signals();
+
+            let mut current: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current);
+
+            let int_blocked = libc::sigismember(&current, libc::SIGINT) == 1;
+            let term_blocked = libc::sigismember(&current, libc::SIGTERM) == 1;
+
+            libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut());
+
+            assert!(int_blocked, "block_signals must block SIGINT");
+            assert!(term_blocked, "block_signals must block SIGTERM");
+        }
     }
 }
