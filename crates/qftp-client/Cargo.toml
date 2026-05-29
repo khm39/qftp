@@ -28,12 +28,14 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 notify = "8"
+x509-parser = "0.16"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = "0.13"
 
 
 [package.metadata.deb]

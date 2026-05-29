@@ -1414,6 +1414,7 @@ dependencies = [
  "qftp-common",
  "qftp-protocol",
  "quiche",
+ "rcgen 0.13.2",
  "ring",
  "rustyline",
  "serde",
@@ -1422,6 +1423,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "x509-parser 0.16.0",
 ]
 
 [[package]]
