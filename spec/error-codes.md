@@ -45,15 +45,22 @@ codes are assigned the next unused value, appended to the end of the
 table; assigned values are never changed.
 
 Because the wire encoding is positional and not self-describing
-([versioning.md](versioning.md)), a decoder built before a code was
-assigned cannot map that discriminant to a known name. Such an
-implementation:
+([versioning.md](versioning.md)), a `code` discriminant a decoder does
+not know cannot be mapped to a variant: under `qftp/1` it makes the
+enclosing `ErrorResponse` **undecodable**, so the frame is rejected as
+`Malformed` (code `10`), exactly as for any unknown discriminant
+([versioning.md](versioning.md#the-wire-encoding-is-positional)). A
+decoder **MUST NOT** crash on such a frame.
 
-- **MUST NOT** crash on an unrecognised `code` value, and
-- **SHOULD** present it to the user as a generic failure equivalent to
-  `Internal` (code `11`), preserving the accompanying `message`.
+An implementation that can represent a raw, unrecognised discriminant
+(for example one that surfaces the numeric value rather than a named
+variant) **SHOULD** present it as a generic failure equivalent to
+`Internal` (code `11`), preserving the accompanying `message`.
+`qftp/1`'s encoding does not carry enough information for a strict
+decoder to do this, which is the reason introducing a new code is
+treated as a wire change rather than a transparent extension.
 
-Because adding a code is a change an older peer cannot fully decode,
+Because adding a code is a change an older peer cannot decode,
 introducing a new `ErrorCode` is a wire change: it **MUST** be recorded
 in [PROTOCOL-CHANGELOG.md](../PROTOCOL-CHANGELOG.md) and accompanied by
 a new vector in [`test-vectors/`](../test-vectors/).
