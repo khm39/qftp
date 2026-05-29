@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use qftp_common::util::{format_duration, format_size};
+
 static STARTED_AT: OnceLock<Instant> = OnceLock::new();
 
 static BYTES_UPLOADED: AtomicU64 = AtomicU64::new(0);
@@ -66,31 +68,6 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
-/// `12 B` / `1.2 KB` / `3.4 MB` / `5.6 GB`. Matches the REPL `ls`
-/// rendering style.
-pub fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{:02}m{:02}s", secs / 3600, (secs / 60) % 60, secs % 60)
-    }
-}
-
 /// Print a human-readable summary of the snapshot to stdout. Output
 /// format is stable enough to grep in tests but not a structured API.
 pub fn print(s: &Snapshot) {
@@ -124,24 +101,3 @@ pub fn print(s: &Snapshot) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_size_thresholds() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-        assert_eq!(format_size(1024), "1.0 KB");
-        assert_eq!(format_size(1024 * 1024), "1.0 MB");
-        assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GB");
-    }
-
-    #[test]
-    fn format_duration_rolls_over() {
-        use std::time::Duration;
-        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(Duration::from_secs(75)), "1m15s");
-        assert_eq!(format_duration(Duration::from_secs(3661)), "1h01m01s");
-    }
-}

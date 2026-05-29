@@ -242,112 +242,151 @@ pub fn resolve(
     // command-line URL so users get the "alias is a defaults bundle"
     // mental model.
 
-    let mut host = "127.0.0.1".to_string();
-    let mut port: u16 = DEFAULT_PORT;
-    let mut server_name = "localhost".to_string();
-    let mut user: Option<String> = None;
-    let mut initial_path: Option<String> = None;
-    let mut insecure = false;
-    let mut ca: Option<String> = None;
-    let mut client_cert: Option<String> = None;
-    let mut client_key: Option<String> = None;
-
-    // Step 2: alias.endpoint.
+    let mut acc = ResolveAcc::builtin();
     if let Some(alias) = &alias_part {
+        acc.apply_alias_endpoint(alias)?;
+        acc.apply_alias_fields(alias);
+    }
+    if let Some(u) = &url_part {
+        acc.apply_url(u);
+    }
+    acc.apply_overrides(overrides);
+
+    Ok(acc.into_spec())
+}
+
+/// Accumulator for the layered merge inside [`resolve`]. Each `apply_*`
+/// method folds one precedence layer onto the running state, lowest
+/// precedence first; later layers overwrite fields the earlier ones set.
+struct ResolveAcc {
+    host: String,
+    port: u16,
+    server_name: String,
+    user: Option<String>,
+    initial_path: Option<String>,
+    insecure: bool,
+    ca: Option<String>,
+    client_cert: Option<String>,
+    client_key: Option<String>,
+}
+
+impl ResolveAcc {
+    /// Step 1: builtin defaults.
+    fn builtin() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: DEFAULT_PORT,
+            server_name: "localhost".to_string(),
+            user: None,
+            initial_path: None,
+            insecure: false,
+            ca: None,
+            client_cert: None,
+            client_key: None,
+        }
+    }
+
+    /// Step 2: alias.endpoint, a URL parsed into host/port/sni/user/path.
+    fn apply_alias_endpoint(&mut self, alias: &HostConfig) -> Result<()> {
         if let Some(endpoint) = &alias.endpoint {
             let u = parse_url(endpoint)?;
-            host.clone_from(&u.host);
-            port = u.port;
-            server_name.clone_from(&u.host);
+            self.host.clone_from(&u.host);
+            self.port = u.port;
+            self.server_name.clone_from(&u.host);
             if let Some(uu) = &u.user {
-                user = Some(uu.clone());
+                self.user = Some(uu.clone());
             }
             if let Some(p) = &u.initial_path {
-                initial_path = Some(p.clone());
+                self.initial_path = Some(p.clone());
             }
         }
+        Ok(())
     }
 
-    // Step 3: alias explicit fields override the endpoint.
-    if let Some(alias) = &alias_part {
+    /// Step 3: alias explicit fields override the endpoint.
+    fn apply_alias_fields(&mut self, alias: &HostConfig) {
         if let Some(h) = &alias.host {
-            host.clone_from(h);
+            self.host.clone_from(h);
         }
         if let Some(p) = alias.port {
-            port = p;
+            self.port = p;
         }
         if let Some(s) = &alias.server_name {
-            server_name.clone_from(s);
+            self.server_name.clone_from(s);
         }
         if let Some(u) = &alias.user {
-            user = Some(u.clone());
+            self.user = Some(u.clone());
         }
         if let Some(b) = alias.insecure {
-            insecure = b;
+            self.insecure = b;
         }
         if let Some(p) = &alias.initial_path {
-            initial_path = Some(p.clone());
+            self.initial_path = Some(p.clone());
         }
         if let Some(s) = &alias.ca {
-            ca = Some(expand_tilde(s));
+            self.ca = Some(expand_tilde(s));
         }
         if let Some(s) = &alias.client_cert {
-            client_cert = Some(expand_tilde(s));
+            self.client_cert = Some(expand_tilde(s));
         }
         if let Some(s) = &alias.client_key {
-            client_key = Some(expand_tilde(s));
+            self.client_key = Some(expand_tilde(s));
         }
     }
 
-    // Step 4: URL given on the command line.
-    if let Some(u) = &url_part {
-        host.clone_from(&u.host);
-        port = u.port;
+    /// Step 4: URL given on the command line.
+    fn apply_url(&mut self, u: &UrlTarget) {
+        self.host.clone_from(&u.host);
+        self.port = u.port;
         // SNI follows the URL host unless explicitly overridden by a
         // flag later.
-        server_name.clone_from(&u.host);
+        self.server_name.clone_from(&u.host);
         if let Some(uu) = &u.user {
-            user = Some(uu.clone());
+            self.user = Some(uu.clone());
         }
         if let Some(p) = &u.initial_path {
-            initial_path = Some(p.clone());
+            self.initial_path = Some(p.clone());
         }
     }
 
-    // Step 5: CLI flags win.
-    if let Some(h) = &overrides.host {
-        let (h_only, p_opt) = split_host_port(h);
-        host = h_only;
-        if let Some(p) = p_opt {
-            port = p;
+    /// Step 5: CLI flags win.
+    fn apply_overrides(&mut self, overrides: &Overrides) {
+        if let Some(h) = &overrides.host {
+            let (h_only, p_opt) = split_host_port(h);
+            self.host = h_only;
+            if let Some(p) = p_opt {
+                self.port = p;
+            }
+        }
+        if let Some(s) = &overrides.server_name {
+            self.server_name.clone_from(s);
+        }
+        if let Some(b) = overrides.insecure {
+            self.insecure = b;
+        }
+        if overrides.ca.is_some() {
+            self.ca = overrides.ca.clone();
+        }
+        if overrides.client_cert.is_some() {
+            self.client_cert = overrides.client_cert.clone();
+        }
+        if overrides.client_key.is_some() {
+            self.client_key = overrides.client_key.clone();
         }
     }
-    if let Some(s) = &overrides.server_name {
-        server_name.clone_from(s);
-    }
-    if let Some(b) = overrides.insecure {
-        insecure = b;
-    }
-    if overrides.ca.is_some() {
-        ca = overrides.ca.clone();
-    }
-    if overrides.client_cert.is_some() {
-        client_cert = overrides.client_cert.clone();
-    }
-    if overrides.client_key.is_some() {
-        client_key = overrides.client_key.clone();
-    }
 
-    Ok(ConnectionSpec {
-        host: format_host_port(&host, port),
-        server_name,
-        user,
-        initial_path,
-        insecure,
-        ca,
-        client_cert,
-        client_key,
-    })
+    fn into_spec(self) -> ConnectionSpec {
+        ConnectionSpec {
+            host: format_host_port(&self.host, self.port),
+            server_name: self.server_name,
+            user: self.user,
+            initial_path: self.initial_path,
+            insecure: self.insecure,
+            ca: self.ca,
+            client_cert: self.client_cert,
+            client_key: self.client_key,
+        }
+    }
 }
 
 /// Format a host + port for the `SocketAddr` parser. IPv6 literals

@@ -84,18 +84,14 @@ impl Pacer {
         if self.rate <= 0.0 {
             return Duration::ZERO;
         }
-        // Refill.
         let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
-        self.last = now;
+        self.refill_tokens(now);
 
-        if (bytes as f64) <= self.tokens {
+        if self.check_capacity(bytes) {
             self.tokens -= bytes as f64;
             return Duration::ZERO;
         }
-        let need = bytes as f64 - self.tokens;
-        let wait = Duration::from_secs_f64(need / self.rate);
+        let wait = self.calculate_wait(bytes);
         // Treat the upcoming wait as having drained the deficit; the
         // caller blocks for `wait`, so account for it now and let the
         // next refill (off the updated `last`) credit time elapsed
@@ -103,6 +99,27 @@ impl Pacer {
         self.last = now + wait;
         self.tokens = 0.0;
         wait
+    }
+
+    /// Credit tokens for the time elapsed since the last refill, capped
+    /// at `burst`, and advance `last` to `now`.
+    fn refill_tokens(&mut self, now: std::time::Instant) {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        self.last = now;
+    }
+
+    /// Whether the bucket currently holds enough tokens to send `bytes`
+    /// without waiting.
+    fn check_capacity(&self, bytes: usize) -> bool {
+        (bytes as f64) <= self.tokens
+    }
+
+    /// How long the caller must wait to cover the deficit between
+    /// `bytes` and the tokens currently in the bucket.
+    fn calculate_wait(&self, bytes: usize) -> Duration {
+        let need = bytes as f64 - self.tokens;
+        Duration::from_secs_f64(need / self.rate)
     }
 }
 
@@ -121,7 +138,7 @@ pub fn parse_bw_limit(input: &str) -> anyhow::Result<u64> {
         anyhow::bail!("bwlimit is empty");
     }
     let bytes = s.as_bytes();
-    let (num_end, mult) = parse_suffix(bytes)
+    let (num_end, mult) = qftp_common::util::parse_suffix(bytes)
         .ok_or_else(|| anyhow::anyhow!("bwlimit: unrecognized suffix in '{input}'"))?;
     let num: f64 = std::str::from_utf8(&bytes[..num_end])
         .map_err(|_| anyhow::anyhow!("bwlimit: non-utf8 number"))?
@@ -131,27 +148,6 @@ pub fn parse_bw_limit(input: &str) -> anyhow::Result<u64> {
         anyhow::bail!("bwlimit: negative rate");
     }
     Ok((num * mult as f64) as u64)
-}
-
-fn parse_suffix(bytes: &[u8]) -> Option<(usize, u64)> {
-    // Walk back from the end to find the digit/suffix boundary.
-    let mut end = bytes.len();
-    while end > 0 && !bytes[end - 1].is_ascii_digit() && bytes[end - 1] != b'.' {
-        end -= 1;
-    }
-    let suffix = std::str::from_utf8(&bytes[end..]).unwrap_or("");
-    let mult: u64 = match suffix {
-        "" => 1,
-        "K" | "k" => 1_000,
-        "M" | "m" => 1_000_000,
-        "G" | "g" => 1_000_000_000,
-        "Ki" | "ki" => 1024,
-        "Mi" | "mi" => 1024 * 1024,
-        "Gi" | "gi" => 1024 * 1024 * 1024,
-        // An unrecognized suffix is a user typo, not a 1-byte unit.
-        _ => return None,
-    };
-    Some((end, mult))
 }
 
 fn make_bar(total: u64, label: &str) -> ProgressBar {

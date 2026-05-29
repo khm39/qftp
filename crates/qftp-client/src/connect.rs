@@ -307,18 +307,57 @@ fn cert_matches_hostname(der: &[u8], host: &str) -> bool {
     };
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if let Ok(Some(san)) = cert.subject_alternative_name() {
-            for gn in &san.value.general_names {
-                if let GeneralName::IPAddress(bytes) = gn {
-                    if ip_san_matches(bytes, &ip) {
-                        return true;
-                    }
+        return match_ip_san(&cert, &ip);
+    }
+
+    match match_dns_san(&cert, host) {
+        DnsSanVerdict::Matched => true,
+        // A SAN extension we cannot parse may carry a dNSName that would
+        // forbid the CN fallback; fail closed rather than fall through.
+        DnsSanVerdict::FailClosed => false,
+        DnsSanVerdict::DnsSanPresentNoMatch => false,
+        // Legacy CN fallback only when no dNSName SAN constrains the cert.
+        DnsSanVerdict::NoDnsSan => match_cn_fallback(&cert, host),
+    }
+}
+
+/// Match a literal IP target against the cert's SAN iPAddress entries
+/// only (RFC 9525): a DNS target is never considered here, and any
+/// missing / unparseable SAN extension yields no match.
+fn match_ip_san(cert: &x509_parser::certificate::X509Certificate, ip: &std::net::IpAddr) -> bool {
+    use x509_parser::prelude::*;
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for gn in &san.value.general_names {
+            if let GeneralName::IPAddress(bytes) = gn {
+                if ip_san_matches(bytes, ip) {
+                    return true;
                 }
             }
         }
-        return false;
     }
+    false
+}
 
+/// Outcome of matching a DNS host against the cert's dNSName SANs.
+enum DnsSanVerdict {
+    /// A dNSName SAN matched the host.
+    Matched,
+    /// One or more dNSName SANs were present but none matched. The CN
+    /// fallback must NOT run -- a present SAN constrains the cert.
+    DnsSanPresentNoMatch,
+    /// No dNSName SAN present at all. The CN fallback may run.
+    NoDnsSan,
+    /// The SAN extension could not be parsed; fail closed (an
+    /// unparseable SAN may carry a dNSName that would forbid the CN
+    /// fallback).
+    FailClosed,
+}
+
+/// Match a DNS host against the cert's dNSName SANs (single left-most
+/// wildcard label supported), reporting enough state for the caller to
+/// gate the legacy CN fallback and fail closed on a parse error.
+fn match_dns_san(cert: &x509_parser::certificate::X509Certificate, host: &str) -> DnsSanVerdict {
+    use x509_parser::prelude::*;
     let mut had_dns_san = false;
     match cert.subject_alternative_name() {
         Ok(Some(san)) => {
@@ -326,28 +365,31 @@ fn cert_matches_hostname(der: &[u8], host: &str) -> bool {
                 if let GeneralName::DNSName(pat) = gn {
                     had_dns_san = true;
                     if dns_name_matches(pat, host) {
-                        return true;
+                        return DnsSanVerdict::Matched;
                     }
                 }
             }
         }
         Ok(None) => {}
-        // A SAN extension we cannot parse may carry a dNSName that would
-        // forbid the CN fallback; fail closed rather than fall through.
-        Err(_) => return false,
+        Err(_) => return DnsSanVerdict::FailClosed,
     }
+    if had_dns_san {
+        DnsSanVerdict::DnsSanPresentNoMatch
+    } else {
+        DnsSanVerdict::NoDnsSan
+    }
+}
 
-    // Legacy CN fallback only when no dNSName SAN constrains the cert.
-    if !had_dns_san {
-        for attr in cert.subject().iter_common_name() {
-            if let Ok(cn) = attr.as_str() {
-                if dns_name_matches(cn, host) {
-                    return true;
-                }
+/// Legacy Subject CN fallback. Only consulted when the cert carries no
+/// dNSName SAN at all (see `match_dns_san`).
+fn match_cn_fallback(cert: &x509_parser::certificate::X509Certificate, host: &str) -> bool {
+    for attr in cert.subject().iter_common_name() {
+        if let Ok(cn) = attr.as_str() {
+            if dns_name_matches(cn, host) {
+                return true;
             }
         }
     }
-
     false
 }
 
