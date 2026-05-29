@@ -3,6 +3,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
 
 use qftp_common::protocol::{
@@ -360,6 +361,89 @@ fn check_path_safe(target: &Path, root: &Path) -> Option<Response> {
     recheck_ancestors_no_symlinks(target, root)
         .err()
         .map(Response::Err)
+}
+
+/// `Rm` that also keeps the per-user `used_bytes` cache correct.
+///
+/// The generic [`handle_request`] never sees the deleted file's size, so
+/// the removal is performed here against a single resolved `target`: the
+/// size is captured before `remove_file`, then decremented from
+/// `used_bytes` only on a successful delete.
+pub fn quota_aware_remove(path: &str, cwd: &Path, user: &User) -> Response {
+    if is_upload_temp(path) {
+        return err(
+            ErrorCode::PermissionDenied,
+            "cannot remove a server-internal upload temp file",
+        );
+    }
+    match resolve(cwd, &user.home, path) {
+        Ok(target) => {
+            // Parent-dir symlink TOCTOU re-check.
+            if let Err(e) = recheck_ancestors_no_symlinks(&target, &user.home) {
+                Response::Err(e)
+            } else {
+                let pre_size = fs::symlink_metadata(&target)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                match fs::remove_file(&target) {
+                    Ok(()) => {
+                        if pre_size > 0 {
+                            // Atomic saturating subtract: a plain
+                            // load/store loses concurrent Rm
+                            // decrements from other worker threads,
+                            // drifting `used_bytes` upward until the
+                            // user is falsely quota-locked.
+                            let _ = user.used_bytes.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |v| Some(v.saturating_sub(pre_size)),
+                            );
+                        }
+                        Response::Ok
+                    }
+                    Err(e) => err(io_code(&e), format!("rm failed: {e}")),
+                }
+            }
+        }
+        Err(e) => Response::Err(e),
+    }
+}
+
+/// `Rename` that also keeps the per-user `used_bytes` cache correct.
+///
+/// The actual rename is delegated to [`handle_request`] (so path
+/// validation and the FS op stay in one place); this only captures the
+/// size of any regular file the rename clobbers at the destination and
+/// refunds it from `used_bytes` once the rename succeeds -- otherwise
+/// repeated overwrite-renames drift the quota upward until the user is
+/// falsely QuotaExceeded.
+pub fn quota_aware_rename(req: &Request, cwd: &mut PathBuf, user: &User) -> Response {
+    let Request::Rename { from, to } = req else {
+        return handle_request(req, cwd, &user.home);
+    };
+    let from_path = resolve(cwd, &user.home, from).ok();
+    let to_path = resolve_parent(cwd, &user.home, to).ok();
+    let clobbered = match (&from_path, &to_path) {
+        // A rename onto itself frees nothing; only count a distinct
+        // destination that already holds a regular file.
+        (Some(f), Some(t)) if f != t => fs::symlink_metadata(t)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let resp = handle_request(req, cwd, &user.home);
+    if matches!(resp, Response::Ok) && clobbered > 0 {
+        user.used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(clobbered))
+            })
+            .ok();
+    }
+    resp
 }
 
 pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response {
