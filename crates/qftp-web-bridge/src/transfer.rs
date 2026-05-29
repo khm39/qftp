@@ -12,7 +12,7 @@
 //! with absolute paths (the SPA tracks its own location). This lets the
 //! session loop run streams concurrently without a shared, mutable cwd.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use qftp_common::transport::{decode_framed_message, MAX_MESSAGE_SIZE};
 use qftp_protocol::handler;
 use qftp_protocol::stream::{
     apply_mode, classify_put_chunk, resolve_put_checksum, temp_path_for, PutOverflow, TrailerBuf,
-    FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+    UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
 };
 use qftp_protocol::user::{InFlightReservation, User};
 use serde::Serialize;
@@ -87,20 +87,17 @@ async fn dispatch_request(
             no_clobber,
             checksum_trailer,
         } => {
-            do_put(
-                send,
-                recv,
-                user,
-                &path,
+            let ctx = PutContext {
+                path,
                 size,
                 mode,
                 offset,
-                checksum,
+                expected_checksum: checksum,
                 no_clobber,
                 checksum_trailer,
                 leftover,
-            )
-            .await
+            };
+            do_put(send, recv, user, ctx).await
         }
 
         Request::Quota => {
@@ -396,12 +393,10 @@ impl Drop for PutGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn do_put(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
-    user: &Arc<User>,
-    path: &str,
+/// The parameters of a single `Put` request, bundled so `do_put` and
+/// its stage helpers pass one value instead of a long argument list.
+struct PutContext {
+    path: String,
     size: u64,
     mode: u32,
     offset: u64,
@@ -409,31 +404,16 @@ async fn do_put(
     no_clobber: bool,
     checksum_trailer: bool,
     leftover: Vec<u8>,
-) -> Result<()> {
-    let root = &user.home;
+}
 
-    if size > MAX_FILE_SIZE {
-        return reply_err(
-            send,
-            ErrorResponse::new(
-                ErrorCode::FileTooLarge,
-                format!("Upload too large: {size} bytes (max {MAX_FILE_SIZE})"),
-            ),
-        )
-        .await;
-    }
-    // Upload resume (continuing a server-side `.partial` from a prior
-    // session) is a native-client feature; the web SPA always uploads
-    // whole files, so the bridge only accepts fresh uploads.
-    if offset != 0 {
-        return reply_err(
-            send,
-            ErrorResponse::new(
-                ErrorCode::Unsupported,
-                "the web bridge does not support upload resume (offset > 0)",
-            ),
-        )
-        .await;
+async fn do_put(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    user: &Arc<User>,
+    ctx: PutContext,
+) -> Result<()> {
+    if let Err(e) = validate_put_preconditions(&ctx) {
+        return reply_err(send, e).await;
     }
 
     // Quota enforcement. Reserve the bytes against `in_flight_bytes`
@@ -443,7 +423,7 @@ async fn do_put(
     // From here every early return drops `guard`, which releases the
     // reservation and removes the temp file if one was created.
     let mut guard = PutGuard {
-        reservation: InFlightReservation::reserve(Arc::clone(user), size),
+        reservation: InFlightReservation::reserve(Arc::clone(user), ctx.size),
         temp_path: None,
     };
     if let Some(limit) = user.quota_bytes {
@@ -464,12 +444,84 @@ async fn do_put(
         }
     }
 
+    // Holds the upload claim (released when `do_put` returns) for the
+    // duration of the streaming + commit below; a bare `_` would drop it
+    // immediately and free the claim mid-upload.
+    let (_claim, final_path, temp_path, mut file) =
+        match resolve_and_open_temp(user, &mut guard, &ctx).await? {
+            Ok(opened) => opened,
+            Err(e) => return reply_err(send, e).await,
+        };
+
+    let mut hasher = blake3::Hasher::new();
+    let mut trailer_buf = TrailerBuf::new();
+
+    if let Some(e) = stream_put_body(recv, &mut file, &mut hasher, &mut trailer_buf, &ctx).await? {
+        return reply_err(send, e).await;
+    }
+
+    file.flush().await.context("temp file flush failed")?;
+    drop(file);
+
+    if let Err(e) = verify_put_checksum(&ctx, &hasher, &trailer_buf) {
+        return reply_err(send, e).await;
+    }
+
+    if let Err(e) = commit_put(user, &ctx, &final_path, &temp_path).await? {
+        return reply_err(send, e).await;
+    }
+
+    // The upload committed: disarm the guard so its drop won't undo it,
+    // then hand the reservation over to the persistent used-bytes
+    // counter.
+    guard.reservation.disarm();
+    user.in_flight_bytes.fetch_sub(ctx.size, Ordering::Relaxed);
+    user.used_bytes.fetch_add(ctx.size, Ordering::Relaxed);
+
+    send_framed(send, &Response::Ok).await?;
+    finish(send).await
+}
+
+/// Size, resume, and overflow checks that must pass before any quota
+/// reservation or filesystem work happens.
+fn validate_put_preconditions(ctx: &PutContext) -> std::result::Result<(), ErrorResponse> {
+    if ctx.size > MAX_FILE_SIZE {
+        return Err(ErrorResponse::new(
+            ErrorCode::FileTooLarge,
+            format!("Upload too large: {} bytes (max {MAX_FILE_SIZE})", ctx.size),
+        ));
+    }
+    // Upload resume (continuing a server-side `.partial` from a prior
+    // session) is a native-client feature; the web SPA always uploads
+    // whole files, so the bridge only accepts fresh uploads.
+    if ctx.offset != 0 {
+        return Err(ErrorResponse::new(
+            ErrorCode::Unsupported,
+            "the web bridge does not support upload resume (offset > 0)",
+        ));
+    }
+    Ok(())
+}
+
+type ResolvedTemp = (UploadClaim, PathBuf, PathBuf, tokio::fs::File);
+
+/// Resolve the destination, claim it, and open the truncated temp file.
+/// On success returns the held claim plus the final path, temp path, and
+/// open temp file. `guard.temp_path` is armed before the open so a
+/// cancellation between create and return still reaps the partial.
+async fn resolve_and_open_temp(
+    user: &Arc<User>,
+    guard: &mut PutGuard,
+    ctx: &PutContext,
+) -> Result<std::result::Result<ResolvedTemp, ErrorResponse>> {
+    let root = &user.home;
+
     // Same shape as `do_get`'s resolve: bundle the path validation
     // syscalls (resolve_parent, ancestor lstats, optional no_clobber
     // lstat) into one blocking task.
     type ResolveOutcome = std::result::Result<(PathBuf, bool), ErrorResponse>;
     let resolve_outcome: ResolveOutcome = run_blocking_path_op(
-        path.to_string(),
+        ctx.path.clone(),
         root.clone(),
         "do_put resolve",
         |path_owned, root_owned| {
@@ -482,17 +534,13 @@ async fn do_put(
     .await?;
     let (final_path, exists) = match resolve_outcome {
         Ok(pair) => pair,
-        Err(e) => return reply_err(send, e).await,
+        Err(e) => return Ok(Err(e)),
     };
-    if no_clobber && exists {
-        return reply_err(
-            send,
-            ErrorResponse::new(
-                ErrorCode::AlreadyExists,
-                format!("path already exists (no_clobber): {path}"),
-            ),
-        )
-        .await;
+    if ctx.no_clobber && exists {
+        return Ok(Err(ErrorResponse::new(
+            ErrorCode::AlreadyExists,
+            format!("path already exists (no_clobber): {}", ctx.path),
+        )));
     }
 
     // Claim the destination path so a second concurrent upload to the
@@ -501,20 +549,18 @@ async fn do_put(
     // takes the identical claim; without it each side's BLAKE3 covers
     // only the bytes it sent, so an interleaved corrupt file could
     // still pass verification. Released when this function returns.
-    let _claim =
-        match qftp_protocol::stream::UploadClaim::try_claim(Arc::clone(user), final_path.clone()) {
-            Some(c) => c,
-            None => {
-                return reply_err(
-                    send,
-                    ErrorResponse::new(
-                        ErrorCode::AlreadyExists,
-                        format!("an upload to this path is already in progress: {path}"),
-                    ),
-                )
-                .await;
-            }
-        };
+    let claim = match UploadClaim::try_claim(Arc::clone(user), final_path.clone()) {
+        Some(c) => c,
+        None => {
+            return Ok(Err(ErrorResponse::new(
+                ErrorCode::AlreadyExists,
+                format!(
+                    "an upload to this path is already in progress: {}",
+                    ctx.path
+                ),
+            )));
+        }
+    };
 
     let temp_path = temp_path_for(&final_path);
     // Assign the temp_path to the guard *before* the open spawn_blocking
@@ -577,31 +623,41 @@ async fn do_put(
     .await?;
     let std_file = match open_outcome {
         Ok(f) => f,
-        Err(e) => return reply_err(send, e).await,
+        Err(e) => return Ok(Err(e)),
     };
-    let mut file = tokio::fs::File::from_std(std_file);
+    let file = tokio::fs::File::from_std(std_file);
+    Ok(Ok((claim, final_path, temp_path, file)))
+}
 
-    let mut hasher = blake3::Hasher::new();
-    let mut body_remaining = size;
-    let mut trailer_buf = TrailerBuf::new();
+/// Stream the leftover prefix plus the rest of the body and (when
+/// requested) the BLAKE3 trailer into `file`, hashing as it goes.
+/// Returns `Ok(Some(_))` for a protocol error, `Ok(None)` on success.
+async fn stream_put_body(
+    recv: &mut RecvStream,
+    file: &mut tokio::fs::File,
+    hasher: &mut blake3::Hasher,
+    trailer_buf: &mut TrailerBuf,
+    ctx: &PutContext,
+) -> Result<Option<ErrorResponse>> {
+    let mut body_remaining = ctx.size;
 
     // Route the bytes that arrived alongside the request frame, then
     // keep reading until the body and (when requested) the 32-byte
     // BLAKE3 trailer are complete.
     if let Some(e) = route_put_chunk(
-        &leftover,
-        &mut file,
-        &mut hasher,
+        &ctx.leftover,
+        file,
+        hasher,
         &mut body_remaining,
-        &mut trailer_buf,
-        checksum_trailer,
+        trailer_buf,
+        ctx.checksum_trailer,
     )
     .await?
     {
-        return reply_err(send, e).await;
+        return Ok(Some(e));
     }
     let mut tmp = vec![0u8; FILE_CHUNK_SIZE];
-    while body_remaining > 0 || (checksum_trailer && !trailer_buf.is_full()) {
+    while body_remaining > 0 || (ctx.checksum_trailer && !trailer_buf.is_full()) {
         let n = match recv.read(&mut tmp).await.context("stream read failed")? {
             Some(0) => {
                 // A zero-length read on an open stream is anomalous --
@@ -616,7 +672,7 @@ async fn do_put(
                 } else {
                     "Stream yielded no data while the BLAKE3 trailer was incomplete"
                 };
-                return reply_err(send, ErrorResponse::new(ErrorCode::UploadTruncated, msg)).await;
+                return Ok(Some(ErrorResponse::new(ErrorCode::UploadTruncated, msg)));
             }
             Some(n) => n,
             None => {
@@ -625,44 +681,56 @@ async fn do_put(
                 } else {
                     "Stream closed before the BLAKE3 trailer was complete"
                 };
-                return reply_err(send, ErrorResponse::new(ErrorCode::UploadTruncated, msg)).await;
+                return Ok(Some(ErrorResponse::new(ErrorCode::UploadTruncated, msg)));
             }
         };
         if let Some(e) = route_put_chunk(
             &tmp[..n],
-            &mut file,
-            &mut hasher,
+            file,
+            hasher,
             &mut body_remaining,
-            &mut trailer_buf,
-            checksum_trailer,
+            trailer_buf,
+            ctx.checksum_trailer,
         )
         .await?
         {
-            return reply_err(send, e).await;
+            return Ok(Some(e));
         }
     }
+    Ok(None)
+}
 
-    file.flush().await.context("temp file flush failed")?;
-    drop(file);
-
-    // Verify the checksum before the rename: a corrupt body must never
-    // become visible at `final_path`. The shared precedence rule (#269):
-    // a complete streamed trailer overrides the legacy header checksum
-    // when both are present.
-    let expected = resolve_put_checksum(checksum_trailer, &trailer_buf, expected_checksum);
+/// Verify the uploaded body against the streamed trailer or header
+/// checksum before the rename, so a corrupt body never becomes visible
+/// at `final_path`. The shared precedence rule (#269): a complete
+/// streamed trailer overrides the legacy header checksum when both are
+/// present.
+fn verify_put_checksum(
+    ctx: &PutContext,
+    hasher: &blake3::Hasher,
+    trailer_buf: &TrailerBuf,
+) -> std::result::Result<(), ErrorResponse> {
+    let expected = resolve_put_checksum(ctx.checksum_trailer, trailer_buf, ctx.expected_checksum);
     if let Some(expected) = expected {
         if *hasher.finalize().as_bytes() != expected {
-            return reply_err(
-                send,
-                ErrorResponse::new(
-                    ErrorCode::ChecksumMismatch,
-                    "Upload checksum verification failed",
-                ),
-            )
-            .await;
+            return Err(ErrorResponse::new(
+                ErrorCode::ChecksumMismatch,
+                "Upload checksum verification failed",
+            ));
         }
     }
+    Ok(())
+}
 
+/// Commit the verified temp file to its final path: recheck ancestors,
+/// rename, and apply the requested mode, all in one blocking task.
+async fn commit_put(
+    user: &Arc<User>,
+    ctx: &PutContext,
+    final_path: &Path,
+    temp_path: &Path,
+) -> Result<std::result::Result<(), ErrorResponse>> {
+    let root = &user.home;
     // Commit: bundle the symlink TOCTOU recheck + rename + mode
     // application into one blocking task so the tokio scheduler can't
     // interleave another task between them. The recheck must happen
@@ -674,10 +742,11 @@ async fn do_put(
     // `final_path` at the temp file's 0o600 for any concurrent reader
     // in the gap; bundling them keeps the file invisible at
     // `final_path` until both succeed.
-    let temp_for_commit = temp_path.clone();
+    let temp_for_commit = temp_path.to_path_buf();
+    let mode = ctx.mode;
     type CommitOutcome = std::result::Result<(), ErrorResponse>;
     let commit_outcome: CommitOutcome = run_blocking_path_op(
-        final_path.clone(),
+        final_path.to_path_buf(),
         root.clone(),
         "do_put commit",
         move |final_for_commit, root_for_commit| {
@@ -694,19 +763,7 @@ async fn do_put(
         },
     )
     .await?;
-    if let Err(e) = commit_outcome {
-        return reply_err(send, e).await;
-    }
-
-    // The upload committed: disarm the guard so its drop won't undo it,
-    // then hand the reservation over to the persistent used-bytes
-    // counter.
-    guard.reservation.disarm();
-    user.in_flight_bytes.fetch_sub(size, Ordering::Relaxed);
-    user.used_bytes.fetch_add(size, Ordering::Relaxed);
-
-    send_framed(send, &Response::Ok).await?;
-    finish(send).await
+    Ok(commit_outcome)
 }
 
 /// Map the transport-agnostic [`PutOverflow`] from the shared
