@@ -272,6 +272,7 @@ fn try_connect(
         let der = conn.peer_cert().ok_or_else(|| {
             anyhow!("{context_label}: server presented no certificate to verify hostname against")
         })?;
+        // Bind to `server_name` (intended identity / SNI, config-overridable), not `spec.host` (dial target).
         if !cert_matches_hostname(der, &spec.server_name) {
             conn.close(true, 0x0, b"server cert hostname mismatch").ok();
             let _ = flush_egress(&mut conn, &socket);
@@ -319,15 +320,21 @@ fn cert_matches_hostname(der: &[u8], host: &str) -> bool {
     }
 
     let mut had_dns_san = false;
-    if let Ok(Some(san)) = cert.subject_alternative_name() {
-        for gn in &san.value.general_names {
-            if let GeneralName::DNSName(pat) = gn {
-                had_dns_san = true;
-                if dns_name_matches(pat, host) {
-                    return true;
+    match cert.subject_alternative_name() {
+        Ok(Some(san)) => {
+            for gn in &san.value.general_names {
+                if let GeneralName::DNSName(pat) = gn {
+                    had_dns_san = true;
+                    if dns_name_matches(pat, host) {
+                        return true;
+                    }
                 }
             }
         }
+        Ok(None) => {}
+        // A SAN extension we cannot parse may carry a dNSName that would
+        // forbid the CN fallback; fail closed rather than fall through.
+        Err(_) => return false,
     }
 
     // Legacy CN fallback only when no dNSName SAN constrains the cert.
@@ -461,6 +468,44 @@ mod tests {
             .to_vec();
         assert!(cert_matches_hostname(&der, "legacy.example.com"));
         assert!(!cert_matches_hostname(&der, "elsewhere.example.com"));
+    }
+
+    #[test]
+    fn unparseable_san_does_not_fall_back_to_cn() {
+        use x509_parser::prelude::*;
+
+        // Emit a normal dNSName SAN plus a duplicate SAN extension (same
+        // OID 2.5.29.17) via a custom extension. x509-parser then fails
+        // to resolve `subject_alternative_name()` (DuplicateExtensions),
+        // and the host must NOT be authenticated by the matching CN.
+        let mut params =
+            CertificateParams::new(vec!["other.example.com".to_string()]).expect("rcgen new");
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "legacy.example.com");
+        params.distinguished_name = dn;
+        // A second, syntactically valid SAN extension: SEQUENCE { dNSName }.
+        let dup_san = rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 17],
+            vec![0x30, 0x14, 0x82, 0x12]
+                .into_iter()
+                .chain(b"legacy.example.com".iter().copied())
+                .collect(),
+        );
+        params.custom_extensions.push(dup_san);
+        let key = KeyPair::generate().expect("rcgen keypair");
+        let der = params
+            .self_signed(&key)
+            .expect("self_signed")
+            .der()
+            .to_vec();
+
+        let (_, cert) = X509Certificate::from_der(&der).expect("cert must still parse");
+        assert!(
+            cert.subject_alternative_name().is_err(),
+            "test precondition: SAN getter must return Err"
+        );
+        // Fail closed: CN matches but the unparseable SAN must block it.
+        assert!(!cert_matches_hostname(&der, "legacy.example.com"));
     }
 
     #[test]
