@@ -41,28 +41,26 @@ struct StaticFile {
     body: &'static [u8],
 }
 
+/// (request path, content type, body) for every embedded route.
+static ROUTES: &[(&str, &str, &[u8])] = &[
+    ("/", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
+    ("/index.html", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
+    ("/app.js", "text/javascript; charset=utf-8", APP_JS.as_bytes()),
+    (
+        "/blake3.js",
+        "text/javascript; charset=utf-8",
+        BLAKE3_JS.as_bytes(),
+    ),
+    ("/style.css", "text/css; charset=utf-8", STYLE_CSS.as_bytes()),
+];
+
 /// Map a request target (path, query stripped) to an embedded file.
 fn route(target: &str) -> Option<StaticFile> {
     let path = target.split('?').next().unwrap_or(target);
-    match path {
-        "/" | "/index.html" => Some(StaticFile {
-            content_type: "text/html; charset=utf-8",
-            body: INDEX_HTML.as_bytes(),
-        }),
-        "/app.js" => Some(StaticFile {
-            content_type: "text/javascript; charset=utf-8",
-            body: APP_JS.as_bytes(),
-        }),
-        "/blake3.js" => Some(StaticFile {
-            content_type: "text/javascript; charset=utf-8",
-            body: BLAKE3_JS.as_bytes(),
-        }),
-        "/style.css" => Some(StaticFile {
-            content_type: "text/css; charset=utf-8",
-            body: STYLE_CSS.as_bytes(),
-        }),
-        _ => None,
-    }
+    ROUTES
+        .iter()
+        .find(|(p, _, _)| *p == path)
+        .map(|&(_, content_type, body)| StaticFile { content_type, body })
 }
 
 /// Bind the SPA HTTP listener and serve it forever. `config_json` is

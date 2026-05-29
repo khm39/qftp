@@ -16,6 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use qftp_common::protocol::{ErrorCode, Request, Response};
+use qftp_common::transport::{decode_framed_message, encode_framed_message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wtransport::endpoint::endpoint_side::Client;
 use wtransport::{ClientConfig, Connection, Endpoint, Identity, RecvStream, SendStream};
@@ -45,20 +46,15 @@ fn free_tcp_port() -> u16 {
         .port()
 }
 
-/// Prefix a bincode payload with the 4-byte big-endian length frame.
-fn frame(payload: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(4 + payload.len());
-    v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    v.extend_from_slice(payload);
-    v
-}
-
-/// Split a buffer into its first length-prefixed frame and the rest.
-fn split_frame(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    assert!(data.len() >= 4, "response shorter than a frame header");
-    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    assert!(data.len() >= 4 + len, "response frame is incomplete");
-    (data[4..4 + len].to_vec(), data[4 + len..].to_vec())
+/// Decode the first length-prefixed `Response` frame out of `data`,
+/// draining the consumed prefix + payload so the bytes that follow the
+/// frame (a `Get` body + BLAKE3 trailer) stay in `data`. The inner
+/// `expect` reproduces the old `split_frame` assert that the buffer
+/// holds a complete frame.
+fn decode_response(data: &mut Vec<u8>) -> Response {
+    decode_framed_message::<Response>(data)
+        .expect("decode response")
+        .expect("response frame is incomplete")
 }
 
 async fn read_to_end(recv: &mut RecvStream) -> Vec<u8> {
@@ -84,12 +80,12 @@ async fn open_bi(conn: &Connection) -> (SendStream, RecvStream) {
 /// Run a one-shot request whose reply is a single framed `Response`.
 async fn op(conn: &Connection, req: &Request) -> Response {
     let (mut send, mut recv) = open_bi(conn).await;
-    send.write_all(&frame(&bincode::serialize(req).unwrap()))
+    send.write_all(&encode_framed_message(req).unwrap())
         .await
         .expect("write request");
     send.finish().await.expect("finish request");
-    let data = read_to_end(&mut recv).await;
-    bincode::deserialize(&split_frame(&data).0).expect("decode response")
+    let mut data = read_to_end(&mut recv).await;
+    decode_response(&mut data)
 }
 
 /// Upload `body`, optionally with a header BLAKE3 checksum.
@@ -104,13 +100,13 @@ async fn put(conn: &Connection, path: &str, body: &[u8], checksum: Option<[u8; 3
         no_clobber: false,
         checksum_trailer: false,
     };
-    send.write_all(&frame(&bincode::serialize(&req).unwrap()))
+    send.write_all(&encode_framed_message(&req).unwrap())
         .await
         .expect("write put header");
     send.write_all(body).await.expect("write put body");
     send.finish().await.expect("finish put");
-    let data = read_to_end(&mut recv).await;
-    bincode::deserialize(&split_frame(&data).0).expect("decode put response")
+    let mut data = read_to_end(&mut recv).await;
+    decode_response(&mut data)
 }
 
 /// Upload `body` the way the browser SPA does: declare
@@ -132,14 +128,14 @@ async fn put_with_trailer(
         no_clobber: false,
         checksum_trailer: true,
     };
-    send.write_all(&frame(&bincode::serialize(&req).unwrap()))
+    send.write_all(&encode_framed_message(&req).unwrap())
         .await
         .expect("write put header");
     send.write_all(body).await.expect("write put body");
     send.write_all(&trailer).await.expect("write put trailer");
     send.finish().await.expect("finish put");
-    let data = read_to_end(&mut recv).await;
-    bincode::deserialize(&split_frame(&data).0).expect("decode put response")
+    let mut data = read_to_end(&mut recv).await;
+    decode_response(&mut data)
 }
 
 /// Download `path`; returns the framed response plus the trailing
@@ -151,16 +147,13 @@ async fn get(conn: &Connection, path: &str) -> (Response, Vec<u8>) {
         offset: 0,
         length: None,
     };
-    send.write_all(&frame(&bincode::serialize(&req).unwrap()))
+    send.write_all(&encode_framed_message(&req).unwrap())
         .await
         .expect("write get");
     send.finish().await.expect("finish get");
-    let data = read_to_end(&mut recv).await;
-    let (payload, rest) = split_frame(&data);
-    (
-        bincode::deserialize(&payload).expect("decode get response"),
-        rest,
-    )
+    let mut data = read_to_end(&mut recv).await;
+    let resp = decode_response(&mut data);
+    (resp, data)
 }
 
 /// Like [`get`] but resumes from `offset`, exercising the whole-file
@@ -172,16 +165,13 @@ async fn get_at(conn: &Connection, path: &str, offset: u64) -> (Response, Vec<u8
         offset,
         length: None,
     };
-    send.write_all(&frame(&bincode::serialize(&req).unwrap()))
+    send.write_all(&encode_framed_message(&req).unwrap())
         .await
         .expect("write get");
     send.finish().await.expect("finish get");
-    let data = read_to_end(&mut recv).await;
-    let (payload, rest) = split_frame(&data);
-    (
-        bincode::deserialize(&payload).expect("decode get response"),
-        rest,
-    )
+    let mut data = read_to_end(&mut recv).await;
+    let resp = decode_response(&mut data);
+    (resp, data)
 }
 
 fn expect_ok(resp: Response, ctx: &str) {
