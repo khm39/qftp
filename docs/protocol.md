@@ -56,14 +56,16 @@ If anything goes wrong (path traversal, ACL denial, file too large, range past E
 ### Put
 
 ```
-client -> server : Request::Put { path, size, mode, offset, checksum }
+client -> server : Request::Put { path, size, mode, offset, checksum, no_clobber, checksum_trailer }
 client -> server : <size bytes of body, FIN on the last byte>
+                   <32 bytes BLAKE3 trailer, if checksum_trailer>
 server -> client : Response::Ok | Response::Err(...)
 ```
 
 - `size` is the number of body bytes the client is about to send (post-offset).
 - `offset` enables append-style resume. The interrupted upload's partial lives next to the eventual destination as `<final-filename>.qftp.partial` (so the final `rename` stays atomic) and is kept on disk across a disconnect. The name is deterministic — derived only from the destination — so a later session can find it: a client `Stat`s that path to learn how many bytes already landed and sends that count as `offset` (the native client does this automatically). When `offset > 0` the server opens the existing partial, requires it to be exactly `offset` bytes long (`ErrorCode::InvalidRange` otherwise), re-hashes that prefix into the running BLAKE3, and appends. A fresh Put (`offset == 0`) truncates and reuses any stale partial at that path.
-- `checksum` (BLAKE3 of the full file, not just the bytes being sent this round) is verified after the last byte. On mismatch the temp is removed — a corrupt partial would only fail the same check on every resume — and the response carries `ErrorCode::ChecksumMismatch`.
+- `no_clobber`: when true, the server refuses the upload with `ErrorCode::AlreadyExists` if `path` already exists. Defaults to `false` (silent overwrite) for older clients.
+- Checksum verification has two paths. `checksum` is the legacy header field: the BLAKE3 of the full file, populated by a pre-send pass. `checksum_trailer` lets the client hash as it streams and append a 32-byte BLAKE3 trailer on the same stream right after the `size` body bytes. When the trailer is present and full it takes precedence over the header `checksum` (`resolve_put_checksum` in `crates/qftp-protocol/src/stream.rs`, shared by both transports since #269); the native client always uses the trailer path (`checksum_trailer: true`, `checksum: None`). The chosen checksum (BLAKE3 of the full file, not just the bytes sent this round) is verified after the last byte. On mismatch the temp is removed — a corrupt partial would only fail the same check on every resume — and the response carries `ErrorCode::ChecksumMismatch`. With neither field set, the upload is accepted unverified (pre-existing behavior).
 
 Upon success, the server `rename`s the temp into place atomically and applies `mode` (Unix only).
 
@@ -77,6 +79,7 @@ NotADirectory     IsADirectory      FileTooLarge
 UploadOverflow    UploadTruncated   ChecksumMismatch
 RateLimited       Malformed         Internal
 Unauthorized      InvalidRange      Unsupported
+QuotaExceeded
 ```
 
 ## Versioning policy
@@ -102,10 +105,19 @@ request set:
 
 | Request | 0-RTT? |
 |---|---|
-| `Ls`, `Cd`, `Pwd`, `Stat`, `Get`, `Quit` | Allowed -- read-only / idempotent |
-| `Put`, `Rm`, `Mkdir`, `Rmdir`, `Rename`, `Chmod` | Refused with `ErrorCode::Unsupported` ("Operation requires 1-RTT data") |
+| `Ls`, `Cd`, `Pwd`, `Stat`, `Quit` | Allowed -- read-only / idempotent, small fixed-size reply |
+| `Get`, `Quota`, `Put`, `Rm`, `Mkdir`, `Rmdir`, `Rename`, `Chmod` | Refused with `ErrorCode::Unsupported` ("Operation requires 1-RTT data") |
 
-The check is `conn.is_in_early_data()` at request-decode time. After
+`Get` is refused even though its reply is idempotent and side-effect-free:
+it can return up to `MAX_FILE_SIZE` bytes, so a replayed 0-RTT flight is a
+bandwidth amplification primitive (reflected downloads against a spoofed
+source IP). `Quota` is likewise refused — a captured 0-RTT `Quota` can be
+re-fired indefinitely as an amplification "ping" against the user record.
+The allow list therefore keeps only small fixed-size replies. The latency
+cost is one extra round trip on the first request of a session; subsequent
+requests run at 1-RTT either way.
+
+The check is `request_is_replay_safe` against `conn.is_in_early_data()` at request-decode time. `request_is_replay_safe` only classifies whether a request type is safe to replay; the request-dispatch loop in `server.rs` is what tests `conn.is_in_early_data()` and applies that classification solely to requests arriving as 0-RTT early data. After
 the handshake completes, every request is allowed; the client's retry
 of a refused mutation transparently goes through under 1-RTT.
 
