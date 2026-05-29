@@ -1,0 +1,19 @@
+[package]
+name = "qftp-conformance"
+description = "Language-independent conformance test vectors for the qftp wire protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+qftp-common = { path = "../qftp-common" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "gen-vectors"
+path = "src/bin/gen_vectors.rs"
