@@ -44,14 +44,26 @@ struct StaticFile {
 /// (request path, content type, body) for every embedded route.
 static ROUTES: &[(&str, &str, &[u8])] = &[
     ("/", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
-    ("/index.html", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
-    ("/app.js", "text/javascript; charset=utf-8", APP_JS.as_bytes()),
+    (
+        "/index.html",
+        "text/html; charset=utf-8",
+        INDEX_HTML.as_bytes(),
+    ),
+    (
+        "/app.js",
+        "text/javascript; charset=utf-8",
+        APP_JS.as_bytes(),
+    ),
     (
         "/blake3.js",
         "text/javascript; charset=utf-8",
         BLAKE3_JS.as_bytes(),
     ),
-    ("/style.css", "text/css; charset=utf-8", STYLE_CSS.as_bytes()),
+    (
+        "/style.css",
+        "text/css; charset=utf-8",
+        STYLE_CSS.as_bytes(),
+    ),
 ];
 
 /// Map a request target (path, query stripped) to an embedded file.

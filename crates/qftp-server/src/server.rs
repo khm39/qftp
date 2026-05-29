@@ -290,7 +290,12 @@ fn handler_worker(
 /// it, so a panic mid-handler can't desync the working directory.
 /// `log_msg` is logged verbatim alongside the panic so each caller keeps
 /// its own message text.
-fn handle_handler_panic(req: &Request, cwd: PathBuf, user: &User, log_msg: &str) -> (Response, PathBuf) {
+fn handle_handler_panic(
+    req: &Request,
+    cwd: PathBuf,
+    user: &User,
+    log_msg: &str,
+) -> (Response, PathBuf) {
     let cwd_snapshot = if matches!(req, Request::Cd { .. }) {
         Some(cwd.clone())
     } else {
@@ -768,9 +773,7 @@ fn phase_drain_handler_results(
 }
 
 /// Phase 2: advance each connection's QUIC timers.
-fn phase_on_timeout(
-    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
-) {
+fn phase_on_timeout(connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>) {
     for ctx in connections.values_mut() {
         ctx.conn.on_timeout();
     }

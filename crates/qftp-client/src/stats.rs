@@ -100,4 +100,3 @@ pub fn print(s: &Snapshot) {
         );
     }
 }
-

@@ -86,8 +86,7 @@ fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, ErrorR
     // Single source for the three structurally-distinct ways a `..` can
     // escape and the final post-walk guard, so the wording stays in one
     // place.
-    let outside_root =
-        || ErrorResponse::new(ErrorCode::PermissionDenied, "path outside root");
+    let outside_root = || ErrorResponse::new(ErrorCode::PermissionDenied, "path outside root");
 
     let p = Path::new(user_path);
     let mut current = if p.is_absolute() {

@@ -284,9 +284,7 @@ pub struct UploadClaim {
 /// The set only tracks in-flight destination paths; a thread that
 /// panicked while holding it leaves the set itself consistent, so
 /// recovering the guard is correct rather than propagating the panic.
-fn lock_uploads(
-    user: &User,
-) -> std::sync::MutexGuard<'_, std::collections::HashSet<PathBuf>> {
+fn lock_uploads(user: &User) -> std::sync::MutexGuard<'_, std::collections::HashSet<PathBuf>> {
     user.active_uploads
         .lock()
         .unwrap_or_else(|e| e.into_inner())
