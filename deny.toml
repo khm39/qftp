@@ -10,7 +10,9 @@
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+# RUSTSEC-2025-0141: bincode 1.x is unmaintained (no known vulnerability).
+# Accepted for now; revisit when migrating serialization off bincode 1.x.
+ignore = ["RUSTSEC-2025-0141"]
 
 [licenses]
 version = 2
