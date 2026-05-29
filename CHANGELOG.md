@@ -2,9 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-qftp's public API surface is the wire protocol (see
-[docs/protocol.md](docs/protocol.md)); the ALPN major version (`qftp/<n>`)
-is what we will bump to signal an intentional wire break.
+qftp's public API surface is the wire protocol (specified in
+[spec/](spec/)); the ALPN major version (`qftp/<n>`) is what we will
+bump to signal an intentional wire break. Wire-protocol changes are
+tracked separately in [PROTOCOL-CHANGELOG.md](PROTOCOL-CHANGELOG.md);
+this file tracks the reference implementation.
 
 ## [Unreleased]
 
@@ -78,9 +80,9 @@ is what we will bump to signal an intentional wire break.
 - **Client REPL enhancements.** History persists to `~/.qftp_history`
   (or `--history <path>`). `--execute "<cmd>"` runs one command and
   exits. Piping commands on stdin runs them in batch.
-- **Documentation.** Top-level README, [docs/protocol.md](docs/protocol.md),
-  [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md), and dual
-  MIT/Apache-2.0 licensing.
+- **Documentation.** Top-level README, the protocol specification in
+  [spec/](spec/), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md),
+  and dual MIT/Apache-2.0 licensing.
 - **Packaging.** Multi-stage Dockerfile, systemd unit example,
   cargo-dist release workflow, and `repository`/`license`/`rust-version`
   metadata on every crate.
@@ -101,7 +103,8 @@ is what we will bump to signal an intentional wire break.
 - **Resumed downloads no longer fail integrity verification.** On a
   resumed `get` the client hashed the *whole* local file while the
   server's trailer covers only the streamed `[offset..]` suffix (as
-  `docs/protocol.md` specifies), so the BLAKE3 check always mismatched
+  [spec/qftp-protocol.md](spec/qftp-protocol.md) specifies), so the
+  BLAKE3 check always mismatched
   and the partial file was deleted -- resume was completely broken. The
   client now hashes only the bytes it receives. (#178)
 - **The client can connect to hostnames again.** Connection setup fed

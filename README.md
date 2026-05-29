@@ -5,6 +5,13 @@ connection carries every command and every byte of file body, all
 multiplexed over independent streams. Resumable transfers, BLAKE3
 integrity, mTLS authentication, per-user ACLs.
 
+**This repository is both the qftp protocol specification and its
+reference implementation.** The [`spec/`](spec/) directory is the
+source of truth for the wire protocol; the Rust crates under
+[`crates/`](crates/) are the reference implementation that conforms to
+it. A second implementation in another language can be built from
+[`spec/`](spec/) and [`test-vectors/`](test-vectors/) alone.
+
 ## Why QUIC?
 
 The classic FTP design has the wrong shape today: two TCP connections
@@ -225,15 +232,21 @@ steps, bearer-token auth model, and certificate handling are in
 
 ## Documentation
 
-- [docs/protocol.md](docs/protocol.md) -- wire format and stream
-  conventions.
+- [spec/](spec/) -- the protocol specification, the source of truth for
+  the wire format: [protocol](spec/qftp-protocol.md),
+  [wire format](spec/wire-format.md), [error codes](spec/error-codes.md),
+  [versioning](spec/versioning.md).
+- [test-vectors/](test-vectors/) -- language-independent conformance
+  vectors for the wire format.
 - [docs/web-client.md](docs/web-client.md) -- the browser client and
   the WebTransport bridge.
 - [docs/adr/](docs/adr/) -- architectural decision records (the
   `quiche` vs `quinn` choice is [0001](docs/adr/0001-quic-runtime.md)).
 - [SECURITY.md](SECURITY.md) -- vulnerability reporting and supported
   versions.
-- [CHANGELOG.md](CHANGELOG.md) -- per-release notes.
+- [CHANGELOG.md](CHANGELOG.md) -- per-release implementation notes.
+- [PROTOCOL-CHANGELOG.md](PROTOCOL-CHANGELOG.md) -- wire-protocol
+  changes (versioned by ALPN major).
 
 ## Platform support
 
