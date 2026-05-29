@@ -83,6 +83,12 @@ pub fn io_code(e: &std::io::Error) -> ErrorCode {
 /// See the docs in Phase 1 for the rationale. Returns the resolved path
 /// or a structured ErrorResponse with the right code.
 fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, ErrorResponse> {
+    // Single source for the three structurally-distinct ways a `..` can
+    // escape and the final post-walk guard, so the wording stays in one
+    // place.
+    let outside_root =
+        || ErrorResponse::new(ErrorCode::PermissionDenied, "path outside root");
+
     let p = Path::new(user_path);
     let mut current = if p.is_absolute() {
         root.to_path_buf()
@@ -92,44 +98,27 @@ fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, ErrorR
 
     for comp in p.components() {
         match comp {
-            Component::RootDir => {
-                current = root.to_path_buf();
-            }
+            Component::RootDir => current = root.to_path_buf(),
             Component::CurDir => {}
             Component::ParentDir => {
-                if current == *root {
-                    return Err(ErrorResponse::new(
-                        ErrorCode::PermissionDenied,
-                        "path outside root",
-                    ));
-                }
-                if !current.pop() {
-                    return Err(ErrorResponse::new(
-                        ErrorCode::PermissionDenied,
-                        "path outside root",
-                    ));
-                }
-                if !current.starts_with(root) {
-                    return Err(ErrorResponse::new(
-                        ErrorCode::PermissionDenied,
-                        "path outside root",
-                    ));
+                // Order matters: the `==root` test must run before the
+                // mutating `pop()`, and `starts_with` after it.
+                if current == *root || !current.pop() || !current.starts_with(root) {
+                    return Err(outside_root());
                 }
             }
             Component::Normal(name) => {
                 current.push(name);
                 match std::fs::symlink_metadata(&current) {
-                    Ok(meta) => {
-                        if meta.file_type().is_symlink() {
-                            return Err(ErrorResponse::new(
-                                ErrorCode::PermissionDenied,
-                                format!("symlink not allowed in path ({})", current.display()),
-                            ));
-                        }
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(ErrorResponse::new(
+                            ErrorCode::PermissionDenied,
+                            format!("symlink not allowed in path ({})", current.display()),
+                        ));
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // OK: the leaf may not exist yet.
-                    }
+                    Ok(_) => {}
+                    // OK: the leaf may not exist yet.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
                         return Err(ErrorResponse::new(
                             ErrorCode::Internal,
@@ -148,10 +137,7 @@ fn walk_safe(cwd: &Path, root: &Path, user_path: &str) -> Result<PathBuf, ErrorR
     }
 
     if !current.starts_with(root) {
-        return Err(ErrorResponse::new(
-            ErrorCode::PermissionDenied,
-            "path outside root",
-        ));
+        return Err(outside_root());
     }
 
     Ok(current)
@@ -366,6 +352,17 @@ pub fn is_upload_temp(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Run the pre-mutation ancestor symlink re-check on `target` and, on
+/// failure, produce the `Response::Err` the caller should return. The
+/// TOCTOU semantics are entirely in `recheck_ancestors_no_symlinks`;
+/// this only adapts its `Result` to the `Response`-returning handler
+/// arms (which can't use `?`). `Some(resp)` means "return this now".
+fn check_path_safe(target: &Path, root: &Path) -> Option<Response> {
+    recheck_ancestors_no_symlinks(target, root)
+        .err()
+        .map(Response::Err)
+}
+
 pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response {
     match req {
         Request::Pwd => {
@@ -458,12 +455,12 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                             // (`<name>.qftp.partial`): they are server
                             // bookkeeping, not listable content, and would
                             // otherwise be pulled down by `mget` / `get -r`.
-                            // Match the exact suffix `temp_path_for`
-                            // produces, not a substring, so a legitimate
-                            // file merely containing `.qftp.partial` isn't
-                            // hidden (mirrors `is_upload_temp`). Skip
-                            // BEFORE the metadata() syscall.
-                            if name.ends_with(".qftp.partial") {
+                            // `is_upload_temp` matches the exact suffix
+                            // `temp_path_for` produces, not a substring, so
+                            // a legitimate file merely containing
+                            // `.qftp.partial` isn't hidden. Skip BEFORE the
+                            // metadata() syscall.
+                            if is_upload_temp(&name) {
                                 continue;
                             }
                             let meta = match entry.metadata() {
@@ -495,8 +492,8 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
 
         Request::Mkdir { path } => match resolve_parent(cwd, root, path) {
             Ok(target) => {
-                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
-                    return Response::Err(e);
+                if let Some(resp) = check_path_safe(&target, root) {
+                    return resp;
                 }
                 match fs::create_dir(&target) {
                     Ok(()) => Response::Ok,
@@ -508,8 +505,8 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
 
         Request::Rmdir { path } => match resolve(cwd, root, path) {
             Ok(target) => {
-                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
-                    return Response::Err(e);
+                if let Some(resp) = check_path_safe(&target, root) {
+                    return resp;
                 }
                 match fs::remove_dir(&target) {
                     Ok(()) => Response::Ok,
@@ -528,8 +525,8 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             }
             match resolve(cwd, root, path) {
                 Ok(target) => {
-                    if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
-                        return Response::Err(e);
+                    if let Some(resp) = check_path_safe(&target, root) {
+                        return resp;
                     }
                     match fs::remove_file(&target) {
                         Ok(()) => Response::Ok,
@@ -555,11 +552,11 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                 Ok(p) => p,
                 Err(e) => return Response::Err(e),
             };
-            if let Err(e) = recheck_ancestors_no_symlinks(&src, root) {
-                return Response::Err(e);
+            if let Some(resp) = check_path_safe(&src, root) {
+                return resp;
             }
-            if let Err(e) = recheck_ancestors_no_symlinks(&dst, root) {
-                return Response::Err(e);
+            if let Some(resp) = check_path_safe(&dst, root) {
+                return resp;
             }
             match fs::rename(&src, &dst) {
                 Ok(()) => Response::Ok,
@@ -574,8 +571,8 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                 // component swapped to a symlink after `resolve` would
                 // let the chmod follow it and modify a file outside the
                 // root. Every other mutating op already does this.
-                if let Err(e) = recheck_ancestors_no_symlinks(&target, root) {
-                    return Response::Err(e);
+                if let Some(resp) = check_path_safe(&target, root) {
+                    return resp;
                 }
                 set_mode(&target, *mode)
             }

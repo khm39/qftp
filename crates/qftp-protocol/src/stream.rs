@@ -280,26 +280,30 @@ pub struct UploadClaim {
     path: PathBuf,
 }
 
+/// Lock a user's `active_uploads`, recovering from a poisoned mutex.
+/// The set only tracks in-flight destination paths; a thread that
+/// panicked while holding it leaves the set itself consistent, so
+/// recovering the guard is correct rather than propagating the panic.
+fn lock_uploads(
+    user: &User,
+) -> std::sync::MutexGuard<'_, std::collections::HashSet<PathBuf>> {
+    user.active_uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 impl UploadClaim {
     /// Claim `path` for `user`. Returns `None` when another upload to
     /// the same path is already in progress.
     pub fn try_claim(user: Arc<User>, path: PathBuf) -> Option<UploadClaim> {
-        let claimed = user
-            .active_uploads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(path.clone());
+        let claimed = lock_uploads(&user).insert(path.clone());
         claimed.then(|| UploadClaim { owner: user, path })
     }
 }
 
 impl Drop for UploadClaim {
     fn drop(&mut self) {
-        self.owner
-            .active_uploads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.path);
+        lock_uploads(&self.owner).remove(&self.path);
     }
 }
 
