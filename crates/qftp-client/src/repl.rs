@@ -330,7 +330,7 @@ pub fn error_hint(code: &qftp_common::protocol::ErrorCode) -> Option<&'static st
         }
         FileTooLarge => {
             "the file exceeds the server's MAX_FILE_SIZE. \
-            See docs/protocol.md and consider splitting or compressing."
+            See spec/qftp-protocol.md and consider splitting or compressing."
         }
         Unsupported => {
             "the server doesn't support this operation in the \

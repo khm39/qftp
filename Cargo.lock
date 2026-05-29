@@ -1443,6 +1443,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qftp-conformance"
+version = "0.1.0"
+dependencies = [
+ "qftp-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qftp-protocol"
 version = "0.1.0"
 dependencies = [
