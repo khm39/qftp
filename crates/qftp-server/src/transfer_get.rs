@@ -234,44 +234,110 @@ fn drive_one_sender(
         return SendOutcome::Finished;
     }
 
-    // Phase 0: re-hash the [0..offset) prefix of a resumed Get into
-    // `hasher` before streaming any body bytes. Doing this incrementally
-    // (one chunk per call) keeps a large resumed Get from stalling the
-    // event loop; once `prefix_remaining` reaches 0 the next call falls
-    // through to Phase A. The trailer is therefore a whole-file BLAKE3,
-    // so the client can verify its local prefix against it (#221).
+    if let Some(outcome) = send_phase_prefix_rehash(
+        &mut ctx.conn,
+        stream_id,
+        chunk,
+        reader,
+        hasher,
+        prefix_remaining,
+    ) {
+        return outcome;
+    }
+
+    if let Some(outcome) = send_phase_body(
+        &mut ctx.conn,
+        stream_id,
+        chunk,
+        metrics,
+        reader,
+        total_size,
+        sent,
+        hasher,
+        trailer,
+    ) {
+        return outcome;
+    }
+
+    send_phase_trailer(
+        &mut ctx.conn,
+        stream_id,
+        metrics,
+        hasher,
+        trailer,
+        trailer_offset,
+        finished,
+    )
+}
+
+/// Phase 0: re-hash the [0..offset) prefix of a resumed Get into
+/// `hasher` before streaming any body bytes. Doing this incrementally
+/// (one chunk per call) keeps a large resumed Get from stalling the
+/// event loop; once `prefix_remaining` reaches 0 the next call falls
+/// through to Phase A. The trailer is therefore a whole-file BLAKE3,
+/// so the client can verify its local prefix against it (#221).
+///
+/// `Some(outcome)` returns from `drive_one_sender`; `None` falls through
+/// to Phase A.
+#[allow(clippy::too_many_arguments)]
+fn send_phase_prefix_rehash(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    chunk: &mut [u8],
+    reader: &mut std::io::BufReader<std::fs::File>,
+    hasher: &mut blake3::Hasher,
+    prefix_remaining: &mut u64,
+) -> Option<SendOutcome> {
     if *prefix_remaining > 0 {
         let want = (*prefix_remaining as usize).min(chunk.len());
         if let Err(e) = reader.read_exact(&mut chunk[..want]) {
             warn!(stream_id, error = %e, "file read failed during prefix re-hash");
-            let _ = ctx.conn.stream_send(stream_id, &[], true);
-            return SendOutcome::Failed;
+            let _ = conn.stream_send(stream_id, &[], true);
+            return Some(SendOutcome::Failed);
         }
         hasher.update(&chunk[..want]);
         *prefix_remaining -= want as u64;
         // Yield to the event loop so other streams get a turn; the next
         // iteration continues the prefix walk (or proceeds to Phase A
         // once `prefix_remaining` hits 0).
-        return SendOutcome::Blocked;
+        return Some(SendOutcome::Blocked);
     }
+    None
+}
 
-    // Phase A: stream the body. After every chunk that quiche accepts we
-    // also feed it into the BLAKE3 hasher so the trailer matches exactly
-    // what the peer received.
+/// Phase A: stream the body. After every chunk that quiche accepts we
+/// also feed it into the BLAKE3 hasher so the trailer matches exactly
+/// what the peer received.
+///
+/// `Some(outcome)` returns from `drive_one_sender`; `None` means the
+/// body is fully sent and the caller proceeds to Phase B in the same
+/// call.
+#[allow(clippy::too_many_arguments)]
+fn send_phase_body(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    chunk: &mut [u8],
+    metrics: &Metrics,
+    reader: &mut std::io::BufReader<std::fs::File>,
+    total_size: &mut u64,
+    sent: &mut u64,
+    hasher: &mut blake3::Hasher,
+    trailer: &mut Option<[u8; 32]>,
+) -> Option<SendOutcome> {
     while *sent < *total_size && trailer.is_none() {
         let want = ((*total_size - *sent) as usize).min(chunk.len());
         if let Err(e) = reader.read_exact(&mut chunk[..want]) {
             warn!(stream_id, error = %e, "file read failed mid-stream");
-            let _ = ctx.conn.stream_send(stream_id, &[], true);
-            return SendOutcome::Failed;
+            let _ = conn.stream_send(stream_id, &[], true);
+            return Some(SendOutcome::Failed);
         }
-        match ctx.conn.stream_send(stream_id, &chunk[..want], false) {
+        match conn.stream_send(stream_id, &chunk[..want], false) {
             Ok(0) => {
                 if let Err(e) = reader.seek_relative(-(want as i64)) {
                     warn!(stream_id, error = %e, "seek failed when stream blocked");
-                    return SendOutcome::Failed;
+                    return Some(SendOutcome::Failed);
                 }
-                return SendOutcome::Blocked;
+                return Some(SendOutcome::Blocked);
             }
             Ok(n) => {
                 hasher.update(&chunk[..n]);
@@ -280,28 +346,39 @@ fn drive_one_sender(
                 if n < want {
                     if let Err(e) = reader.seek_relative(-((want - n) as i64)) {
                         warn!(stream_id, error = %e, "seek failed during partial send");
-                        return SendOutcome::Failed;
+                        return Some(SendOutcome::Failed);
                     }
-                    return SendOutcome::Blocked;
+                    return Some(SendOutcome::Blocked);
                 }
             }
             Err(quiche::Error::Done) => {
                 if let Err(e) = reader.seek_relative(-(want as i64)) {
                     warn!(stream_id, error = %e, "seek failed on Done");
-                    return SendOutcome::Failed;
+                    return Some(SendOutcome::Failed);
                 }
-                return SendOutcome::Blocked;
+                return Some(SendOutcome::Blocked);
             }
             Err(e) => {
                 warn!(stream_id, error = ?e, "stream_send failed during Get");
-                return SendOutcome::Failed;
+                return Some(SendOutcome::Failed);
             }
         }
     }
+    None
+}
 
-    // Phase B: body fully sent. Finalize hash once, then push the 32
-    // bytes as a trailer with FIN. trailer_offset survives across
-    // iterations so a partial-write here resumes cleanly.
+/// Phase B: body fully sent. Finalize hash once, then push the 32
+/// bytes as a trailer with FIN. trailer_offset survives across
+/// iterations so a partial-write here resumes cleanly.
+fn send_phase_trailer(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    metrics: &Metrics,
+    hasher: &mut blake3::Hasher,
+    trailer: &mut Option<[u8; 32]>,
+    trailer_offset: &mut usize,
+    finished: &mut bool,
+) -> SendOutcome {
     if trailer.is_none() {
         let h = hasher.finalize();
         let mut buf = [0u8; 32];
@@ -318,7 +395,7 @@ fn drive_one_sender(
     // byte has been queued" invariant impossible to misread.
     while *trailer_offset < bytes.len() {
         let remaining = &bytes[*trailer_offset..];
-        match ctx.conn.stream_send(stream_id, remaining, false) {
+        match conn.stream_send(stream_id, remaining, false) {
             Ok(0) => return SendOutcome::Blocked,
             Ok(n) => {
                 *trailer_offset += n;
@@ -332,7 +409,7 @@ fn drive_one_sender(
         }
     }
     // All 32 trailer bytes are queued -- emit the FIN.
-    match ctx.conn.stream_send(stream_id, &[], true) {
+    match conn.stream_send(stream_id, &[], true) {
         Ok(_) | Err(quiche::Error::Done) => {}
         Err(e) => {
             warn!(stream_id, error = ?e, "stream_send for trailer FIN failed");

@@ -251,57 +251,19 @@ fn handler_worker(
         let generation = job.generation;
         let stream_id = job.stream_id;
         let user = Arc::clone(&job.user);
-        let req_dbg = format!("{:?}", job.req);
         // Wrap `run_handler` in catch_unwind so a panic inside a
         // single request handler doesn't permanently shrink the pool
         // (after HANDLER_WORKERS panics nothing would drain
         // `pending_handler_jobs`, and the event loop would queue
         // requests forever). On panic, synthesize an Internal error
         // response and keep the worker alive.
-        //
-        // Snapshot `cwd` only for `Cd` requests. `Cd` is the only
-        // handler arm that mutates `cwd`; other requests (`Ls`,
-        // `Stat`, `Mkdir`, ...) take `&mut cwd` but never write to
-        // it, so a panic mid-handler can't desync the connection's
-        // working directory. Cloning unconditionally would charge
-        // every hot-path request a `PathBuf` allocation -- on top of
-        // the clone already done by `dispatch_handler_job` to fill
-        // `job.cwd` -- for a rollback we'd never use.
-        let cwd_snapshot = if matches!(job.req, Request::Cd { .. }) {
-            Some(job.cwd.clone())
-        } else {
-            None
-        };
-        let mut cwd = job.cwd;
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_handler(&job.req, &mut cwd, &job.user)
-        }));
-        let (response, new_cwd) = match outcome {
-            Ok(r) => (r, cwd),
-            Err(payload) => {
-                let msg = qftp_common::util::panic_payload_message(payload);
-                tracing::error!(
-                    panic = %msg,
-                    request = %req_dbg,
-                    user = %user.name,
-                    "handler_worker: request handler panicked; replying with Internal \
-                     error and restoring cwd to the pre-handler value (if Cd)",
-                );
-                // For non-Cd requests we did not take a snapshot
-                // (cwd is unmodified by the handler), so fall back
-                // to `cwd` -- which equals the value Cd hadn't yet
-                // overwritten anyway, since the partial-mutation
-                // path only exists in Cd's match arm.
-                let restored = cwd_snapshot.unwrap_or(cwd);
-                (
-                    Response::Err(qftp_common::protocol::ErrorResponse::new(
-                        qftp_common::protocol::ErrorCode::Internal,
-                        "handler crashed",
-                    )),
-                    restored,
-                )
-            }
-        };
+        let (response, new_cwd) = handle_handler_panic(
+            &job.req,
+            job.cwd,
+            &job.user,
+            "handler_worker: request handler panicked; replying with Internal \
+             error and restoring cwd to the pre-handler value (if Cd)",
+        );
         let result = HandlerResult {
             conn_key,
             generation,
@@ -316,6 +278,48 @@ fn handler_worker(
         // Wake the loop so the response goes out without waiting for
         // the next timeout or inbound packet.
         let _ = waker.wake();
+    }
+}
+
+/// Run `run_handler` under `catch_unwind`, restoring `cwd` on panic and
+/// synthesizing an `Internal` error response. Shared by the worker pool
+/// and the inline fallback so a handler panic can't take down the loop.
+///
+/// Snapshot `cwd` only for `Cd` requests: `Cd` is the only handler arm
+/// that mutates `cwd`; other requests take `&mut cwd` but never write to
+/// it, so a panic mid-handler can't desync the working directory.
+/// `log_msg` is logged verbatim alongside the panic so each caller keeps
+/// its own message text.
+fn handle_handler_panic(req: &Request, cwd: PathBuf, user: &User, log_msg: &str) -> (Response, PathBuf) {
+    let cwd_snapshot = if matches!(req, Request::Cd { .. }) {
+        Some(cwd.clone())
+    } else {
+        None
+    };
+    let req_dbg = format!("{:?}", req);
+    let mut cwd = cwd;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_handler(req, &mut cwd, user)
+    }));
+    match outcome {
+        Ok(r) => (r, cwd),
+        Err(payload) => {
+            let msg = qftp_common::util::panic_payload_message(payload);
+            tracing::error!(
+                panic = %msg,
+                request = %req_dbg,
+                user = %user.name,
+                "{log_msg}",
+            );
+            let restored = cwd_snapshot.unwrap_or(cwd);
+            (
+                Response::Err(qftp_common::protocol::ErrorResponse::new(
+                    qftp_common::protocol::ErrorCode::Internal,
+                    "handler crashed",
+                )),
+                restored,
+            )
+        }
     }
 }
 
@@ -426,38 +430,13 @@ fn dispatch_handler_job(
             // event-loop thread, with the same catch_unwind + cwd
             // rollback the worker pool uses, so a handler panic
             // can't take down every other connection.
-            let cwd_snapshot = if matches!(job.req, Request::Cd { .. }) {
-                Some(job.cwd.clone())
-            } else {
-                None
-            };
-            let user = Arc::clone(&job.user);
-            let req_dbg = format!("{:?}", job.req);
-            let mut cwd = job.cwd;
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_handler(&job.req, &mut cwd, &job.user)
-            }));
-            let (response, new_cwd) = match outcome {
-                Ok(r) => (r, cwd),
-                Err(payload) => {
-                    let msg = qftp_common::util::panic_payload_message(payload);
-                    tracing::error!(
-                        panic = %msg,
-                        request = %req_dbg,
-                        user = %user.name,
-                        "dispatch_handler_job inline fallback panicked; \
-                         replying with Internal error",
-                    );
-                    let restored = cwd_snapshot.unwrap_or(cwd);
-                    (
-                        Response::Err(qftp_common::protocol::ErrorResponse::new(
-                            qftp_common::protocol::ErrorCode::Internal,
-                            "handler crashed",
-                        )),
-                        restored,
-                    )
-                }
-            };
+            let (response, new_cwd) = handle_handler_panic(
+                &job.req,
+                job.cwd,
+                &job.user,
+                "dispatch_handler_job inline fallback panicked; \
+                 replying with Internal error",
+            );
             ctx.cwd = new_cwd;
             if matches!(response, Response::Err(_)) {
                 metrics.inc_requests_failed();
@@ -577,225 +556,59 @@ pub fn run(
     );
 
     loop {
-        if shutdown.load(Ordering::Relaxed) && !closing {
-            info!(
-                "shutdown signal received, draining {} connection(s)",
-                connections.len()
-            );
-            closing = true;
-            for c in connections.values_mut() {
-                c.conn.close(true, 0x00, b"server shutdown").ok();
-            }
-        }
+        phase_shutdown_drain(&shutdown, &mut closing, &mut connections);
 
-        // The shortest QUIC timeout, but also bounded by the time left
-        // until the soonest half-open connection must be reaped (#266):
-        // a flood of un-established connections produces no network
-        // events, so without this the loop would sleep until the QUIC
-        // idle timeout and the half-open reap would be ineffective.
-        let shortest_timeout = connections
-            .values()
-            .filter_map(|c| {
-                let quic = c.conn.timeout();
-                let half_open = (!c.conn.is_established())
-                    .then(|| HALF_OPEN_TIMEOUT.saturating_sub(c.created_at.elapsed()));
-                match (quic, half_open) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                }
-            })
-            .min();
-        // A resumed Put re-hashing its on-disk prefix has pure local
-        // work to do that no network event will wake the loop for; spin
-        // at a zero timeout until that re-hash finishes.
-        let rehash_pending = connections.values().any(|c| {
-            c.streams.values().any(|s| {
-                matches!(
-                    s,
-                    StreamState::ReadingFileData {
-                        rehash: Some(_),
-                        ..
-                    }
-                )
-            })
-        });
-        let poll_timeout = match (closing, rehash_pending, shortest_timeout) {
-            (true, _, t) => Some(t.unwrap_or(Duration::from_millis(250))),
-            (false, true, _) => Some(Duration::ZERO),
-            (false, false, Some(t)) => Some(t),
-            (false, false, None) => None,
-        };
+        let poll_timeout = compute_poll_timeout(&connections, closing);
         poll.poll(&mut events, poll_timeout)
             .context("poll failed")?;
 
         // 1. Drain incoming UDP packets.
         let local_addr = socket.local_addr().context("failed to get local addr")?;
-        loop {
-            let (len, from) = match socket.recv_from(&mut buf) {
-                Ok(v) => v,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e).context("UDP recv_from failed"),
-            };
-
-            let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(error = ?e, "failed to parse QUIC header");
-                    continue;
-                }
-            };
-
-            // Route to existing connection. For established connections
-            // the peer's DCID is the SCID we issued, so this lookup hits
-            // first and is the only one we pay for on the hot path. The
-            // borrowed DCID is used as the key directly -- no owned
-            // clone -- and the derived alias is only computed on a miss.
-            let recv_info = quiche::RecvInfo {
-                from,
-                to: local_addr,
-            };
-            if let Some(ctx) = connections.get_mut(&hdr.dcid) {
-                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
-                    warn!(peer = %from, error = ?e, "QUIC recv error");
-                }
-                continue;
-            }
-            // Miss: Initial retransmits during the handshake still carry
-            // the peer's original DCID, so try its derived alias too.
-            let alias = derive_scid(&conn_id_seed, &hdr.dcid);
-            if let Some(ctx) = connections.get_mut(&alias) {
-                if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
-                    warn!(peer = %from, error = ?e, "QUIC recv error");
-                }
-                continue;
-            }
-
-            // No matching connection. Only Initials can create one.
-            if hdr.ty != quiche::Type::Initial {
-                debug!(peer = %from, ty = ?hdr.ty, "stray non-Initial packet, ignoring");
-                continue;
-            }
-
-            if closing {
-                continue;
-            }
-
-            let mut ax = AcceptCtx {
-                connections: &mut connections,
-                counter: &mut counter,
-                rate_limiter: &mut rate_limiter,
-                quiche_config: &mut quiche_config,
-                retry_key: &retry_key,
-                conn_id_seed: &conn_id_seed,
-                cfg: &server_config,
-                users: &users,
-                metrics: &metrics,
-                rng: &rng,
-                socket: &socket,
-                next_generation: &mut next_generation,
-            };
-            // An accept-time failure (a transient UDP send error while
-            // issuing a RETRY, a quiche::accept rejection) must stay
-            // scoped to this one Initial: propagating it out of `run()`
-            // would tear down the whole server and every other client's
-            // connection. Log and drop the packet, like the
-            // per-connection work below.
-            if let Err(e) = try_accept(
-                &mut ax,
-                from,
-                local_addr,
-                &hdr,
-                &mut buf[..len],
-                &mut out_pkt,
-            ) {
-                warn!(peer = %from, error = %e, "accept failed; dropping Initial");
-            }
-        }
+        phase_ingress(
+            &mut connections,
+            &mut counter,
+            &mut rate_limiter,
+            &mut quiche_config,
+            &retry_key,
+            &conn_id_seed,
+            &server_config,
+            &users,
+            &metrics,
+            &rng,
+            &socket,
+            &mut next_generation,
+            &mut buf,
+            &mut out_pkt,
+            local_addr,
+            closing,
+        )?;
 
         // 1.5. Drain completed handler jobs and send their responses.
-        while let Ok(result) = handler_pool.result_rx.try_recv() {
-            apply_handler_result(&mut connections, &handler_pool, &metrics, result);
-        }
+        phase_drain_handler_results(&mut connections, &handler_pool, &metrics);
 
         // 2. on_timeout.
-        for ctx in connections.values_mut() {
-            ctx.conn.on_timeout();
-        }
+        phase_on_timeout(&mut connections);
 
         // 3-5. Per-connection work: streams + sending + egress.
-        //
-        // An error here is scoped to the one connection it happened on --
-        // most commonly a stream-/connection-level QUIC send error after
-        // the peer reset a stream or closed the connection mid-request.
-        // Such an error must NOT propagate out of `run()`: that would tear
-        // down the whole server and every other client's connection. We
-        // instead close just the offending connection (the reap sweep
-        // below drops it) and keep serving everyone else. Truly fatal
-        // socket errors still surface via the ingress `recv_from` path.
-        for ctx in connections.values_mut() {
-            if let Err(e) = process_readable_streams(
-                ctx,
-                &socket,
-                &users,
-                &metrics,
-                &mut rate_limiter,
-                &mut buf,
-                &handler_pool,
-                &mut readable_ids,
-                server_config.mtls_required,
-            ) {
-                warn!(peer = %ctx.peer_addr, error = %e, "stream processing failed; closing connection");
-                let _ = ctx.conn.close(true, 0x01, b"connection error");
-            }
-            if let Err(e) = crate::transfer_get::drive_rehash_streams(ctx, &mut buf, &metrics) {
-                warn!(peer = %ctx.peer_addr, error = %e, "resume re-hash failed; closing connection");
-                let _ = ctx.conn.close(true, 0x01, b"connection error");
-            }
-            if let Err(e) = crate::transfer_get::drive_sending_streams(
-                ctx,
-                &socket,
-                &metrics,
-                &mut send_buf,
-                &mut sender_ids,
-            ) {
-                warn!(peer = %ctx.peer_addr, error = %e, "send processing failed; closing connection");
-                let _ = ctx.conn.close(true, 0x01, b"connection error");
-            }
-            if let Err(e) = flush_egress(&mut ctx.conn, &socket) {
-                warn!(peer = %ctx.peer_addr, error = %e, "egress flush failed; closing connection");
-                let _ = ctx.conn.close(true, 0x01, b"connection error");
-            }
-        }
+        phase_per_connection_work(
+            &mut connections,
+            &socket,
+            &users,
+            &metrics,
+            &mut rate_limiter,
+            &mut buf,
+            &handler_pool,
+            &mut readable_ids,
+            &mut send_buf,
+            &mut sender_ids,
+            &server_config,
+        );
 
         // 6. Reap closed / timed-out connections.
-        let before = connections.len();
-        connections.retain(|_, ctx| {
-            let half_open = half_open_expired(ctx.conn.is_established(), ctx.created_at.elapsed());
-            let alive = !ctx.conn.is_closed() && !half_open;
-            if !alive {
-                if half_open {
-                    debug!(
-                        peer = %ctx.peer_addr,
-                        "reaping half-open connection (handshake never completed)"
-                    );
-                }
-                let peer_ip = ctx.peer_addr.ip();
-                counter.release(peer_ip);
-                metrics.dec_connections_open();
-                info!(peer = %ctx.peer_addr, user = %ctx.user.name, "connection closed");
-            }
-            alive
-        });
-        if connections.len() != before {
-            debug!(open = connections.len(), "reaped connections");
-        }
+        phase_reap_connections(&mut connections, &mut counter, &metrics);
 
         // 7. Sweep Done streams.
-        for ctx in connections.values_mut() {
-            ctx.streams.retain(|_, s| !matches!(s, StreamState::Done));
-        }
+        phase_sweep_done_streams(&mut connections);
 
         if closing && connections.is_empty() {
             break;
@@ -804,6 +617,295 @@ pub fn run(
 
     info!("server loop stopped");
     Ok(())
+}
+
+/// Phase: on shutdown, flip into draining mode once and close every
+/// connection. Idempotent via the `closing` guard.
+fn phase_shutdown_drain(
+    shutdown: &AtomicBool,
+    closing: &mut bool,
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+) {
+    if shutdown.load(Ordering::Relaxed) && !*closing {
+        info!(
+            "shutdown signal received, draining {} connection(s)",
+            connections.len()
+        );
+        *closing = true;
+        for c in connections.values_mut() {
+            c.conn.close(true, 0x00, b"server shutdown").ok();
+        }
+    }
+}
+
+/// Phase: compute the poll timeout for this iteration.
+fn compute_poll_timeout(
+    connections: &HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+    closing: bool,
+) -> Option<Duration> {
+    // The shortest QUIC timeout, but also bounded by the time left
+    // until the soonest half-open connection must be reaped (#266):
+    // a flood of un-established connections produces no network
+    // events, so without this the loop would sleep until the QUIC
+    // idle timeout and the half-open reap would be ineffective.
+    let shortest_timeout = connections
+        .values()
+        .filter_map(|c| {
+            let quic = c.conn.timeout();
+            let half_open = (!c.conn.is_established())
+                .then(|| HALF_OPEN_TIMEOUT.saturating_sub(c.created_at.elapsed()));
+            match (quic, half_open) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            }
+        })
+        .min();
+    // A resumed Put re-hashing its on-disk prefix has pure local
+    // work to do that no network event will wake the loop for; spin
+    // at a zero timeout until that re-hash finishes.
+    let rehash_pending = connections.values().any(|c| {
+        c.streams.values().any(|s| {
+            matches!(
+                s,
+                StreamState::ReadingFileData {
+                    rehash: Some(_),
+                    ..
+                }
+            )
+        })
+    });
+    match (closing, rehash_pending, shortest_timeout) {
+        (true, _, t) => Some(t.unwrap_or(Duration::from_millis(250))),
+        (false, true, _) => Some(Duration::ZERO),
+        (false, false, Some(t)) => Some(t),
+        (false, false, None) => None,
+    }
+}
+
+/// Phase 1: drain incoming UDP packets and route each to its connection
+/// (or to the accept path for Initials). A fatal socket error aborts the
+/// loop via `?`; per-packet and accept-time errors stay scoped and logged.
+#[allow(clippy::too_many_arguments)]
+fn phase_ingress(
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+    counter: &mut ConnectionCounter,
+    rate_limiter: &mut RateLimiter,
+    quiche_config: &mut quiche::Config,
+    retry_key: &RetryKey,
+    conn_id_seed: &[u8; 32],
+    server_config: &ServerConfig,
+    users: &Arc<UserDirectory>,
+    metrics: &Arc<Metrics>,
+    rng: &ring::rand::SystemRandom,
+    socket: &mio::net::UdpSocket,
+    next_generation: &mut u64,
+    buf: &mut [u8; 65536],
+    out_pkt: &mut [u8; 1350],
+    local_addr: std::net::SocketAddr,
+    closing: bool,
+) -> Result<()> {
+    loop {
+        let (len, from) = match socket.recv_from(buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e).context("UDP recv_from failed"),
+        };
+
+        let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = ?e, "failed to parse QUIC header");
+                continue;
+            }
+        };
+
+        // Route to existing connection. For established connections
+        // the peer's DCID is the SCID we issued, so this lookup hits
+        // first and is the only one we pay for on the hot path. The
+        // borrowed DCID is used as the key directly -- no owned
+        // clone -- and the derived alias is only computed on a miss.
+        let recv_info = quiche::RecvInfo {
+            from,
+            to: local_addr,
+        };
+        if let Some(ctx) = connections.get_mut(&hdr.dcid) {
+            if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                warn!(peer = %from, error = ?e, "QUIC recv error");
+            }
+            continue;
+        }
+        // Miss: Initial retransmits during the handshake still carry
+        // the peer's original DCID, so try its derived alias too.
+        let alias = derive_scid(conn_id_seed, &hdr.dcid);
+        if let Some(ctx) = connections.get_mut(&alias) {
+            if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
+                warn!(peer = %from, error = ?e, "QUIC recv error");
+            }
+            continue;
+        }
+
+        // No matching connection. Only Initials can create one.
+        if hdr.ty != quiche::Type::Initial {
+            debug!(peer = %from, ty = ?hdr.ty, "stray non-Initial packet, ignoring");
+            continue;
+        }
+
+        if closing {
+            continue;
+        }
+
+        let mut ax = AcceptCtx {
+            connections,
+            counter,
+            rate_limiter,
+            quiche_config,
+            retry_key,
+            conn_id_seed,
+            cfg: server_config,
+            users,
+            metrics,
+            rng,
+            socket,
+            next_generation,
+        };
+        // An accept-time failure (a transient UDP send error while
+        // issuing a RETRY, a quiche::accept rejection) must stay
+        // scoped to this one Initial: propagating it out of `run()`
+        // would tear down the whole server and every other client's
+        // connection. Log and drop the packet, like the
+        // per-connection work below.
+        if let Err(e) = try_accept(
+            &mut ax,
+            from,
+            local_addr,
+            &hdr,
+            &mut buf[..len],
+            out_pkt,
+        ) {
+            warn!(peer = %from, error = %e, "accept failed; dropping Initial");
+        }
+    }
+    Ok(())
+}
+
+/// Phase 1.5: drain completed handler jobs and send their responses.
+fn phase_drain_handler_results(
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+    handler_pool: &HandlerPool,
+    metrics: &Metrics,
+) {
+    while let Ok(result) = handler_pool.result_rx.try_recv() {
+        apply_handler_result(connections, handler_pool, metrics, result);
+    }
+}
+
+/// Phase 2: advance each connection's QUIC timers.
+fn phase_on_timeout(
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+) {
+    for ctx in connections.values_mut() {
+        ctx.conn.on_timeout();
+    }
+}
+
+/// Phase 3-5: per-connection work (streams + sending + egress).
+///
+/// An error here is scoped to the one connection it happened on --
+/// most commonly a stream-/connection-level QUIC send error after
+/// the peer reset a stream or closed the connection mid-request.
+/// Such an error must NOT propagate out of `run()`: that would tear
+/// down the whole server and every other client's connection. We
+/// instead close just the offending connection (the reap sweep
+/// below drops it) and keep serving everyone else. Truly fatal
+/// socket errors still surface via the ingress `recv_from` path.
+#[allow(clippy::too_many_arguments)]
+fn phase_per_connection_work(
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+    socket: &mio::net::UdpSocket,
+    users: &UserDirectory,
+    metrics: &Metrics,
+    rate_limiter: &mut RateLimiter,
+    buf: &mut [u8],
+    handler_pool: &HandlerPool,
+    readable_ids: &mut Vec<u64>,
+    send_buf: &mut [u8],
+    sender_ids: &mut Vec<u64>,
+    server_config: &ServerConfig,
+) {
+    for ctx in connections.values_mut() {
+        if let Err(e) = process_readable_streams(
+            ctx,
+            socket,
+            users,
+            metrics,
+            rate_limiter,
+            buf,
+            handler_pool,
+            readable_ids,
+            server_config.mtls_required,
+        ) {
+            warn!(peer = %ctx.peer_addr, error = %e, "stream processing failed; closing connection");
+            let _ = ctx.conn.close(true, 0x01, b"connection error");
+        }
+        if let Err(e) = crate::transfer_get::drive_rehash_streams(ctx, buf, metrics) {
+            warn!(peer = %ctx.peer_addr, error = %e, "resume re-hash failed; closing connection");
+            let _ = ctx.conn.close(true, 0x01, b"connection error");
+        }
+        if let Err(e) = crate::transfer_get::drive_sending_streams(
+            ctx,
+            socket,
+            metrics,
+            send_buf,
+            sender_ids,
+        ) {
+            warn!(peer = %ctx.peer_addr, error = %e, "send processing failed; closing connection");
+            let _ = ctx.conn.close(true, 0x01, b"connection error");
+        }
+        if let Err(e) = flush_egress(&mut ctx.conn, socket) {
+            warn!(peer = %ctx.peer_addr, error = %e, "egress flush failed; closing connection");
+            let _ = ctx.conn.close(true, 0x01, b"connection error");
+        }
+    }
+}
+
+/// Phase 6: reap closed / timed-out connections.
+fn phase_reap_connections(
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+    counter: &mut ConnectionCounter,
+    metrics: &Metrics,
+) {
+    let before = connections.len();
+    connections.retain(|_, ctx| {
+        let half_open = half_open_expired(ctx.conn.is_established(), ctx.created_at.elapsed());
+        let alive = !ctx.conn.is_closed() && !half_open;
+        if !alive {
+            if half_open {
+                debug!(
+                    peer = %ctx.peer_addr,
+                    "reaping half-open connection (handshake never completed)"
+                );
+            }
+            let peer_ip = ctx.peer_addr.ip();
+            counter.release(peer_ip);
+            metrics.dec_connections_open();
+            info!(peer = %ctx.peer_addr, user = %ctx.user.name, "connection closed");
+        }
+        alive
+    });
+    if connections.len() != before {
+        debug!(open = connections.len(), "reaped connections");
+    }
+}
+
+/// Phase 7: sweep Done streams from every connection.
+fn phase_sweep_done_streams(
+    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
+) {
+    for ctx in connections.values_mut() {
+        ctx.streams.retain(|_, s| !matches!(s, StreamState::Done));
+    }
 }
 
 /// Server-wide state borrowed by [`try_accept`] for one accept attempt.
@@ -1195,6 +1297,69 @@ fn process_readable_streams(
     }
     readable_ids.clear();
     readable_ids.extend(ctx.conn.readable());
+
+    let actions = plan_actions(ctx, metrics, rate_limiter, tmp, readable_ids)?;
+
+    execute_pending_actions(ctx, socket, metrics, pool, tmp, actions)
+}
+
+/// Gate a freshly decoded request through the rate limiter, 0-RTT replay
+/// protection, and ACL check, in that order. Returns `Some(resp)` to
+/// reject (the caller turns it into an `AclReject` + `Done`), or `None`
+/// to proceed with handling the request. The order and short-circuit are
+/// load-bearing: rate limit first, then 0-RTT, then ACL.
+fn validate_request_prerequisites(
+    req: &Request,
+    conn: &quiche::Connection,
+    user: &User,
+    rate_limiter: &mut RateLimiter,
+    metrics: &Metrics,
+    peer_ip: std::net::IpAddr,
+) -> Option<Response> {
+    // Per-request rate limit: token-bucket also gates
+    // protocol requests on established connections so a
+    // single accepted peer can't burn the server with
+    // command floods.
+    if !rate_limiter.try_consume(peer_ip) {
+        metrics.inc_requests_rate_limited();
+        return Some(err(ErrorCode::RateLimited, "Rate limit exceeded"));
+    }
+
+    // 0-RTT replay protection. Any request decoded
+    // while the QUIC handshake is still in the
+    // early-data phase rode the first flight, which
+    // an attacker can replay byte-for-byte. Read-only
+    // ops are idempotent so we accept them; anything
+    // that mutates server state is refused with
+    // `Unsupported` and the client falls back to a
+    // 1-RTT retry.
+    if conn.is_in_early_data() {
+        if request_is_replay_safe(req) {
+            metrics.inc_zero_rtt_accepted();
+        } else {
+            metrics.inc_zero_rtt_rejected();
+            return Some(err(ErrorCode::Unsupported, "Operation requires 1-RTT data"));
+        }
+    }
+
+    if let Some(resp) = handler::acl_reject(user, req) {
+        return Some(resp);
+    }
+    None
+}
+
+/// Sweep every readable stream once, decode pending requests, run the
+/// per-request prerequisite gates, and collect the resulting
+/// [`PendingAction`]s. Held a `&mut` into `ctx.streams` throughout, so it
+/// cannot act on the requests here; the actions are executed afterward by
+/// [`execute_pending_actions`] once that borrow is released.
+fn plan_actions(
+    ctx: &mut ConnectionContext,
+    metrics: &Metrics,
+    rate_limiter: &mut RateLimiter,
+    tmp: &mut [u8],
+    readable_ids: &[u64],
+) -> Result<Vec<PendingAction>> {
     let peer_ip = ctx.peer_addr.ip();
 
     let mut actions: Vec<PendingAction> = Vec::new();
@@ -1262,43 +1427,14 @@ fn process_readable_streams(
                         "request received"
                     );
 
-                    // Per-request rate limit: token-bucket also gates
-                    // protocol requests on established connections so a
-                    // single accepted peer can't burn the server with
-                    // command floods.
-                    if !rate_limiter.try_consume(peer_ip) {
-                        metrics.inc_requests_rate_limited();
-                        actions.push(PendingAction::AclReject {
-                            stream_id,
-                            resp: err(ErrorCode::RateLimited, "Rate limit exceeded"),
-                        });
-                        *state = StreamState::Done;
-                        continue;
-                    }
-
-                    // 0-RTT replay protection. Any request decoded
-                    // while the QUIC handshake is still in the
-                    // early-data phase rode the first flight, which
-                    // an attacker can replay byte-for-byte. Read-only
-                    // ops are idempotent so we accept them; anything
-                    // that mutates server state is refused with
-                    // `Unsupported` and the client falls back to a
-                    // 1-RTT retry.
-                    if ctx.conn.is_in_early_data() {
-                        if request_is_replay_safe(&req) {
-                            metrics.inc_zero_rtt_accepted();
-                        } else {
-                            metrics.inc_zero_rtt_rejected();
-                            actions.push(PendingAction::AclReject {
-                                stream_id,
-                                resp: err(ErrorCode::Unsupported, "Operation requires 1-RTT data"),
-                            });
-                            *state = StreamState::Done;
-                            continue;
-                        }
-                    }
-
-                    if let Some(resp) = handler::acl_reject(&ctx.user, &req) {
+                    if let Some(resp) = validate_request_prerequisites(
+                        &req,
+                        &ctx.conn,
+                        &ctx.user,
+                        rate_limiter,
+                        metrics,
+                        peer_ip,
+                    ) {
                         actions.push(PendingAction::AclReject { stream_id, resp });
                         *state = StreamState::Done;
                         continue;
@@ -1376,8 +1512,19 @@ fn process_readable_streams(
             StreamState::Done => {}
         }
     }
+    Ok(actions)
+}
 
-    // Now we own no borrows into ctx.streams; safe to mutate freely.
+/// Execute the [`PendingAction`]s collected by [`plan_actions`]. By now
+/// no borrow into `ctx.streams` is live, so `ctx` can be mutated freely.
+fn execute_pending_actions(
+    ctx: &mut ConnectionContext,
+    socket: &mio::net::UdpSocket,
+    metrics: &Metrics,
+    pool: &HandlerPool,
+    tmp: &mut [u8],
+    actions: Vec<PendingAction>,
+) -> Result<()> {
     for action in actions {
         match action {
             PendingAction::AclReject { stream_id, resp } => {
@@ -1406,14 +1553,16 @@ fn process_readable_streams(
                 crate::transfer_put::start_put(
                     ctx,
                     stream_id,
-                    &path,
-                    size,
-                    mode,
-                    offset,
-                    expected_checksum,
-                    no_clobber,
-                    checksum_trailer,
-                    leftover,
+                    crate::transfer_put::PutRequest {
+                        path,
+                        size,
+                        mode,
+                        offset,
+                        expected_checksum,
+                        no_clobber,
+                        checksum_trailer,
+                        leftover,
+                    },
                     tmp,
                     metrics,
                 )?;

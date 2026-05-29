@@ -39,21 +39,38 @@ pub(crate) fn put_overflow_err(o: qftp_protocol::stream::PutOverflow) -> Respons
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Protocol-level parameters of a `Put` request, grouped so `start_put`
+/// takes the transport handles (`ctx`, `stream_id`, scratch, metrics)
+/// plus this one bundle rather than a dozen positional arguments.
+pub(crate) struct PutRequest {
+    pub path: String,
+    pub size: u64,
+    pub mode: u32,
+    pub offset: u64,
+    pub expected_checksum: Option<[u8; 32]>,
+    pub no_clobber: bool,
+    pub checksum_trailer: bool,
+    pub leftover: Vec<u8>,
+}
+
 pub(crate) fn start_put(
     ctx: &mut ConnectionContext,
     stream_id: u64,
-    path: &str,
-    size: u64,
-    mode: u32,
-    offset: u64,
-    expected_checksum: Option<[u8; 32]>,
-    no_clobber: bool,
-    checksum_trailer: bool,
-    leftover: Vec<u8>,
+    req: PutRequest,
     scratch: &mut [u8],
     metrics: &Metrics,
 ) -> Result<()> {
+    let PutRequest {
+        path,
+        size,
+        mode,
+        offset,
+        expected_checksum,
+        no_clobber,
+        checksum_trailer,
+        leftover,
+    } = req;
+    let path = path.as_str();
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
         fail_stream(ctx, stream_id, metrics, err(code, msg))
     };
