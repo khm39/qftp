@@ -8,16 +8,30 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 
+/// Apply `O_NOFOLLOW` on unix, plus a 0o600 create mode when
+/// `owner_only`. No-op on other platforms (where symlinks have
+/// different semantics and the same attack surface doesn't apply).
+pub fn apply_secure_open(opts: &mut OpenOptions, owner_only: bool) -> &mut OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if owner_only {
+            opts.mode(0o600);
+        }
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = owner_only;
+    }
+    opts
+}
+
 /// Apply `O_NOFOLLOW` to an `OpenOptions` on unix. No-op on other
 /// platforms (where symlinks have different semantics and the same
 /// attack surface doesn't apply).
 pub fn apply_no_follow(opts: &mut OpenOptions) -> &mut OpenOptions {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    opts
+    apply_secure_open(opts, false)
 }
 
 /// Apply `O_NOFOLLOW` and a 0o600 create mode on unix. Used when the
@@ -27,13 +41,7 @@ pub fn apply_no_follow(opts: &mut OpenOptions) -> &mut OpenOptions {
 /// umask (typically 0o022 -> 0o644 = world-readable) which leaks the
 /// content for the duration the file exists.
 pub fn apply_owner_only_no_follow(opts: &mut OpenOptions) -> &mut OpenOptions {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    opts
+    apply_secure_open(opts, true)
 }
 
 /// Require that a path's `symlink_metadata` reports a regular file.
