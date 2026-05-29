@@ -71,6 +71,18 @@ server:
   connection URL's query string is mapped to a `users.toml` user.
   Tokens are the only secret gating web access -- generate them with
   high entropy and treat the tokens file like a password file.
+- **Bearer tokens travel in the URL query string, where intermediaries
+  log them.** The token is inside the TLS-encrypted HTTP/3 handshake
+  on the wire, but any component that terminates or inspects TLS and
+  then logs the request URL -- a reverse proxy, load balancer, WAF, or
+  CDN with access logging -- captures the secret in cleartext logs.
+  Prefer mTLS (the native server) for anything that can present a
+  client certificate; use the WebTransport bridge only for true
+  browser clients. Where the bridge is required, disable URL/query
+  logging on every TLS-terminating intermediary in front of it, treat
+  any log store that may have seen a token as compromised, and rotate
+  tokens routinely. Per-user, revocable tokens limit the blast radius
+  of a leaked log.
 - WebTransport requires a browser-trusted TLS certificate; the bridge
   has no `--insecure` equivalent. The token travels inside the
   TLS-encrypted HTTP/3 handshake.
@@ -79,6 +91,20 @@ server:
 - The bundled SPA is served over plain HTTP on `--http-bind`; bind it
   to loopback and front it with a TLS-terminating reverse proxy.
 - Safari has no WebTransport support and cannot use the bridge.
+
+### Integrity is not authenticity
+
+The BLAKE3 checksums on `Get`/`Put` (header field or streamed trailer)
+detect **accidental corruption** of the transferred bytes -- truncation,
+bit-rot, a buggy resume. They are an unkeyed hash: they are **not** a
+message-authentication code and do **not** prove who produced the bytes.
+Authenticity and confidentiality on the wire come entirely from the
+QUIC + TLS 1.3 channel (and, when configured, mTLS peer
+authentication). An attacker who could rewrite both the body and its
+trailer would pass the BLAKE3 check; only TLS prevents that on the
+wire. Do not treat a matching BLAKE3 digest as a signature.
+Message-layer authenticity (a per-message MAC or signed manifest) is a
+[qftp/2 direction](PROTOCOL-CHANGELOG.md), not a `qftp/1` guarantee.
 
 ## Out of scope
 
@@ -93,7 +119,12 @@ server:
 
 ## Hardening checklist for production
 
-- Run with `--require-retry`.
+- Run with `--require-retry`. The stateless-retry token is HMAC-signed
+  over the peer's address and connection ID; the HMAC tag **SHOULD** be
+  at least 20 bytes (160 bits) of the SHA-256 output. A shorter
+  truncation weakens the forgery resistance of the only thing gating
+  connection-state allocation before address validation; this is the
+  recommended minimum for new deployments and configurations.
 - Set `--max-connections` and `--max-connections-per-ip` for your
   capacity.
 - Configure mTLS via `--client-ca` and a per-user `--users` TOML;
