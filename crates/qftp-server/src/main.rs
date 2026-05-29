@@ -18,6 +18,8 @@ mod limits;
 mod metrics;
 mod retry;
 mod server;
+mod transfer_get;
+mod transfer_put;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -84,9 +86,17 @@ struct Args {
     /// Maximum request burst per source IP. Default 100.
     #[arg(long, default_value_t = 100.0)]
     rate_limit_burst: f64,
-    /// Require stateless retry (anti-amplification address validation)
-    /// before any connection state is allocated. Recommended for any
-    /// internet-facing deployment.
+    /// Require stateless retry (anti-amplification + source-address
+    /// validation) before any connection state is allocated.
+    ///
+    /// REQUIRED for any internet-facing deployment that is NOT behind an
+    /// upstream source-address filter (BCP38 / uRPF). Without it, an
+    /// attacker spoofing source IPs can commit a connection slot per
+    /// forged Initial and exhaust the global/per-IP connection table,
+    /// denying service to legitimate peers (#266). Half-open connections
+    /// are force-reaped after a few seconds to bound the damage, but
+    /// `--require-retry` removes the primitive entirely by validating the
+    /// peer's address before any state is allocated.
     #[arg(long, default_value_t = false)]
     require_retry: bool,
 

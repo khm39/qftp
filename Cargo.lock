@@ -1382,6 +1382,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "qftp-protocol",
  "serde",
  "tempfile",
  "toml",

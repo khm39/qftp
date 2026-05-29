@@ -22,9 +22,7 @@
 //! the loop.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -41,11 +39,8 @@ use crate::limits::{Caps, ConnectionCounter, RateLimiter};
 use crate::metrics::Metrics;
 use crate::retry::RetryKey;
 use qftp_protocol::handler::{self, err, io_code};
-use qftp_protocol::stream::{
-    temp_path_for, ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE,
-    SEND_CHUNK_SIZE,
-};
-use qftp_protocol::user::{self, InFlightReservation, User, UserDirectory};
+use qftp_protocol::stream::{StreamState, SEND_CHUNK_SIZE};
+use qftp_protocol::user::{self, User, UserDirectory};
 
 /// Which Request variants are safe to serve while the connection is
 /// still in the 0-RTT phase. The rule is "read-only / no
@@ -94,6 +89,14 @@ const WAKER_TOKEN: Token = Token(1);
 /// connection (H-1).
 const HANDLER_WORKERS: usize = 4;
 
+/// How long a connection may stay un-established (handshake not
+/// complete) before the reap loop force-drops it and releases its cap
+/// slot. Much shorter than the QUIC idle timeout (30s) so a flood of
+/// spoofed Initials that each commit a connection slot can't pin the
+/// global table for the full idle window (#266). Legitimate handshakes
+/// complete in well under a second even on lossy links.
+const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Static knobs the loop reads on every iteration.
 pub struct ServerConfig {
     pub caps: Caps,
@@ -115,6 +118,8 @@ pub struct ServerConfig {
 /// execution (H-1).
 struct HandlerJob {
     conn_key: quiche::ConnectionId<'static>,
+    /// Generation of the connection that dispatched this job (L-6).
+    generation: u64,
     stream_id: u64,
     req: Request,
     cwd: PathBuf,
@@ -124,6 +129,10 @@ struct HandlerJob {
 /// The result of a `HandlerJob`, routed back to the event loop.
 struct HandlerResult {
     conn_key: quiche::ConnectionId<'static>,
+    /// Echoed from the originating `HandlerJob`; compared against the
+    /// live connection's generation on apply to drop a response that
+    /// would otherwise be misdelivered to a resurrected SCID (L-6).
+    generation: u64,
     stream_id: u64,
     response: Response,
     /// `cwd` after running the request -- changed only by `Cd`.
@@ -131,6 +140,14 @@ struct HandlerResult {
     /// The user the job ran as. Used to detect a mid-flight auth
     /// upgrade so a stale `cwd` doesn't clobber the upgraded one.
     user: Arc<User>,
+}
+
+/// True when a completed handler result belongs to an older generation
+/// than the connection currently occupying its SCID -- i.e. the
+/// dispatching connection was reaped and a new one resurrected the
+/// (deterministic) SCID before the response came back (L-6).
+fn handler_result_is_stale(ctx_generation: u64, result_generation: u64) -> bool {
+    ctx_generation != result_generation
 }
 
 /// Pool of worker threads that execute blocking filesystem requests
@@ -231,6 +248,7 @@ fn handler_worker(
             }
         };
         let conn_key = job.conn_key.clone();
+        let generation = job.generation;
         let stream_id = job.stream_id;
         let user = Arc::clone(&job.user);
         let req_dbg = format!("{:?}", job.req);
@@ -286,6 +304,7 @@ fn handler_worker(
         };
         let result = HandlerResult {
             conn_key,
+            generation,
             stream_id,
             response,
             new_cwd,
@@ -393,6 +412,7 @@ fn dispatch_handler_job(
 ) {
     let job = HandlerJob {
         conn_key: ctx.scid.clone(),
+        generation: ctx.generation,
         stream_id,
         req,
         cwd: ctx.cwd.clone(),
@@ -462,6 +482,17 @@ fn apply_handler_result(
         // Connection was reaped while the job ran; drop the response.
         return;
     };
+    // The SCID lookup can succeed against a *different* connection that
+    // reused the same deterministic SCID after the original was reaped
+    // (L-6). Drop the stale response rather than misdeliver it on the
+    // resurrected connection's stream.
+    if handler_result_is_stale(ctx.generation, result.generation) {
+        debug!(
+            stream_id = result.stream_id,
+            "dropping handler result from a reaped connection generation"
+        );
+        return;
+    }
     // Commit the cwd only if the connection still belongs to the same
     // user. A handshake completing mid-flight can upgrade the user (and
     // reset cwd to the authenticated home); a stale anonymous cwd must
@@ -521,6 +552,10 @@ pub fn run(
 
     // Connection table keyed by the SCID we issued (= derive_scid(seed, dcid)).
     let mut connections: HashMap<quiche::ConnectionId<'static>, ConnectionContext> = HashMap::new();
+    // Monotonic generation handed to each accepted connection so a
+    // delayed handler response can't be misdelivered to a different
+    // connection that later reused the same (deterministic) SCID (L-6).
+    let mut next_generation: u64 = 0;
 
     let mut buf = [0u8; 65536];
     let mut out_pkt = [0u8; 1350];
@@ -553,7 +588,25 @@ pub fn run(
             }
         }
 
-        let shortest_timeout = connections.values().filter_map(|c| c.conn.timeout()).min();
+        // The shortest QUIC timeout, but also bounded by the time left
+        // until the soonest half-open connection must be reaped (#266):
+        // a flood of un-established connections produces no network
+        // events, so without this the loop would sleep until the QUIC
+        // idle timeout and the half-open reap would be ineffective.
+        let shortest_timeout = connections
+            .values()
+            .filter_map(|c| {
+                let quic = c.conn.timeout();
+                let half_open = (!c.conn.is_established())
+                    .then(|| HALF_OPEN_TIMEOUT.saturating_sub(c.created_at.elapsed()));
+                match (quic, half_open) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                }
+            })
+            .min();
         // A resumed Put re-hashing its on-disk prefix has pure local
         // work to do that no network event will wake the loop for; spin
         // at a zero timeout until that re-hash finishes.
@@ -641,6 +694,7 @@ pub fn run(
                 metrics: &metrics,
                 rng: &rng,
                 socket: &socket,
+                next_generation: &mut next_generation,
             };
             // An accept-time failure (a transient UDP send error while
             // issuing a RETRY, a quiche::accept rejection) must stay
@@ -695,13 +749,17 @@ pub fn run(
                 warn!(peer = %ctx.peer_addr, error = %e, "stream processing failed; closing connection");
                 let _ = ctx.conn.close(true, 0x01, b"connection error");
             }
-            if let Err(e) = drive_rehash_streams(ctx, &mut buf, &metrics) {
+            if let Err(e) = crate::transfer_get::drive_rehash_streams(ctx, &mut buf, &metrics) {
                 warn!(peer = %ctx.peer_addr, error = %e, "resume re-hash failed; closing connection");
                 let _ = ctx.conn.close(true, 0x01, b"connection error");
             }
-            if let Err(e) =
-                drive_sending_streams(ctx, &socket, &metrics, &mut send_buf, &mut sender_ids)
-            {
+            if let Err(e) = crate::transfer_get::drive_sending_streams(
+                ctx,
+                &socket,
+                &metrics,
+                &mut send_buf,
+                &mut sender_ids,
+            ) {
                 warn!(peer = %ctx.peer_addr, error = %e, "send processing failed; closing connection");
                 let _ = ctx.conn.close(true, 0x01, b"connection error");
             }
@@ -714,8 +772,15 @@ pub fn run(
         // 6. Reap closed / timed-out connections.
         let before = connections.len();
         connections.retain(|_, ctx| {
-            let alive = !ctx.conn.is_closed();
+            let half_open = half_open_expired(ctx.conn.is_established(), ctx.created_at.elapsed());
+            let alive = !ctx.conn.is_closed() && !half_open;
             if !alive {
+                if half_open {
+                    debug!(
+                        peer = %ctx.peer_addr,
+                        "reaping half-open connection (handshake never completed)"
+                    );
+                }
                 let peer_ip = ctx.peer_addr.ip();
                 counter.release(peer_ip);
                 metrics.dec_connections_open();
@@ -756,6 +821,9 @@ struct AcceptCtx<'a> {
     metrics: &'a Metrics,
     rng: &'a ring::rand::SystemRandom,
     socket: &'a mio::net::UdpSocket,
+    /// Monotonic source for per-connection generations (L-6). Bumped
+    /// only when a connection is actually inserted into the table.
+    next_generation: &'a mut u64,
 }
 
 fn try_accept(
@@ -872,21 +940,24 @@ fn try_accept(
         return Ok(());
     }
 
-    // mTLS identity isn't ready until the handshake completes; start the
-    // connection as the anonymous user and upgrade later if we can.
-    let ctx = ConnectionContext::new(conn, from, ax.users.anonymous(), scid.clone());
-
     // If a previous Initial from this peer already created the slot
     // (the deterministic SCID collapses retransmits onto the same key),
     // just drop the duplicate accept. The slot drops here, releasing
     // the duplicate count so a retransmitted Initial that derives the
     // same SCID doesn't leak a `connections_open` gauge unit for a
     // `ConnectionContext` that is dropped here and never enters the
-    // `connections` map.
+    // `connections` map. Checked before constructing the context so the
+    // duplicate path doesn't burn a generation.
     if ax.connections.contains_key(&scid) {
         // `slot` drops here -> release happens automatically.
         return Ok(());
     }
+    // Assign this connection's generation and advance the source (L-6).
+    let generation = *ax.next_generation;
+    *ax.next_generation = ax.next_generation.wrapping_add(1);
+    // mTLS identity isn't ready until the handshake completes; start the
+    // connection as the anonymous user and upgrade later if we can.
+    let ctx = ConnectionContext::new(conn, from, ax.users.anonymous(), scid.clone(), generation);
     info!(peer = %from, "connection accepted");
     // Order: insert FIRST so the metrics gauge and the cap counter
     // both reflect a live map entry. If `connections.insert` panics
@@ -903,6 +974,17 @@ fn try_accept(
     ax.metrics.inc_connections_open();
     slot.commit();
     Ok(())
+}
+
+/// True when a connection has been alive for longer than
+/// [`HALF_OPEN_TIMEOUT`] without completing its handshake. Such a
+/// connection still occupies a global + per-IP cap slot, so a flood of
+/// spoofed Initials that each commit a slot but never finish the
+/// handshake could otherwise pin the table for the full QUIC idle
+/// timeout (#266). Reaping these early bounds the exposure to
+/// `HALF_OPEN_TIMEOUT`.
+fn half_open_expired(established: bool, age: Duration) -> bool {
+    !established && age >= HALF_OPEN_TIMEOUT
 }
 
 /// Deterministically derive a server SCID from the client's DCID using
@@ -931,7 +1013,15 @@ fn send_retry(
     out: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<bool> {
     let mut new_scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-    ring::rand::SecureRandom::fill(rng, &mut new_scid_bytes).expect("system RNG failed");
+    // This runs once per unauthenticated peer's first Initial. A
+    // transient system-RNG failure must not panic the whole server on
+    // that hostile-controlled path (L-4): drop the packet and report
+    // "no retry emitted", mirroring the `mint` None branch below. The
+    // peer simply retransmits its Initial and we try again.
+    if ring::rand::SecureRandom::fill(rng, &mut new_scid_bytes).is_err() {
+        warn!(peer = %from, "send_retry: system RNG failed; dropping Initial without retry");
+        return Ok(false);
+    }
     let new_scid = quiche::ConnectionId::from_ref(&new_scid_bytes);
     // quiche v0.24 does NOT enforce a minimum DCID length on Initial
     // parse. The pre-rate-limit check in `try_accept` filters these
@@ -1270,7 +1360,9 @@ fn process_readable_streams(
                 }
             }
             StreamState::ReadingFileData { .. } => {
-                if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, tmp, metrics)? {
+                if let Some(resp) =
+                    crate::transfer_put::drive_put(&mut ctx.conn, stream_id, state, tmp, metrics)?
+                {
                     if matches!(resp, Response::Err(_)) {
                         metrics.inc_requests_failed();
                     }
@@ -1298,7 +1390,7 @@ fn process_readable_streams(
                 offset,
                 length,
             } => {
-                start_get(ctx, stream_id, &path, offset, length, metrics)?;
+                crate::transfer_get::start_get(ctx, stream_id, &path, offset, length, metrics)?;
             }
             PendingAction::StartPut {
                 stream_id,
@@ -1311,7 +1403,7 @@ fn process_readable_streams(
                 checksum_trailer,
                 leftover,
             } => {
-                start_put(
+                crate::transfer_put::start_put(
                     ctx,
                     stream_id,
                     &path,
@@ -1368,7 +1460,7 @@ fn process_readable_streams(
 /// Send a one-shot error response for a stream and mark it Done.
 /// Used by both `start_get` and `start_put` to collapse what was the
 /// same `send_err` closure repeated in each.
-fn fail_stream(
+pub(crate) fn fail_stream(
     ctx: &mut ConnectionContext,
     stream_id: u64,
     metrics: &Metrics,
@@ -1380,1004 +1472,43 @@ fn fail_stream(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start_get(
-    ctx: &mut ConnectionContext,
-    stream_id: u64,
-    path: &str,
-    offset: u64,
-    length: Option<u64>,
-    metrics: &Metrics,
-) -> Result<()> {
-    let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
-        fail_stream(ctx, stream_id, metrics, err(code, msg))
-    };
-
-    // Server-internal upload temp files (`*.qftp.partial`) are server
-    // bookkeeping: hidden from `Ls`, un-deletable, and swept after they
-    // go stale. A client must not be able to read one either.
-    if handler::is_upload_temp(path) {
-        return fail_stream(
-            ctx,
-            stream_id,
-            metrics,
-            err(
-                ErrorCode::PermissionDenied,
-                "path refers to a server-internal upload temp file",
-            ),
-        );
-    }
-
-    let file_path = match handler::resolve(&ctx.cwd, &ctx.user.home, path) {
-        Ok(p) => p,
-        Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
-    };
-    // Parent-dir symlink TOCTOU re-check. O_NOFOLLOW below
-    // protects the leaf only; an intermediate parent that was swapped
-    // to a symlink between resolve and open would still be traversed
-    // by the kernel and let us serve a file outside the user's home.
-    if let Err(e) = handler::recheck_ancestors_no_symlinks(&file_path, &ctx.user.home) {
-        return send_err(ctx, e.code, e.message);
-    }
-    // Open with O_NOFOLLOW first, then derive metadata from the
-    // resulting fd. This binds the metadata + the bytes we stream to
-    // the same inode the path resolved to, eliminating the TOCTOU
-    // window between `walk_safe` and `fs::open`.
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.read(true);
-    qftp_common::fs_safe::apply_no_follow(&mut open_opts);
-    let file = match open_opts.open(&file_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return send_err(ctx, io_code(&e), format!("Failed to open file: {e}"));
-        }
-    };
-    let meta = match file.metadata() {
-        Ok(m) => m,
-        Err(e) => {
-            return send_err(ctx, io_code(&e), format!("Failed to stat file: {e}"));
-        }
-    };
-    if !meta.is_file() {
-        return send_err(
-            ctx,
-            ErrorCode::IsADirectory,
-            "Not a regular file".to_string(),
-        );
-    }
-    if meta.len() > MAX_FILE_SIZE {
-        return send_err(
-            ctx,
-            ErrorCode::FileTooLarge,
-            format!(
-                "File too large: {} bytes (max {} bytes)",
-                meta.len(),
-                MAX_FILE_SIZE
-            ),
-        );
-    }
-    if offset > meta.len() {
-        return send_err(
-            ctx,
-            ErrorCode::InvalidRange,
-            format!("offset {} past end of file (size {})", offset, meta.len()),
-        );
-    }
-    let remaining = meta.len() - offset;
-    let bytes_to_send = match length {
-        Some(n) => n.min(remaining),
-        None => remaining,
-    };
-    send_message(
-        &mut ctx.conn,
-        stream_id,
-        &Response::FileReady {
-            size: bytes_to_send,
-            total_size: meta.len(),
-            checksum_follows: true,
-        },
-    )?;
-    // The reader stays at position 0 even for a resumed Get: the
-    // streaming state machine re-hashes the [0..offset) prefix into
-    // `hasher` before sending any body bytes, so the trailer is a
-    // whole-file BLAKE3 the client can verify its local prefix against.
-    ctx.streams.insert(
-        stream_id,
-        StreamState::SendingFileData {
-            reader: std::io::BufReader::with_capacity(SEND_CHUNK_SIZE, file),
-            total_size: bytes_to_send,
-            sent: 0,
-            hasher: blake3::Hasher::new(),
-            trailer: None,
-            trailer_offset: 0,
-            finished: false,
-            prefix_remaining: offset,
-        },
-    );
-    Ok(())
-}
-
-fn drive_sending_streams(
-    ctx: &mut ConnectionContext,
-    _socket: &mio::net::UdpSocket,
-    metrics: &Metrics,
-    send_buf: &mut [u8],
-    sender_ids: &mut Vec<u64>,
-) -> Result<()> {
-    sender_ids.clear();
-    sender_ids.extend(
-        ctx.streams
-            .iter()
-            .filter(|(_, s)| matches!(s, StreamState::SendingFileData { .. }))
-            .map(|(id, _)| *id),
-    );
-
-    for &stream_id in sender_ids.iter() {
-        // After this call we either mark the stream Done, or we leave a
-        // SendingFileData with updated counters for the next iteration.
-        let outcome = drive_one_sender(ctx, stream_id, send_buf, metrics);
-        if outcome == SendOutcome::Finished {
-            if let Some(state) = ctx.streams.get_mut(&stream_id) {
-                *state = StreamState::Done;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Advance the prefix re-hash of any resumed Put whose `rehash` is
-/// still `Some`. Driven every main-loop iteration (the poll timeout is
-/// forced to zero while any exist) so the re-hash makes progress
-/// without waiting on network events, since it is pure local I/O.
-fn drive_rehash_streams(
-    ctx: &mut ConnectionContext,
-    scratch: &mut [u8],
-    metrics: &Metrics,
-) -> Result<()> {
-    let ids: Vec<u64> = ctx
-        .streams
-        .iter()
-        .filter(|(_, s)| {
-            matches!(
-                s,
-                StreamState::ReadingFileData {
-                    rehash: Some(_),
-                    ..
-                }
-            )
-        })
-        .map(|(id, _)| *id)
-        .collect();
-    for stream_id in ids {
-        let Some(state) = ctx.streams.get_mut(&stream_id) else {
-            continue;
-        };
-        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, scratch, metrics)? {
-            if matches!(resp, Response::Err(_)) {
-                metrics.inc_requests_failed();
-            }
-            send_message(&mut ctx.conn, stream_id, &resp)?;
-            *state = StreamState::Done;
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SendOutcome {
-    Blocked,
-    Finished,
-    Failed,
-}
-
-fn drive_one_sender(
-    ctx: &mut ConnectionContext,
-    stream_id: u64,
-    chunk: &mut [u8],
-    metrics: &Metrics,
-) -> SendOutcome {
-    let Some(state) = ctx.streams.get_mut(&stream_id) else {
-        return SendOutcome::Finished;
-    };
-    let StreamState::SendingFileData {
-        reader,
-        total_size,
-        sent,
-        hasher,
-        trailer,
-        trailer_offset,
-        finished,
-        prefix_remaining,
-    } = state
-    else {
-        return SendOutcome::Finished;
-    };
-    if *finished {
-        return SendOutcome::Finished;
-    }
-
-    // Phase 0: re-hash the [0..offset) prefix of a resumed Get into
-    // `hasher` before streaming any body bytes. Doing this incrementally
-    // (one chunk per call) keeps a large resumed Get from stalling the
-    // event loop; once `prefix_remaining` reaches 0 the next call falls
-    // through to Phase A. The trailer is therefore a whole-file BLAKE3,
-    // so the client can verify its local prefix against it (#221).
-    if *prefix_remaining > 0 {
-        let want = (*prefix_remaining as usize).min(chunk.len());
-        if let Err(e) = reader.read_exact(&mut chunk[..want]) {
-            warn!(stream_id, error = %e, "file read failed during prefix re-hash");
-            let _ = ctx.conn.stream_send(stream_id, &[], true);
-            return SendOutcome::Failed;
-        }
-        hasher.update(&chunk[..want]);
-        *prefix_remaining -= want as u64;
-        // Yield to the event loop so other streams get a turn; the next
-        // iteration continues the prefix walk (or proceeds to Phase A
-        // once `prefix_remaining` hits 0).
-        return SendOutcome::Blocked;
-    }
-
-    // Phase A: stream the body. After every chunk that quiche accepts we
-    // also feed it into the BLAKE3 hasher so the trailer matches exactly
-    // what the peer received.
-    while *sent < *total_size && trailer.is_none() {
-        let want = ((*total_size - *sent) as usize).min(chunk.len());
-        if let Err(e) = reader.read_exact(&mut chunk[..want]) {
-            warn!(stream_id, error = %e, "file read failed mid-stream");
-            let _ = ctx.conn.stream_send(stream_id, &[], true);
-            return SendOutcome::Failed;
-        }
-        match ctx.conn.stream_send(stream_id, &chunk[..want], false) {
-            Ok(0) => {
-                if let Err(e) = reader.seek_relative(-(want as i64)) {
-                    warn!(stream_id, error = %e, "seek failed when stream blocked");
-                    return SendOutcome::Failed;
-                }
-                return SendOutcome::Blocked;
-            }
-            Ok(n) => {
-                hasher.update(&chunk[..n]);
-                *sent += n as u64;
-                metrics.add_bytes_sent(n as u64);
-                if n < want {
-                    if let Err(e) = reader.seek_relative(-((want - n) as i64)) {
-                        warn!(stream_id, error = %e, "seek failed during partial send");
-                        return SendOutcome::Failed;
-                    }
-                    return SendOutcome::Blocked;
-                }
-            }
-            Err(quiche::Error::Done) => {
-                if let Err(e) = reader.seek_relative(-(want as i64)) {
-                    warn!(stream_id, error = %e, "seek failed on Done");
-                    return SendOutcome::Failed;
-                }
-                return SendOutcome::Blocked;
-            }
-            Err(e) => {
-                warn!(stream_id, error = ?e, "stream_send failed during Get");
-                return SendOutcome::Failed;
-            }
-        }
-    }
-
-    // Phase B: body fully sent. Finalize hash once, then push the 32
-    // bytes as a trailer with FIN. trailer_offset survives across
-    // iterations so a partial-write here resumes cleanly.
-    if trailer.is_none() {
-        let h = hasher.finalize();
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(h.as_bytes());
-        *trailer = Some(buf);
-        *trailer_offset = 0;
-    }
-    let bytes = trailer.unwrap();
-    // Push the trailer bytes WITHOUT fin first; we only emit the FIN as
-    // a separate empty frame once all 32 bytes are accepted. quiche's
-    // documented behaviour does keep fin pending across partial writes,
-    // but the explicit fin-only step is the same pattern stream_send_all
-    // uses elsewhere and makes the "stream closes only when the last
-    // byte has been queued" invariant impossible to misread.
-    while *trailer_offset < bytes.len() {
-        let remaining = &bytes[*trailer_offset..];
-        match ctx.conn.stream_send(stream_id, remaining, false) {
-            Ok(0) => return SendOutcome::Blocked,
-            Ok(n) => {
-                *trailer_offset += n;
-                metrics.add_bytes_sent(n as u64);
-            }
-            Err(quiche::Error::Done) => return SendOutcome::Blocked,
-            Err(e) => {
-                warn!(stream_id, error = ?e, "stream_send for trailer failed");
-                return SendOutcome::Failed;
-            }
-        }
-    }
-    // All 32 trailer bytes are queued -- emit the FIN.
-    match ctx.conn.stream_send(stream_id, &[], true) {
-        Ok(_) | Err(quiche::Error::Done) => {}
-        Err(e) => {
-            warn!(stream_id, error = ?e, "stream_send for trailer FIN failed");
-            return SendOutcome::Failed;
-        }
-    }
-
-    *finished = true;
-    metrics.inc_downloads_completed();
-    SendOutcome::Finished
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_put(
-    ctx: &mut ConnectionContext,
-    stream_id: u64,
-    path: &str,
-    size: u64,
-    mode: u32,
-    offset: u64,
-    expected_checksum: Option<[u8; 32]>,
-    no_clobber: bool,
-    checksum_trailer: bool,
-    leftover: Vec<u8>,
-    scratch: &mut [u8],
-    metrics: &Metrics,
-) -> Result<()> {
-    let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
-        fail_stream(ctx, stream_id, metrics, err(code, msg))
-    };
-
-    // Server-internal upload temp files (`*.qftp.partial`) are server
-    // bookkeeping. A client must not `Put` to one: the committed file
-    // would be hidden from `Ls`, un-deletable, and swept after 24h.
-    if handler::is_upload_temp(path) {
-        return send_err(
-            ctx,
-            ErrorCode::PermissionDenied,
-            "path refers to a server-internal upload temp file".to_string(),
-        );
-    }
-
-    // A resumed upload (`offset > 0`) commits an on-disk `.qftp.partial`
-    // prefix that the client never re-sends. The only thing tying that
-    // prefix to the client's intent is the BLAKE3 trailer / header
-    // checksum. With neither, verification is skipped and a prefix that
-    // a co-tenant could have substituted would be committed unverified.
-    // Refuse such a resume up front.
-    if offset > 0 && !checksum_trailer && expected_checksum.is_none() {
-        return send_err(
-            ctx,
-            ErrorCode::Unsupported,
-            "resumed upload requires a checksum".to_string(),
-        );
-    }
-
-    // The final file is `offset + size` bytes; check the resumed total,
-    // not just this round's body, so resume can't append past the cap.
-    let final_size = offset.saturating_add(size);
-    if final_size > MAX_FILE_SIZE {
-        return send_err(
-            ctx,
-            ErrorCode::FileTooLarge,
-            format!("Upload too large: {final_size} bytes (max {MAX_FILE_SIZE} bytes)"),
-        );
-    }
-
-    let final_path = match handler::resolve_parent(&ctx.cwd, &ctx.user.home, path) {
-        Ok(p) => p,
-        Err(e) => return fail_stream(ctx, stream_id, metrics, Response::Err(e)),
-    };
-    // A path whose final component is not a real file name (it ends in
-    // `..` or `/`) has no leaf for `temp_path_for` to build a temp name
-    // from: `file_name()` is `None`, so the temp would collapse to the
-    // bare `.qftp.partial`, shared by every such upload and impossible
-    // to address via `Ls`/`Rm`. Refuse the Put up front.
-    if final_path.file_name().is_none() {
-        return send_err(
-            ctx,
-            ErrorCode::Malformed,
-            "invalid upload path: no file name".to_string(),
-        );
-    }
-    // Parent-dir symlink TOCTOU re-check. The temp file is opened with
-    // O_NOFOLLOW, which protects the *leaf* but not the intermediate
-    // components -- a parent swapped to a symlink between resolve_parent
-    // and open would still be traversed by the kernel.
-    if let Err(e) = handler::recheck_ancestors_no_symlinks(&final_path, &ctx.user.home) {
-        send_message(&mut ctx.conn, stream_id, &Response::Err(e))?;
-        metrics.inc_requests_failed();
-        ctx.streams.insert(stream_id, StreamState::Done);
-        return Ok(());
-    }
-    // Enforce client-requested overwrite refusal. lstat (not stat) so a
-    // planted symlink at `final_path` counts as "exists" -- otherwise an
-    // attacker who could plant a dangling symlink could bypass
-    // --no-clobber by aiming it at /nonexistent.
-    if no_clobber && std::fs::symlink_metadata(&final_path).is_ok() {
-        return send_err(
-            ctx,
-            ErrorCode::AlreadyExists,
-            format!("path already exists (no_clobber): {path}"),
-        );
-    }
-    // Claim the destination so a second concurrent Put to the same path
-    // can't share -- and corrupt -- the one deterministically named
-    // temp. The claim is a local until it moves into `ReadingFileData`;
-    // an early return before then drops it and frees the path.
-    let claim = match UploadClaim::try_claim(Arc::clone(&ctx.user), final_path.clone()) {
-        Some(c) => c,
-        None => {
-            return send_err(
-                ctx,
-                ErrorCode::AlreadyExists,
-                format!("an upload to this path is already in progress: {path}"),
-            );
-        }
-    };
-    let temp_path = temp_path_for(&final_path);
-
-    // Open the deterministically named resumable temp file *before* the
-    // quota check, so a fresh Put can refund a stale partial's bytes
-    // first -- otherwise re-uploading a file whose earlier attempt
-    // aborted near the quota limit would be rejected for the very bytes
-    // it is about to replace.
-    //   * Fresh upload (offset == 0): create-or-reuse. A leftover
-    //     partial is truncated and reused; its bytes were charged to
-    //     `used_bytes` on that abort, so refund them. `prior_bytes` is
-    //     0 -- nothing on disk is pre-accounted for this stream.
-    //   * Resume (offset > 0): the temp must already exist and hold
-    //     exactly `offset` bytes; re-hash that prefix so the BLAKE3
-    //     trailer check still covers the whole file. `prior_bytes` is
-    //     `offset`: those bytes are already counted in `used_bytes`.
-    let (file, hasher, prior_bytes, rehash) = if offset == 0 {
-        let f = match open_temp(&temp_path, false) {
-            Ok(f) => f,
-            Err(e) => {
-                return send_err(
-                    ctx,
-                    io_code(&e),
-                    format!("Failed to create upload temp file: {e}"),
-                );
-            }
-        };
-        let stale = f.metadata().map(|m| m.len()).unwrap_or(0);
-        if stale > 0 {
-            ctx.user
-                .used_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                    Some(u.saturating_sub(stale))
-                })
-                .ok();
-        }
-        // Truncate unconditionally: a reused file (a stale partial, or
-        // one a local user planted at the predictable path) must not
-        // leave trailing bytes past the new body.
-        if let Err(e) = f.set_len(0) {
-            return send_err(
-                ctx,
-                io_code(&e),
-                format!("Failed to truncate upload temp file: {e}"),
-            );
-        }
-        // Re-assert 0o600: the O_CREAT mode is ignored when the file
-        // already existed, so a reused/planted temp could otherwise
-        // keep a looser mode and expose the in-progress body.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
-                return send_err(
-                    ctx,
-                    io_code(&e),
-                    format!("Failed to re-assert 0o600 on partial: {e}"),
-                );
-            }
-        }
-        (f, blake3::Hasher::new(), 0u64, None)
-    } else {
-        let mut f = match open_temp(&temp_path, true) {
-            Ok(f) => f,
-            Err(e) => {
-                return send_err(
-                    ctx,
-                    ErrorCode::InvalidRange,
-                    format!("no resumable partial upload to continue: {e}"),
-                );
-            }
-        };
-        let have = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
-        if have != offset {
-            return send_err(
-                ctx,
-                ErrorCode::InvalidRange,
-                format!("resume offset {offset} does not match partial length {have}"),
-            );
-        }
-        // Position the write handle to append after the prefix.
-        if let Err(e) = std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset)) {
-            return send_err(
-                ctx,
-                io_code(&e),
-                format!("Failed to seek partial upload: {e}"),
-            );
-        }
-        // Re-hash the [0, offset) prefix incrementally through a second
-        // handle, so a large partial doesn't block the event loop with
-        // one synchronous pass (driven by `drive_rehash_streams`). The
-        // hasher starts empty and is filled before any body byte.
-        let rehash_handle = match open_temp(&temp_path, true) {
-            Ok(h) => h,
-            Err(e) => {
-                return send_err(
-                    ctx,
-                    io_code(&e),
-                    format!("Failed to reopen partial for re-hash: {e}"),
-                );
-            }
-        };
-        let rehash = ResumeRehash {
-            reader: std::io::BufReader::with_capacity(FILE_CHUNK_SIZE, rehash_handle),
-            remaining: offset,
-            pending_body: Vec::new(),
-        };
-        (f, blake3::Hasher::new(), offset, Some(rehash))
-    };
-
-    // In-flight reservation, then quota check. `used_bytes` now
-    // reflects reality: a fresh Put refunded any stale partial above,
-    // and a resume's `offset` bytes are legitimately still counted.
-    // `size` is the post-offset body the client is about to send.
-    //
-    // Reserve *before* checking: a check-then-reserve sequence races --
-    // two concurrent Puts could both pass the check before either
-    // reservation lands and together overshoot the limit. Reserving
-    // first means a concurrent Put always sees our bytes in its check.
-    let new_bytes = size;
-    let mut reservation = InFlightReservation::reserve(Arc::clone(&ctx.user), new_bytes);
-    if let Some(limit) = ctx.user.quota_bytes {
-        let used = ctx.user.used_bytes.load(Ordering::Relaxed);
-        // `in_flight` already includes the reservation just made.
-        let in_flight = ctx.user.in_flight_bytes.load(Ordering::Relaxed);
-        let projected = used.saturating_add(in_flight);
-        if projected > limit {
-            // `reservation` is still armed -- it releases `new_bytes`
-            // on return. A fresh Put truncated its temp to empty;
-            // remove it so a rejected upload leaves no litter. A
-            // resume's temp is the user's own partial -- leave it.
-            if offset == 0 {
-                let _ = fs::remove_file(&temp_path);
-            }
-            return send_err(
-                ctx,
-                ErrorCode::QuotaExceeded,
-                format!("Quota exceeded: would use {projected} bytes (limit {limit})"),
-            );
-        }
-    }
-    let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, file);
-
-    // The reservation is now owned by `ReadingFileData`'s Drop (via
-    // `reserved_bytes`); disarm the guard so the bytes aren't released
-    // twice.
-    reservation.disarm();
-    let mut new_state = StreamState::ReadingFileData {
-        final_path,
-        temp_path,
-        writer,
-        remaining: size,
-        mode,
-        completed: false,
-        hasher,
-        expected_checksum,
-        trailer_buf: if checksum_trailer {
-            Some(qftp_protocol::stream::TrailerBuf::new())
-        } else {
-            None
-        },
-        reserved_bytes: new_bytes,
-        prior_bytes,
-        rehash,
-        claim,
-        owner: Arc::clone(&ctx.user),
-    };
-    if !leftover.is_empty() {
-        if let StreamState::ReadingFileData {
-            writer,
-            remaining,
-            hasher,
-            trailer_buf,
-            rehash,
-            ..
-        } = &mut new_state
-        {
-            // Bytes coalesced into the same recv as the Put request
-            // frame can hold the body *and* the 32-byte streaming
-            // checksum trailer. Split them exactly as `drive_put`'s
-            // Phase A does -- counting the trailer against the body
-            // length would spuriously reject the upload with
-            // UploadOverflow (and a checksum_trailer Put always sends
-            // that trailer in-band right after the body).
-            let to_take = (leftover.len() as u64).min(*remaining) as usize;
-            let after_body = &leftover[to_take..];
-            if !after_body.is_empty() {
-                match trailer_buf {
-                    Some(buf) => {
-                        let consumed = buf.extend(after_body);
-                        if consumed < after_body.len() {
-                            return fail_stream(
-                                ctx,
-                                stream_id,
-                                metrics,
-                                err(
-                                    ErrorCode::UploadOverflow,
-                                    "Upload exceeded declared size + trailer",
-                                ),
-                            );
-                        }
-                    }
-                    None => {
-                        return fail_stream(
-                            ctx,
-                            stream_id,
-                            metrics,
-                            err(ErrorCode::UploadOverflow, "Upload exceeded declared size"),
-                        );
-                    }
-                }
-            }
-            let body = &leftover[..to_take];
-            if let Some(rh) = rehash {
-                // Resume: the prefix isn't hashed yet, so these body
-                // bytes can't be hashed in order now. Hold them; the
-                // re-hash completion path in `drive_put` writes and
-                // hashes them once the prefix is done. The trailer (if
-                // any) is already buffered above.
-                rh.pending_body = body.to_vec();
-            } else if !body.is_empty() {
-                if let Err(e) = writer.write_all(body) {
-                    return fail_stream(
-                        ctx,
-                        stream_id,
-                        metrics,
-                        err(ErrorCode::Internal, format!("Failed to write file: {e}")),
-                    );
-                }
-                hasher.update(body);
-                *remaining -= to_take as u64;
-                metrics.add_bytes_received(to_take as u64);
-            }
-        }
-    }
-    ctx.streams.insert(stream_id, new_state);
-
-    // Drain anything already buffered for this stream.
-    if let Some(state) = ctx.streams.get_mut(&stream_id) {
-        if let Some(resp) = drive_put(&mut ctx.conn, stream_id, state, scratch, metrics)? {
-            if matches!(resp, Response::Err(_)) {
-                metrics.inc_requests_failed();
-            }
-            send_message(&mut ctx.conn, stream_id, &resp)?;
-            *state = StreamState::Done;
-        }
-    }
-    Ok(())
-}
-
-fn drive_put(
-    conn: &mut quiche::Connection,
-    stream_id: u64,
-    state: &mut StreamState,
-    tmp: &mut [u8],
-    metrics: &Metrics,
-) -> Result<Option<Response>> {
-    let StreamState::ReadingFileData {
-        final_path,
-        temp_path,
-        writer,
-        remaining,
-        mode,
-        completed,
-        hasher,
-        expected_checksum,
-        trailer_buf,
-        reserved_bytes,
-        prior_bytes,
-        rehash,
-        owner,
-        ..
-    } = state
-    else {
-        return Ok(None);
-    };
-
-    // Resume re-hash phase: feed one bounded slice of the existing
-    // partial's prefix through BLAKE3 per call. Spreading it over many
-    // calls keeps a large partial from stalling the event loop. Body
-    // bytes are left buffered in the QUIC stream until this is done.
-    if rehash.is_some() {
-        // On a resume re-hash read failure the stream is torn down, but
-        // `StreamState`'s Drop runs with `completed == false`: it
-        // releases `reserved_bytes` yet does NOT refund `prior_bytes`
-        // (the `offset` prefix already charged to `used_bytes`) and
-        // does NOT delete the temp. A persistent read error would then
-        // lock those prefix bytes against the user's quota until the
-        // 24h stale sweep. Mirror the checksum-mismatch path: delete
-        // the temp, refund `prior_bytes` to the owner's `used_bytes`,
-        // and mark the stream `completed` so Drop's abort accounting
-        // does not double-count it.
-        let mut abort_rehash = |err_resp: Response| -> Response {
-            let _ = fs::remove_file(&*temp_path);
-            owner
-                .in_flight_bytes
-                .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-            if *prior_bytes > 0 {
-                owner
-                    .used_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                        Some(u.saturating_sub(*prior_bytes))
-                    })
-                    .ok();
-            }
-            *completed = true;
-            err_resp
-        };
-        let rh = rehash.as_mut().unwrap();
-        let want = (rh.remaining as usize).min(tmp.len());
-        let n = match std::io::Read::read(&mut rh.reader, &mut tmp[..want]) {
-            Ok(0) => {
-                return Ok(Some(abort_rehash(err(
-                    ErrorCode::Internal,
-                    "partial upload shrank during resume re-hash",
-                ))));
-            }
-            Ok(n) => n,
-            Err(e) => {
-                return Ok(Some(abort_rehash(err(
-                    io_code(&e),
-                    format!("resume re-hash read failed: {e}"),
-                ))));
-            }
-        };
-        hasher.update(&tmp[..n]);
-        rh.remaining -= n as u64;
-        if rh.remaining > 0 {
-            return Ok(None);
-        }
-        // Prefix fully hashed. Hash the body bytes that arrived with the
-        // request (held back so they followed the prefix in hash
-        // order), write them to disk, then continue into the body
-        // phase (Phase A) below.
-        let pending = std::mem::take(&mut rh.pending_body);
-        *rehash = None;
-        if !pending.is_empty() {
-            if pending.len() as u64 > *remaining {
-                return Ok(Some(err(
-                    ErrorCode::UploadOverflow,
-                    "Upload exceeded declared size",
-                )));
-            }
-            if let Err(e) = writer.write_all(&pending) {
-                return Ok(Some(err(
-                    ErrorCode::Internal,
-                    format!("Failed to write file: {e}"),
-                )));
-            }
-            hasher.update(&pending);
-            *remaining -= pending.len() as u64;
-            metrics.add_bytes_received(pending.len() as u64);
-        }
-        // Deliberately fall through into Phase A rather than returning:
-        // if `pending` already held the whole body, the stream has no
-        // more readable data and no later `drive_put` call would come,
-        // so the upload would never reach Phase B / commit (#180).
-    }
-
-    // Phase A: drain body bytes until `remaining == 0`. Anything past
-    // the body in the same recv goes into the trailer buffer when
-    // streaming-checksum mode is active.
-    loop {
-        if *remaining == 0 {
-            break;
-        }
-        match conn.stream_recv(stream_id, tmp) {
-            Ok((len, fin)) => {
-                let to_take = (len as u64).min(*remaining) as usize;
-                if let Err(e) = writer.write_all(&tmp[..to_take]) {
-                    return Ok(Some(err(
-                        ErrorCode::Internal,
-                        format!("Failed to write file: {e}"),
-                    )));
-                }
-                hasher.update(&tmp[..to_take]);
-                *remaining -= to_take as u64;
-                metrics.add_bytes_received(to_take as u64);
-                let after_body = len - to_take;
-                if after_body > 0 {
-                    // Bytes past the body. Legitimate only when the
-                    // client opted into the streaming trailer.
-                    if let Some(buf) = trailer_buf {
-                        let consumed = buf.extend(&tmp[to_take..len]);
-                        if consumed < after_body {
-                            return Ok(Some(err(
-                                ErrorCode::UploadOverflow,
-                                "Upload exceeded declared size + trailer",
-                            )));
-                        }
-                    } else {
-                        return Ok(Some(err(
-                            ErrorCode::UploadOverflow,
-                            "Upload exceeded declared size",
-                        )));
-                    }
-                }
-                if fin && *remaining > 0 {
-                    return Ok(Some(err(
-                        ErrorCode::UploadTruncated,
-                        format!("Upload truncated: {} bytes still expected", *remaining),
-                    )));
-                }
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => {
-                warn!(stream_id, error = ?e, "stream_recv error during Put");
-                return Ok(Some(err(ErrorCode::Internal, "Stream receive error")));
-            }
-        }
-    }
-
-    // Phase B: body fully received. If streaming-checksum mode is
-    // active, keep draining until the 32-byte trailer is complete
-    // before verifying.
-    if *remaining == 0 {
-        if let Some(buf) = trailer_buf.as_mut() {
-            while !buf.is_full() {
-                match conn.stream_recv(stream_id, tmp) {
-                    Ok((len, fin)) => {
-                        let consumed = buf.extend(&tmp[..len]);
-                        if consumed < len {
-                            return Ok(Some(err(
-                                ErrorCode::UploadOverflow,
-                                "Trailer bytes exceeded 32",
-                            )));
-                        }
-                        if fin && !buf.is_full() {
-                            return Ok(Some(err(
-                                ErrorCode::UploadTruncated,
-                                "Stream closed before BLAKE3 trailer was complete",
-                            )));
-                        }
-                    }
-                    Err(quiche::Error::Done) => return Ok(None),
-                    Err(quiche::Error::InvalidStreamState(_)) => {
-                        // FIN already consumed; stream is gone but
-                        // we never finished the trailer.
-                        return Ok(Some(err(
-                            ErrorCode::UploadTruncated,
-                            "Stream closed before BLAKE3 trailer was complete",
-                        )));
-                    }
-                    Err(e) => {
-                        warn!(stream_id, error = ?e, "stream_recv error during trailer");
-                        return Ok(Some(err(ErrorCode::Internal, "Stream receive error")));
-                    }
-                }
-            }
-        }
-
-        if let Err(e) = writer.flush() {
-            return Ok(Some(err(
-                ErrorCode::Internal,
-                format!("Failed to flush file: {e}"),
-            )));
-        }
-        // Verify checksum before rename -- never reveal a corrupted
-        // body at `final_path`. Trailer takes precedence over the
-        // legacy header checksum when both are present (defensive;
-        // client shouldn't set both).
-        let expected: Option<[u8; 32]> = trailer_buf
-            .as_ref()
-            .filter(|b| b.is_full())
-            .map(|b| b.as_array())
-            .or(*expected_checksum);
-        if let Some(expected) = expected {
-            let got = *hasher.finalize().as_bytes();
-            if got != expected {
-                // The bytes on disk are known-corrupt; a resume would
-                // re-hash the same temp and fail forever. Remove it so
-                // the next upload starts fresh (mirrors `do_get`
-                // deleting a corrupt download). Settle the reservation
-                // and mark the stream done so the abort path in
-                // `StreamState`'s Drop doesn't also account for it.
-                let _ = fs::remove_file(temp_path);
-                owner
-                    .in_flight_bytes
-                    .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-                // The partial is being deleted. Refund the prefix bytes
-                // a prior aborted session charged to `used_bytes`, or
-                // they leak permanently against the user's quota.
-                if *prior_bytes > 0 {
-                    owner
-                        .used_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                            Some(u.saturating_sub(*prior_bytes))
-                        })
-                        .ok();
-                }
-                *completed = true;
-                return Ok(Some(err(
-                    ErrorCode::ChecksumMismatch,
-                    "Upload checksum verification failed",
-                )));
-            }
-        }
-        // Parent-dir symlink TOCTOU re-check, immediately before the
-        // commit rename. `start_put` ran this once at entry, but the
-        // body transfer can take arbitrarily long; a parent directory
-        // swapped to a symlink during the transfer would make this
-        // rename land the file outside the user's home. Every other
-        // mutating syscall re-checks right before the call -- match
-        // that here, and do NOT rename if the re-check fails.
-        if let Err(e) = handler::recheck_ancestors_no_symlinks(final_path, &owner.home) {
-            return Ok(Some(Response::Err(e)));
-        }
-        if let Err(e) = fs::rename(temp_path, &final_path) {
-            return Ok(Some(err(
-                ErrorCode::Internal,
-                format!("Failed to finalize file: {e}"),
-            )));
-        }
-        qftp_protocol::stream::apply_mode(final_path, *mode);
-        *completed = true;
-        // Hand the reservation over to the persistent cache.
-        // Once `completed` is true the Drop impl no longer touches
-        // in_flight (it only does so on abort), so it's safe to
-        // drain the reservation here.
-        owner
-            .in_flight_bytes
-            .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-        owner
-            .used_bytes
-            .fetch_add(*reserved_bytes, Ordering::Relaxed);
-        metrics.inc_uploads_completed();
-        return Ok(Some(Response::Ok));
-    }
-
-    Ok(None)
-}
-
-/// Open the resumable Put temp file at `path`.
-///
-/// `resume == false` (fresh upload): the file is created if absent and
-/// opened read+write; the caller truncates it after refunding any stale
-/// partial's bytes. `resume == true`: the file must already exist and
-/// be a regular file; it is opened read+write without `O_CREAT` so a
-/// vanished partial fails cleanly rather than starting a blank upload.
-///
-/// `O_NOFOLLOW` is set in both cases so a symlink planted at the
-/// predictable temp path can never redirect the open. The 0o600 create
-/// mode keeps an in-progress partial unreadable by other local users
-/// (daemon umask, typically 0o022, would otherwise land it at 0o644).
-fn open_temp(path: &Path, resume: bool) -> std::io::Result<File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).write(true);
-    if resume {
-        qftp_common::fs_safe::require_regular_file(path)?;
-        qftp_common::fs_safe::apply_no_follow(&mut opts);
-    } else {
-        opts.create(true);
-        qftp_common::fs_safe::apply_owner_only_no_follow(&mut opts);
-    }
-    opts.open(path)
-}
-
-// `temp_path_for` lives in `qftp_protocol::stream` (lifted by review
-// cycle 2 #14) and is imported via `use qftp_protocol::stream::...`
-// at the top of this file. Single source of truth ensures the native
-// server and the WebTransport bridge always agree on the partial
-// path so cross-transport resume works.
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handler_result_stale_across_generations() {
+        // A result whose generation matches the live connection applies;
+        // a mismatch (the SCID was reused by a newer connection) is
+        // stale and must be dropped (L-6).
+        assert!(!handler_result_is_stale(7, 7));
+        assert!(handler_result_is_stale(8, 7));
+        assert!(handler_result_is_stale(7, 8));
+    }
+
+    #[test]
+    fn half_open_expired_reaps_unestablished_after_timeout() {
+        // An un-established connection past the half-open window must be
+        // reaped so spoofed Initials can't pin cap slots (#266).
+        assert!(half_open_expired(false, HALF_OPEN_TIMEOUT));
+        assert!(half_open_expired(
+            false,
+            HALF_OPEN_TIMEOUT + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn half_open_does_not_reap_fresh_or_established() {
+        // A connection still inside the window survives.
+        assert!(!half_open_expired(false, Duration::ZERO));
+        assert!(!half_open_expired(
+            false,
+            HALF_OPEN_TIMEOUT - Duration::from_millis(1)
+        ));
+        // An established connection is never half-open-reaped, no matter
+        // how long it has been alive.
+        assert!(!half_open_expired(true, HALF_OPEN_TIMEOUT * 100));
+    }
 
     #[test]
     fn replay_safe_allows_readonly_ops() {
@@ -2427,46 +1558,5 @@ mod tests {
             path: "x".into(),
             mode: 0o644,
         }));
-    }
-
-    /// The in-flight partial-upload temp file must be 0o600
-    /// regardless of the process umask, so it isn't readable by
-    /// other local users while the upload is still in progress.
-    #[cfg(unix)]
-    #[test]
-    fn temp_upload_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        struct UmaskGuard(libc::mode_t);
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                unsafe { libc::umask(self.0) };
-            }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("victim.partial");
-        // Force a permissive umask so the bug would be observable
-        // without the explicit mode call.
-        let _restore = UmaskGuard(unsafe { libc::umask(0o000) });
-        let f = open_temp(&path, false).expect("temp create");
-        drop(f);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "temp file mode was {mode:o}, expected 0o600");
-    }
-
-    // `temp_path_for` is now defined and tested in
-    // `qftp_protocol::stream`; no need to duplicate the deterministic /
-    // sibling assertions here.
-
-    #[cfg(unix)]
-    #[test]
-    fn open_temp_resume_requires_an_existing_partial() {
-        // A resume open must fail when there is no partial to continue
-        // rather than silently creating a blank one.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.partial");
-        assert!(open_temp(&path, true).is_err());
-        // A fresh open creates it; a following resume open then works.
-        drop(open_temp(&path, false).expect("fresh open"));
-        assert!(open_temp(&path, true).is_ok());
     }
 }

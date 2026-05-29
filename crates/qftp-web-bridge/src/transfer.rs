@@ -21,7 +21,8 @@ use qftp_common::protocol::{validate_request, ErrorCode, ErrorResponse, Request,
 use qftp_common::transport::{decode_framed_message, MAX_MESSAGE_SIZE};
 use qftp_protocol::handler;
 use qftp_protocol::stream::{
-    apply_mode, temp_path_for, TrailerBuf, FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
+    apply_mode, classify_put_chunk, resolve_put_checksum, temp_path_for, PutOverflow, TrailerBuf,
+    FILE_CHUNK_SIZE, MAX_FILE_SIZE, SEND_CHUNK_SIZE,
 };
 use qftp_protocol::user::{InFlightReservation, User};
 use serde::Serialize;
@@ -632,13 +633,10 @@ async fn do_put(
     drop(file);
 
     // Verify the checksum before the rename: a corrupt body must never
-    // become visible at `final_path`. A streamed trailer takes
-    // precedence over the legacy header checksum when both are present.
-    let expected = if checksum_trailer && trailer_buf.is_full() {
-        Some(trailer_buf.as_array())
-    } else {
-        expected_checksum
-    };
+    // become visible at `final_path`. The shared precedence rule (#269):
+    // a complete streamed trailer overrides the legacy header checksum
+    // when both are present.
+    let expected = resolve_put_checksum(checksum_trailer, &trailer_buf, expected_checksum);
     if let Some(expected) = expected {
         if *hasher.finalize().as_bytes() != expected {
             return reply_err(
@@ -698,6 +696,20 @@ async fn do_put(
     finish(send).await
 }
 
+/// Map the transport-agnostic [`PutOverflow`] from the shared
+/// classifier (#269) onto the bridge's `ErrorResponse`.
+fn put_overflow_err(o: PutOverflow) -> ErrorResponse {
+    match o {
+        PutOverflow::BodyExceeded => {
+            ErrorResponse::new(ErrorCode::UploadOverflow, "Upload exceeded declared size")
+        }
+        PutOverflow::TrailerExceeded => ErrorResponse::new(
+            ErrorCode::UploadOverflow,
+            "Upload exceeded declared size + trailer",
+        ),
+    }
+}
+
 /// Route one received chunk into the upload body and, once the body is
 /// full, into the 32-byte BLAKE3 trailer buffer. Returns `Ok(Some(_))`
 /// for a protocol error (the caller turns it into an error response),
@@ -710,31 +722,28 @@ async fn route_put_chunk(
     trailer_buf: &mut TrailerBuf,
     checksum_trailer: bool,
 ) -> Result<Option<ErrorResponse>> {
-    let to_body = (chunk.len() as u64).min(*body_remaining) as usize;
-    if to_body > 0 {
-        file.write_all(&chunk[..to_body])
+    // Shared split policy (#269): the same classifier the native
+    // server uses decides body vs. trailer vs. overflow, so the two
+    // transports can't drift on the most error-prone part of the Put
+    // path. This driver only performs the I/O the split prescribes.
+    let split = match classify_put_chunk(
+        chunk.len(),
+        *body_remaining,
+        checksum_trailer,
+        trailer_buf.remaining(),
+    ) {
+        Ok(s) => s,
+        Err(o) => return Ok(Some(put_overflow_err(o))),
+    };
+    if split.to_body > 0 {
+        file.write_all(&chunk[..split.to_body])
             .await
             .context("temp file write failed")?;
-        hasher.update(&chunk[..to_body]);
-        *body_remaining -= to_body as u64;
+        hasher.update(&chunk[..split.to_body]);
+        *body_remaining -= split.to_body as u64;
     }
-    let rest = &chunk[to_body..];
-    if rest.is_empty() {
-        return Ok(None);
-    }
-    if !checksum_trailer {
-        return Ok(Some(ErrorResponse::new(
-            ErrorCode::UploadOverflow,
-            "Upload exceeded declared size",
-        )));
-    }
-    // `extend` caps at the 32-byte trailer; a short consume means the
-    // peer sent more than body + trailer.
-    if trailer_buf.extend(rest) < rest.len() {
-        return Ok(Some(ErrorResponse::new(
-            ErrorCode::UploadOverflow,
-            "Upload exceeded declared size + trailer",
-        )));
+    if split.to_trailer > 0 {
+        trailer_buf.extend(&chunk[split.to_body..split.to_body + split.to_trailer]);
     }
     Ok(None)
 }

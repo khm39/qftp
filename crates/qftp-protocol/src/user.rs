@@ -86,6 +86,15 @@ pub struct Permissions {
     pub chmod: bool,
 }
 
+/// Canonical permission-flag key names, in declaration order. The
+/// single source of truth for the `[permissions]` table keys so the
+/// `qftp-admin` CLI (the only writer of `users.toml`) can't drift from
+/// the `Permissions` struct's `#[serde(deny_unknown_fields)]` schema
+/// (#269). Adding/renaming a flag here keeps admin and server aligned.
+pub const PERM_KEYS: &[&str] = &[
+    "read", "write", "delete", "mkdir", "rmdir", "rename", "chmod",
+];
+
 impl Permissions {
     /// All-true permission set; used by tests and by callers that want
     /// to express "no ACL" explicitly. Not the default for anonymous —
@@ -790,6 +799,28 @@ mod tests {
         ] {
             assert!(p.allows(op), "{op:?} should be allowed in full");
         }
+    }
+
+    #[test]
+    fn perm_keys_match_permissions_schema() {
+        // PERM_KEYS is the canonical key set qftp-admin writes. Building
+        // a `[permissions]` table from exactly those keys must
+        // deserialize cleanly under `deny_unknown_fields`; if a future
+        // edit renames a field but not PERM_KEYS (or vice versa), this
+        // round-trip fails -- catching the admin/server schema drift
+        // #269 is about.
+        let body = format!(
+            "[[users]]\nname = \"k\"\npermissions = {{ {} }}\n",
+            PERM_KEYS
+                .iter()
+                .map(|k| format!("{k} = true"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let cfg: UserConfig = toml::from_str(&body).expect("PERM_KEYS must form a valid schema");
+        assert_eq!(cfg.users.len(), 1);
+        let p = &cfg.users[0].permissions;
+        assert!(p.read && p.write && p.delete && p.mkdir && p.rmdir && p.rename && p.chmod);
     }
 
     #[test]
