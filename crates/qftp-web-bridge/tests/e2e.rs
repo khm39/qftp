@@ -63,7 +63,10 @@ fn split_frame(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
 
 async fn read_to_end(recv: &mut RecvStream) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut buf = [0u8; 65536];
+    // Heap, not a stack `[u8; 65536]`: `#[tokio::test]` polls the whole
+    // test future on the harness thread's 2 MiB stack, where each awaited
+    // call bakes in its own copy of this buffer and overflows it.
+    let mut buf = vec![0u8; 65536];
     while let Some(n) = recv.read(&mut buf).await.expect("recv read") {
         out.extend_from_slice(&buf[..n]);
     }
@@ -406,6 +409,85 @@ async fn end_to_end_webtransport() {
             }
             other => panic!("resumed get: expected FileReady, got {other:?}"),
         }
+    }
+
+    // A resumed get whose offset exceeds SEND_CHUNK_SIZE (256 KiB): the
+    // prefix re-hash loop must iterate more than once, crossing a chunk
+    // boundary (prefix_remaining -= want, read_exact) before the body
+    // streams. A 600 KB upload with a 300 KB offset makes the loop run
+    // twice (256 KiB + ~44 KiB), guarding the boundary arithmetic (#277).
+    {
+        let big_body: Vec<u8> = (0..600_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let big_digest = *blake3::hash(&big_body).as_bytes();
+        expect_ok(
+            put(&alice, "/sub/multi.bin", &big_body, Some(big_digest)).await,
+            "put multi-chunk-prefix body",
+        );
+
+        let offset = 300_000u64;
+        assert!(
+            offset > 256 * 1024,
+            "offset must exceed SEND_CHUNK_SIZE to span the prefix loop"
+        );
+        let (resp, rest) = get_at(&alice, "/sub/multi.bin", offset).await;
+        match resp {
+            Response::FileReady {
+                size, total_size, ..
+            } => {
+                let size = size as usize;
+                assert_eq!(total_size, big_body.len() as u64, "multi-prefix total_size");
+                assert_eq!(size, big_body.len() - offset as usize, "multi-prefix size");
+                assert_eq!(rest.len(), size + 32, "multi-prefix body + trailer length");
+                assert_eq!(
+                    &rest[..size],
+                    &big_body[offset as usize..],
+                    "multi-prefix body must be the [offset..] suffix"
+                );
+                assert_eq!(
+                    &rest[size..size + 32],
+                    blake3::hash(&big_body).as_bytes(),
+                    "multi-prefix resumed get must re-hash the whole file across chunks"
+                );
+            }
+            other => panic!("multi-prefix resumed get: expected FileReady, got {other:?}"),
+        }
+
+        // offset == total_size: zero body, the trailer is the whole-file
+        // BLAKE3 (the prefix is the entire file). Exercises the edge where
+        // the body loop never runs but the prefix re-hash covers everything.
+        let (resp, rest) = get_at(&alice, "/sub/multi.bin", big_body.len() as u64).await;
+        match resp {
+            Response::FileReady {
+                size, total_size, ..
+            } => {
+                assert_eq!(size, 0, "offset==total must yield a zero-length body");
+                assert_eq!(
+                    total_size,
+                    big_body.len() as u64,
+                    "offset==total total_size"
+                );
+                assert_eq!(rest.len(), 32, "offset==total must send only the trailer");
+                assert_eq!(
+                    &rest[..32],
+                    blake3::hash(&big_body).as_bytes(),
+                    "offset==total trailer must be the whole-file BLAKE3"
+                );
+            }
+            other => panic!("offset==total get: expected FileReady, got {other:?}"),
+        }
+
+        expect_ok(
+            op(
+                &alice,
+                &Request::Rm {
+                    path: "/sub/multi.bin".into(),
+                },
+            )
+            .await,
+            "rm multi.bin",
+        );
     }
 
     // A wrong header checksum must be refused and must not appear on disk.
