@@ -98,6 +98,25 @@ thread_local! {
         std::cell::RefCell::new(vec![0u8; MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS]);
 }
 
+/// Static call-site labels for [`TransportError::io_ctx`]. Centralized
+/// here so the per-`send_to`/`recv_from` breadcrumbs operators grep for
+/// stay in one place. The Linux-only labels are cfg-gated to match the
+/// `flush_egress` GSO paths that reference them; the unconditional ones
+/// are used on every platform.
+mod contexts {
+    pub const SEND_PER_PACKET_FALLBACK: &str = "UDP send_to (per-packet fallback)";
+    pub const RECV_FROM: &str = "UDP recv_from";
+
+    #[cfg(target_os = "linux")]
+    pub const SEND_PATH_SWAP: &str = "UDP send_to (path swap)";
+    #[cfg(target_os = "linux")]
+    pub const SEND_OVERSIZE: &str = "UDP send_to (oversize)";
+    #[cfg(target_os = "linux")]
+    pub const SEND_SINGLE: &str = "UDP send_to (single)";
+    #[cfg(target_os = "linux")]
+    pub const SEND_FALLBACK: &str = "UDP send_to (fallback)";
+}
+
 /// Flush pending outgoing packets from the QUIC connection to the UDP
 /// socket. On Linux this coalesces up to `GSO_BURST_PACKETS` datagrams
 /// into a single `sendmsg(UDP_SEGMENT)`; on other platforms,
@@ -139,7 +158,7 @@ fn flush_egress_per_packet(
 
         socket
             .send_to(&out[..write], send_info.to)
-            .map_err(|e| TransportError::io_ctx("UDP send_to (per-packet fallback)", e))?;
+            .map_err(|e| TransportError::io_ctx(contexts::SEND_PER_PACKET_FALLBACK, e))?;
     }
 
     Ok(())
@@ -198,7 +217,7 @@ fn flush_egress_gso(
                     }
                     socket
                         .send_to(&buf[total..total + write], send_info.to)
-                        .map_err(|e| TransportError::io_ctx("UDP send_to (path swap)", e))?;
+                        .map_err(|e| TransportError::io_ctx(contexts::SEND_PATH_SWAP, e))?;
                     continue 'outer;
                 }
             } else {
@@ -214,7 +233,7 @@ fn flush_egress_gso(
                 }
                 socket
                     .send_to(&buf[total..total + write], send_info.to)
-                    .map_err(|e| TransportError::io_ctx("UDP send_to (oversize)", e))?;
+                    .map_err(|e| TransportError::io_ctx(contexts::SEND_OVERSIZE, e))?;
                 continue 'outer;
             }
 
@@ -252,7 +271,7 @@ fn send_batch(
     if packets <= 1 {
         socket
             .send_to(buf, dst)
-            .map_err(|e| TransportError::io_ctx("UDP send_to (single)", e))?;
+            .map_err(|e| TransportError::io_ctx(contexts::SEND_SINGLE, e))?;
         return Ok(());
     }
 
@@ -274,7 +293,7 @@ fn send_batch(
                 let n = seg_size.min(buf.len() - off);
                 socket
                     .send_to(&buf[off..off + n], dst)
-                    .map_err(|e| TransportError::io_ctx("UDP send_to (fallback)", e))?;
+                    .map_err(|e| TransportError::io_ctx(contexts::SEND_FALLBACK, e))?;
                 off += n;
             }
             Ok(())
@@ -370,7 +389,7 @@ pub fn handle_ingress(
         let (len, from) = match socket.recv_from(buf) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(TransportError::io_ctx("UDP recv_from", e)),
+            Err(e) => return Err(TransportError::io_ctx(contexts::RECV_FROM, e)),
         };
 
         let recv_info = quiche::RecvInfo {
@@ -485,6 +504,20 @@ pub fn recv_message<T: DeserializeOwned>(
     decode_framed_message(stream_buf)
 }
 
+/// Bincode options for the framed control-message decode path. The
+/// `with_limit(MAX_MESSAGE_SIZE)` cap bounds individual `String`/`Vec`
+/// allocations during decode; `with_fixint_encoding` +
+/// `allow_trailing_bytes` reproduce the historical wire settings. Only
+/// the decode path uses these -- `encode_framed_message` deliberately
+/// uses bincode's free functions (no decode-side limit at encode time).
+fn make_bincode_options() -> impl bincode::Options {
+    use bincode::Options as _;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_MESSAGE_SIZE as u64)
+}
+
 /// Decode one length-prefixed bincode message from `stream_buf` using
 /// the exact same length cap and bincode options the production
 /// `recv_message` path applies. On success the consumed prefix +
@@ -526,12 +559,8 @@ pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> R
     // bincode's defaults will happily allocate a 16 MiB `String` for
     // a single field within that frame. with_limit caps individual
     // String/Vec allocations during decode at the same MAX_MESSAGE_SIZE.
-    let opts = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .with_limit(MAX_MESSAGE_SIZE as u64);
     use bincode::Options as _;
-    let msg: T = opts.deserialize(&stream_buf[4..4 + msg_len])?;
+    let msg: T = make_bincode_options().deserialize(&stream_buf[4..4 + msg_len])?;
 
     // Drain the consumed bytes.
     stream_buf.drain(..4 + msg_len);

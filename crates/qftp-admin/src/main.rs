@@ -125,14 +125,18 @@ enum Command {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    match args.command {
+    execute_command(&args.users, args.command)
+}
+
+fn execute_command(users_path: &Path, command: Command) -> Result<()> {
+    match command {
         Command::GenerateCompletions { shell } => {
             let mut cmd = Args::command();
             let bin = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
             Ok(())
         }
-        Command::InitUsers => init_users(&args.users),
+        Command::InitUsers => init_users(users_path),
         Command::AddUser {
             name,
             home,
@@ -144,7 +148,7 @@ fn main() -> Result<()> {
             rename,
             chmod,
         } => add_user(
-            &args.users,
+            users_path,
             &name,
             home.as_deref(),
             Perms {
@@ -157,8 +161,8 @@ fn main() -> Result<()> {
                 chmod,
             },
         ),
-        Command::RemoveUser { name } => remove_user(&args.users, &name),
-        Command::ListUsers => list_users(&args.users),
+        Command::RemoveUser { name } => remove_user(users_path, &name),
+        Command::ListUsers => list_users(users_path),
         Command::SetPermissions {
             name,
             read,
@@ -169,7 +173,7 @@ fn main() -> Result<()> {
             rename,
             chmod,
         } => set_permissions(
-            &args.users,
+            users_path,
             &name,
             PartialPerms {
                 read,
@@ -185,7 +189,7 @@ fn main() -> Result<()> {
             name,
             bytes,
             unlimited,
-        } => set_quota(&args.users, &name, if unlimited { None } else { bytes }),
+        } => set_quota(users_path, &name, if unlimited { None } else { bytes }),
     }
 }
 
@@ -211,6 +215,45 @@ struct PartialPerms {
     chmod: Option<bool>,
 }
 
+// Inserts in PERM_KEYS declaration order so the serialized inline table
+// matches the server's `Permissions` field order and stays byte-stable.
+fn build_perms_table(perms: Perms) -> toml_edit::InlineTable {
+    let mut it = toml_edit::InlineTable::new();
+    it.insert("read", perms.read.into());
+    it.insert("write", perms.write.into());
+    it.insert("delete", perms.delete.into());
+    it.insert("mkdir", perms.mkdir.into());
+    it.insert("rmdir", perms.rmdir.into());
+    it.insert("rename", perms.rename.into());
+    it.insert("chmod", perms.chmod.into());
+    it
+}
+
+fn apply_partial_perms(it: &mut toml_edit::InlineTable, partial: PartialPerms) {
+    let apply = |it: &mut toml_edit::InlineTable, k: &str, v: Option<bool>| {
+        if let Some(b) = v {
+            it.insert(k, b.into());
+        }
+    };
+    apply(it, "read", partial.read);
+    apply(it, "write", partial.write);
+    apply(it, "delete", partial.delete);
+    apply(it, "mkdir", partial.mkdir);
+    apply(it, "rmdir", partial.rmdir);
+    apply(it, "rename", partial.rename);
+    apply(it, "chmod", partial.chmod);
+}
+
+fn get_bool_from_perm_item(item: Option<&toml_edit::Item>, key: &str) -> bool {
+    match item {
+        Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(it))) => {
+            it.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+        }
+        Some(toml_edit::Item::Table(tt)) => tt.get(key).and_then(|v| v.as_bool()).unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn init_users(path: &Path) -> Result<()> {
     if path.exists() {
         bail!("{} already exists; refusing to overwrite", path.display());
@@ -233,17 +276,9 @@ fn add_user(path: &Path, name: &str, home: Option<&Path>, perms: Perms) -> Resul
     if let Some(h) = home {
         table.insert("home", toml_edit::value(h.to_string_lossy().to_string()));
     }
-    let mut perms_tbl = toml_edit::InlineTable::new();
-    perms_tbl.insert("read", perms.read.into());
-    perms_tbl.insert("write", perms.write.into());
-    perms_tbl.insert("delete", perms.delete.into());
-    perms_tbl.insert("mkdir", perms.mkdir.into());
-    perms_tbl.insert("rmdir", perms.rmdir.into());
-    perms_tbl.insert("rename", perms.rename.into());
-    perms_tbl.insert("chmod", perms.chmod.into());
     table.insert(
         "permissions",
-        toml_edit::Item::Value(toml_edit::Value::InlineTable(perms_tbl)),
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(build_perms_table(perms))),
     );
 
     users.push(table);
@@ -255,7 +290,7 @@ fn add_user(path: &Path, name: &str, home: Option<&Path>, perms: Perms) -> Resul
 fn remove_user(path: &Path, name: &str) -> Result<()> {
     let mut doc = load_existing(path)?;
     let users = ensure_users_array(&mut doc)?;
-    let idx = find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))?;
+    let idx = validate_user_exists(users, name)?;
     users.remove(idx);
     write_atomic(path, &doc.to_string())?;
     println!("Removed user '{name}' from {}.", path.display());
@@ -290,19 +325,8 @@ fn list_users(path: &Path) -> Result<()> {
 fn format_perms(t: &toml_edit::Table) -> String {
     let p = t.get("permissions");
     let mut on: Vec<&str> = Vec::new();
-    let inline_get = |k: &str| -> bool {
-        match p {
-            Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(it))) => {
-                it.get(k).and_then(|v| v.as_bool()).unwrap_or(false)
-            }
-            Some(toml_edit::Item::Table(tt)) => {
-                tt.get(k).and_then(|v| v.as_bool()).unwrap_or(false)
-            }
-            _ => false,
-        }
-    };
     for k in PERM_KEYS {
-        if inline_get(k) {
+        if get_bool_from_perm_item(p, k) {
             on.push(k);
         }
     }
@@ -316,7 +340,7 @@ fn format_perms(t: &toml_edit::Table) -> String {
 fn set_permissions(path: &Path, name: &str, partial: PartialPerms) -> Result<()> {
     let mut doc = load_existing(path)?;
     let users = ensure_users_array(&mut doc)?;
-    let idx = find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))?;
+    let idx = validate_user_exists(users, name)?;
 
     let entry = users.get_mut(idx).expect("idx in bounds");
     // Lift the existing permissions table into an inline table we can
@@ -334,18 +358,7 @@ fn set_permissions(path: &Path, name: &str, partial: PartialPerms) -> Result<()>
         }
         _ => toml_edit::InlineTable::new(),
     };
-    let apply = |it: &mut toml_edit::InlineTable, k: &str, v: Option<bool>| {
-        if let Some(b) = v {
-            it.insert(k, b.into());
-        }
-    };
-    apply(&mut perms_tbl, "read", partial.read);
-    apply(&mut perms_tbl, "write", partial.write);
-    apply(&mut perms_tbl, "delete", partial.delete);
-    apply(&mut perms_tbl, "mkdir", partial.mkdir);
-    apply(&mut perms_tbl, "rmdir", partial.rmdir);
-    apply(&mut perms_tbl, "rename", partial.rename);
-    apply(&mut perms_tbl, "chmod", partial.chmod);
+    apply_partial_perms(&mut perms_tbl, partial);
 
     entry.insert(
         "permissions",
@@ -381,7 +394,7 @@ fn set_quota(path: &Path, name: &str, bytes: Option<u64>) -> Result<()> {
 
     let mut doc = load_existing(path)?;
     let users = ensure_users_array(&mut doc)?;
-    let idx = find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))?;
+    let idx = validate_user_exists(users, name)?;
     let entry = users.get_mut(idx).expect("idx in bounds");
     match bytes {
         // `quota_bytes` is the schema key on `UserSpec` (Option<u64>,
@@ -442,6 +455,10 @@ fn find_user_index(users: &toml_edit::ArrayOfTables, name: &str) -> Option<usize
         .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
 }
 
+fn validate_user_exists(users: &toml_edit::ArrayOfTables, name: &str) -> Result<usize> {
+    find_user_index(users, name).ok_or_else(|| anyhow!("user '{name}' not found"))
+}
+
 fn write_atomic(path: &Path, body: &str) -> Result<()> {
     // Previously this used a deterministic `users.toml.tmp`
     // name, which raced under concurrent admin invocations and
@@ -458,19 +475,27 @@ fn write_atomic(path: &Path, body: &str) -> Result<()> {
         .with_context(|| format!("failed to create {}", parent.display()))?;
     let mut tf = tempfile::NamedTempFile::new_in(&parent)
         .with_context(|| format!("failed to create temp file in {}", parent.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tf.as_file().metadata()?.permissions();
-        perms.set_mode(0o600);
-        tf.as_file().set_permissions(perms)?;
-    }
+    set_temp_file_permissions(&tf)?;
     tf.as_file_mut()
         .write_all(body.as_bytes())
         .with_context(|| format!("failed to write temp file under {}", parent.display()))?;
     tf.as_file().sync_all().ok();
     tf.persist(path)
         .with_context(|| format!("failed to persist tmp to {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_temp_file_permissions(tf: &tempfile::NamedTempFile) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = tf.as_file().metadata()?.permissions();
+    perms.set_mode(0o600);
+    tf.as_file().set_permissions(perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_temp_file_permissions(_tf: &tempfile::NamedTempFile) -> Result<()> {
     Ok(())
 }
 
@@ -632,6 +657,61 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ambiguous"), "got: {msg}");
         assert!(msg.contains("--unlimited"), "got: {msg}");
+    }
+
+    #[test]
+    fn perms_field_count_matches_perm_keys() {
+        // Destructure without `..` so adding/removing a permission field
+        // fails to compile here, forcing PERM_KEYS to be updated in lock
+        // step (#40, guards the drift described in #269).
+        let Perms {
+            read,
+            write,
+            delete,
+            mkdir,
+            rmdir,
+            rename,
+            chmod,
+        } = Perms {
+            read: false,
+            write: false,
+            delete: false,
+            mkdir: false,
+            rmdir: false,
+            rename: false,
+            chmod: false,
+        };
+        let perms_fields = [read, write, delete, mkdir, rmdir, rename, chmod];
+        assert_eq!(perms_fields.len(), PERM_KEYS.len());
+
+        let PartialPerms {
+            read,
+            write,
+            delete,
+            mkdir,
+            rmdir,
+            rename,
+            chmod,
+        } = PartialPerms::default();
+        let partial_fields = [read, write, delete, mkdir, rmdir, rename, chmod];
+        assert_eq!(partial_fields.len(), PERM_KEYS.len());
+    }
+
+    #[test]
+    fn build_perms_table_preserves_perm_keys_order() {
+        // Locks the serialized inline-table key order to PERM_KEYS so a
+        // refactor can't silently reorder users.toml output (#19/#40).
+        let it = build_perms_table(Perms {
+            read: true,
+            write: true,
+            delete: true,
+            mkdir: true,
+            rmdir: true,
+            rename: true,
+            chmod: true,
+        });
+        let keys: Vec<&str> = it.iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, PERM_KEYS);
     }
 
     #[test]

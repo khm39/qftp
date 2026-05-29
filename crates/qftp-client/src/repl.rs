@@ -1,6 +1,6 @@
 use qftp_common::protocol::{ErrorResponse, Request, Response};
 
-use crate::stats::format_size;
+use qftp_common::util::format_size;
 
 #[derive(Debug)]
 pub enum Command {
@@ -43,19 +43,20 @@ pub enum Command {
     Stats,
 }
 
-/// Pull `-r` / `--recursive` out of a token slice. Returns the flag and
-/// the remaining positional arguments.
-fn take_recursive_flag<'a>(parts: &'a [&'a str]) -> (bool, Vec<&'a str>) {
-    let mut recursive = false;
-    let mut rest = Vec::with_capacity(parts.len());
-    for p in parts {
-        if *p == "-r" || *p == "--recursive" {
-            recursive = true;
+/// Pull a boolean flag (matched against any of `names`) out of a token
+/// slice. Returns whether the flag was present and the remaining
+/// positional arguments in their original order.
+fn extract_flag<'a>(args: &'a [&'a str], names: &[&str]) -> (bool, Vec<&'a str>) {
+    let mut present = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for p in args {
+        if names.contains(p) {
+            present = true;
         } else {
             rest.push(*p);
         }
     }
-    (recursive, rest)
+    (present, rest)
 }
 
 pub fn parse_command(line: &str) -> Option<Command> {
@@ -83,7 +84,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
         }
         "pwd" => Some(Command::Remote(Request::Pwd)),
         "get" => {
-            let (recursive, args) = take_recursive_flag(args);
+            let (recursive, args) = extract_flag(args, &["-r", "--recursive"]);
             if args.is_empty() {
                 println!("Usage: get [-r] <remote> [local]");
                 return None;
@@ -95,7 +96,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
             })
         }
         "put" | "mput" => {
-            let (recursive, args) = take_recursive_flag(args);
+            let (recursive, args) = extract_flag(args, &["-r", "--recursive"]);
             if args.is_empty() {
                 println!("Usage: put [-r] <local> [remote]");
                 return None;

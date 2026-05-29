@@ -257,14 +257,78 @@ impl Drop for InFlightReservation {
     }
 }
 
-/// Walk `root` and return `(total_bytes, file_count)`. Used to
-/// initialize a user's cached `used_bytes` at startup, and (until
-/// the cache lands) for `Request::Quota` replies. We deliberately
-/// skip non-regular files so the number matches `du -b --apparent-size`.
 /// Age past which an aborted `.qftp.partial` is treated as abandoned
 /// and removed at startup. A genuine resume happens far sooner; a
 /// partial older than this is leaked disk no client will reclaim.
 const STALE_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Per-call log strings for [`walk_directory`]. Each caller keeps its
+/// own wording (sweep "skipping" vs. walk_size "quota cache will
+/// undercount") so consolidating the traversal doesn't blur the
+/// operator-facing diagnostics the two paths intentionally differ on.
+struct WalkLogs {
+    read_dir_failed: &'static str,
+    entry_failed: &'static str,
+    metadata_failed: &'static str,
+}
+
+/// Stack-based DFS over `root`, invoking `visit` for every regular file
+/// with its `DirEntry` and `Metadata`. Directories are recursed into
+/// (LIFO order); non-regular entries (and symlink-to-non-file, since
+/// `metadata()` follows the link) are skipped. read_dir / dir-entry /
+/// metadata errors are logged via the caller-supplied `logs` and the
+/// offending node is skipped, never aborting the whole walk.
+fn walk_directory<F>(root: &Path, logs: &WalkLogs, mut visit: F)
+where
+    F: FnMut(&std::fs::DirEntry, &std::fs::Metadata),
+{
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "{}",
+                    logs.read_dir_failed,
+                );
+                continue;
+            }
+        };
+        for entry in read {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "{}",
+                        logs.entry_failed,
+                    );
+                    continue;
+                }
+            };
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "{}",
+                        logs.metadata_failed,
+                    );
+                    continue;
+                }
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                visit(&entry, &meta);
+            }
+        }
+    }
+}
 
 /// Delete abandoned upload temp files (`*.qftp.partial`) under `root`
 /// whose last-modified time is older than [`STALE_PARTIAL_AGE`].
@@ -278,135 +342,65 @@ const STALE_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// fresh partial (a recent abort a client may yet resume) is left be.
 pub fn sweep_stale_partials(root: &Path) {
     let now = std::time::SystemTime::now();
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let read = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(e) => {
+    let logs = WalkLogs {
+        read_dir_failed: "sweep_stale_partials: read_dir failed; skipping subtree",
+        entry_failed: "sweep_stale_partials: dir entry read failed; skipping",
+        metadata_failed: "sweep_stale_partials: metadata failed; skipping entry",
+    };
+    walk_directory(root, &logs, |entry, meta| {
+        // `temp_path_for` always appends `.qftp.partial` to a
+        // non-empty filename, so a legitimate partial is
+        // `<something>.qftp.partial`. Require a non-empty prefix
+        // so a hand-created bare-`.qftp.partial` user file isn't
+        // swept.
+        let is_partial = entry
+            .file_name()
+            .to_str()
+            .map(|n| n.ends_with(".qftp.partial") && n.len() > ".qftp.partial".len())
+            .unwrap_or(false);
+        if !is_partial {
+            return;
+        }
+        let abandoned = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|age| age > STALE_PARTIAL_AGE)
+            .unwrap_or(false);
+        if abandoned {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
                 tracing::warn!(
-                    path = %dir.display(),
+                    path = %entry.path().display(),
                     error = %e,
-                    "sweep_stale_partials: read_dir failed; skipping subtree",
+                    "sweep_stale_partials: remove of abandoned partial failed",
                 );
-                continue;
-            }
-        };
-        for entry in read {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %dir.display(),
-                        error = %e,
-                        "sweep_stale_partials: dir entry read failed; skipping",
-                    );
-                    continue;
-                }
-            };
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %entry.path().display(),
-                        error = %e,
-                        "sweep_stale_partials: metadata failed; skipping entry",
-                    );
-                    continue;
-                }
-            };
-            if meta.is_dir() {
-                stack.push(entry.path());
-                continue;
-            }
-            if !meta.is_file() {
-                continue;
-            }
-            // `temp_path_for` always appends `.qftp.partial` to a
-            // non-empty filename, so a legitimate partial is
-            // `<something>.qftp.partial`. Require a non-empty prefix
-            // so a hand-created bare-`.qftp.partial` user file isn't
-            // swept.
-            let is_partial = entry
-                .file_name()
-                .to_str()
-                .map(|n| n.ends_with(".qftp.partial") && n.len() > ".qftp.partial".len())
-                .unwrap_or(false);
-            if !is_partial {
-                continue;
-            }
-            let abandoned = meta
-                .modified()
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .map(|age| age > STALE_PARTIAL_AGE)
-                .unwrap_or(false);
-            if abandoned {
-                if let Err(e) = std::fs::remove_file(entry.path()) {
-                    tracing::warn!(
-                        path = %entry.path().display(),
-                        error = %e,
-                        "sweep_stale_partials: remove of abandoned partial failed",
-                    );
-                }
             }
         }
-    }
+    });
 }
 
+/// Walk `root` and return `(total_bytes, file_count)`. Used to
+/// initialize a user's cached `used_bytes` at startup, and (until
+/// the cache lands) for `Request::Quota` replies. We deliberately
+/// skip non-regular files so the number matches `du -b --apparent-size`.
 pub fn walk_size(root: &Path) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut count = 0u64;
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let read = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(e) => {
-                // Silently skipping here would permanently undercount
-                // any subtree that briefly couldn't be read at startup
-                // (NFS hiccup, EACCES race, etc.) and quota checks
-                // would then let the user write past their real budget
-                // until the next process restart. Log so operators can
-                // correlate "quota looks wrong" with the boot-time
-                // event that caused it.
-                tracing::warn!(
-                    path = %dir.display(),
-                    error = %e,
-                    "walk_size: read_dir failed; quota cache will undercount this subtree",
-                );
-                continue;
-            }
-        };
-        for entry in read {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %dir.display(),
-                        error = %e,
-                        "walk_size: dir entry read failed; skipping",
-                    );
-                    continue;
-                }
-            };
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %entry.path().display(),
-                        error = %e,
-                        "walk_size: metadata failed; quota cache will undercount this file",
-                    );
-                    continue;
-                }
-            };
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else if meta.is_file() {
-                bytes = bytes.saturating_add(meta.len());
-                count = count.saturating_add(1);
-            }
-        }
-    }
+    // Silently skipping a read_dir error would permanently undercount
+    // any subtree that briefly couldn't be read at startup (NFS hiccup,
+    // EACCES race, etc.) and quota checks would then let the user write
+    // past their real budget until the next process restart. Log so
+    // operators can correlate "quota looks wrong" with the boot-time
+    // event that caused it.
+    let logs = WalkLogs {
+        read_dir_failed: "walk_size: read_dir failed; quota cache will undercount this subtree",
+        entry_failed: "walk_size: dir entry read failed; skipping",
+        metadata_failed: "walk_size: metadata failed; quota cache will undercount this file",
+    };
+    walk_directory(root, &logs, |_entry, meta| {
+        bytes = bytes.saturating_add(meta.len());
+        count = count.saturating_add(1);
+    });
     (bytes, count)
 }
 
@@ -425,6 +419,119 @@ pub struct UserConfig {
 pub struct UserDirectory {
     by_name: HashMap<String, Arc<User>>,
     anonymous: Arc<User>,
+}
+
+/// Reject `quota_bytes = 0` for every spec (users + anonymous).
+///
+/// `quota_bytes = 0` is ambiguous. Operators familiar with traditional
+/// disk-quota systems often expect 0 to mean "unlimited"; the natural
+/// reading of this field is "zero bytes allowed" (every Put fails with
+/// QuotaExceeded). Refuse the value at parse time and direct the operator
+/// to omit the key for unlimited, or use `permissions.write = false` to
+/// forbid writes.
+fn validate_specs(cfg: &UserConfig) -> Result<()> {
+    for spec in cfg.users.iter().chain(cfg.anonymous.iter()) {
+        if spec.quota_bytes == Some(0) {
+            return Err(UserDirectoryError::Config(format!(
+                "user {}: quota_bytes = 0 is ambiguous (#126); \
+                 omit the field for unlimited, or set \
+                 `permissions.write = false` to forbid writes",
+                spec.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a single spec's home directory, creating it and verifying it
+/// canonicalizes to inside the global root.
+///
+/// A relative home joins against `global_root` (the operator-facing,
+/// possibly-symlinked path); the escape check is against `canonical_root`
+/// (the canonicalized form) so a home reachable only through a symlink
+/// above the root is still refused.
+fn resolve_home(global_root: &Path, canonical_root: &Path, spec: &UserSpec) -> Result<PathBuf> {
+    let raw = match &spec.home {
+        Some(h) if h.is_absolute() => h.clone(),
+        Some(h) => {
+            if h.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(UserDirectoryError::Config(format!(
+                    "user {}: relative home {} contains `..` (#112)",
+                    spec.name,
+                    h.display()
+                )));
+            }
+            global_root.join(h)
+        }
+        None => global_root.join(&spec.name),
+    };
+    std::fs::create_dir_all(&raw).map_err(|e| {
+        UserDirectoryError::io(
+            format!(
+                "failed to create home directory {} for user {}",
+                raw.display(),
+                spec.name
+            ),
+            e,
+        )
+    })?;
+    let canonical = raw.canonicalize().map_err(|e| {
+        UserDirectoryError::io(
+            format!(
+                "failed to canonicalize home {} for user {}",
+                raw.display(),
+                spec.name
+            ),
+            e,
+        )
+    })?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(UserDirectoryError::Config(format!(
+            "user {} home {} escapes global root {} (#112)",
+            spec.name,
+            canonical.display(),
+            canonical_root.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+/// First already-resolved `(name, home)` whose home is equal to, nested
+/// under, or an ancestor of `home`. `None` means no overlap.
+///
+/// Two users whose homes are equal or nested share a directory tree;
+/// each gets an independent `AtomicU64` quota cache, so a Put by user A
+/// updates only A's view and B's cache silently diverges from the
+/// on-disk reality (both can exceed quota). Callers refuse such a
+/// configuration; the message wording differs between the user and
+/// anonymous paths, so each formats its own.
+fn check_home_overlap<'a>(
+    home: &Path,
+    resolved: &'a [(String, PathBuf)],
+) -> Option<&'a (String, PathBuf)> {
+    resolved
+        .iter()
+        .find(|(_, other_home)| home.starts_with(other_home) || other_home.starts_with(home))
+}
+
+/// Drop abandoned partials, prime the used-bytes cache, and build the
+/// resolved `User` record. The sweep runs before priming so abandoned
+/// bytes are never counted, then the cache is primed once so the hot
+/// path (Put) doesn't re-walk the home.
+fn build_user(spec: &UserSpec, home: PathBuf) -> Arc<User> {
+    sweep_stale_partials(&home);
+    let (used, _) = walk_size(&home);
+    Arc::new(User {
+        name: spec.name.clone(),
+        home,
+        permissions: spec.permissions.clone(),
+        quota_bytes: spec.quota_bytes,
+        used_bytes: AtomicU64::new(used),
+        in_flight_bytes: AtomicU64::new(0),
+        active_uploads: Mutex::new(HashSet::new()),
+    })
 }
 
 impl UserDirectory {
@@ -461,112 +568,31 @@ impl UserDirectory {
             )
         })?;
 
-        // `quota_bytes = 0` is ambiguous. Operators familiar
-        // with traditional disk-quota systems often expect 0 to mean
-        // "unlimited"; the natural reading of this field is "zero
-        // bytes allowed" (every Put fails with QuotaExceeded).
-        // Refuse the value at parse time and direct the operator to
-        // omit the key for unlimited, or use `permissions.write =
-        // false` to forbid writes.
-        for spec in cfg.users.iter().chain(cfg.anonymous.iter()) {
-            if spec.quota_bytes == Some(0) {
-                return Err(UserDirectoryError::Config(format!(
-                    "user {}: quota_bytes = 0 is ambiguous (#126); \
-                     omit the field for unlimited, or set \
-                     `permissions.write = false` to forbid writes",
-                    spec.name
-                )));
-            }
-        }
+        validate_specs(&cfg)?;
 
-        let resolve_home = |spec: &UserSpec| -> Result<PathBuf> {
-            let raw = match &spec.home {
-                Some(h) if h.is_absolute() => h.clone(),
-                Some(h) => {
-                    if h.components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                    {
-                        return Err(UserDirectoryError::Config(format!(
-                            "user {}: relative home {} contains `..` (#112)",
-                            spec.name,
-                            h.display()
-                        )));
-                    }
-                    global_root.join(h)
-                }
-                None => global_root.join(&spec.name),
-            };
-            std::fs::create_dir_all(&raw).map_err(|e| {
-                UserDirectoryError::io(
-                    format!(
-                        "failed to create home directory {} for user {}",
-                        raw.display(),
-                        spec.name
-                    ),
-                    e,
-                )
-            })?;
-            let canonical = raw.canonicalize().map_err(|e| {
-                UserDirectoryError::io(
-                    format!(
-                        "failed to canonicalize home {} for user {}",
-                        raw.display(),
-                        spec.name
-                    ),
-                    e,
-                )
-            })?;
-            if !canonical.starts_with(&canonical_root) {
-                return Err(UserDirectoryError::Config(format!(
-                    "user {} home {} escapes global root {} (#112)",
-                    spec.name,
-                    canonical.display(),
-                    canonical_root.display()
-                )));
-            }
-            Ok(canonical)
-        };
-
-        let build_user = |spec: &UserSpec, home: PathBuf| -> Arc<User> {
-            // Drop abandoned partials before priming the cache so their
-            // bytes are never counted, then prime the used-bytes cache
-            // once so the hot path (Put) doesn't re-walk the home.
-            sweep_stale_partials(&home);
-            let (used, _) = walk_size(&home);
-            Arc::new(User {
-                name: spec.name.clone(),
-                home,
-                permissions: spec.permissions.clone(),
-                quota_bytes: spec.quota_bytes,
-                used_bytes: AtomicU64::new(used),
-                in_flight_bytes: AtomicU64::new(0),
-                active_uploads: Mutex::new(HashSet::new()),
-            })
-        };
-
-        // Resolve every home up-front so we can check for overlap
-        // BEFORE priming any `used_bytes` caches. Two users whose
-        // homes are equal or nested share a directory tree; each
-        // gets an independent `AtomicU64` quota cache, so a Put by
-        // user A updates only A's view and B's cache silently
-        // diverges from the on-disk reality (both can exceed
-        // quota). Refuse this configuration at parse time.
+        // Resolve every home and check overlap in one interleaved pass.
+        // The overlap check must run BEFORE priming any `used_bytes`
+        // caches (each user gets an independent quota counter, so equal
+        // or nested homes would silently diverge from the on-disk
+        // reality and both could exceed quota). The interleaving also
+        // preserves error precedence: resolving user[n] and overlap-
+        // checking it against earlier users happens together, so the
+        // first failing user — whichever kind of failure it hits —
+        // wins.
         let mut resolved: Vec<(String, PathBuf)> = Vec::with_capacity(cfg.users.len() + 1);
         for spec in &cfg.users {
-            let home = resolve_home(spec)?;
-            for (other_name, other_home) in &resolved {
-                if home.starts_with(other_home) || other_home.starts_with(&home) {
-                    return Err(UserDirectoryError::Config(format!(
-                        "user {} home {} overlaps with user {} home {} \
-                         (homes must not be equal or nested -- they \
-                         would share storage but maintain independent \
-                         quota counters)",
-                        spec.name,
-                        home.display(),
-                        other_name,
-                        other_home.display(),
-                    )));
-                }
+            let home = resolve_home(global_root, &canonical_root, spec)?;
+            if let Some((other_name, other_home)) = check_home_overlap(&home, &resolved) {
+                return Err(UserDirectoryError::Config(format!(
+                    "user {} home {} overlaps with user {} home {} \
+                     (homes must not be equal or nested -- they \
+                     would share storage but maintain independent \
+                     quota counters)",
+                    spec.name,
+                    home.display(),
+                    other_name,
+                    other_home.display(),
+                )));
             }
             resolved.push((spec.name.clone(), home));
         }
@@ -584,16 +610,14 @@ impl UserDirectory {
 
         let anonymous = match &cfg.anonymous {
             Some(spec) => {
-                let home = resolve_home(spec)?;
-                for (other_name, other_home) in &resolved {
-                    if home.starts_with(other_home) || other_home.starts_with(&home) {
-                        return Err(UserDirectoryError::Config(format!(
-                            "anonymous user home {} overlaps with user {} home {}",
-                            home.display(),
-                            other_name,
-                            other_home.display(),
-                        )));
-                    }
+                let home = resolve_home(global_root, &canonical_root, spec)?;
+                if let Some((other_name, other_home)) = check_home_overlap(&home, &resolved) {
+                    return Err(UserDirectoryError::Config(format!(
+                        "anonymous user home {} overlaps with user {} home {}",
+                        home.display(),
+                        other_name,
+                        other_home.display(),
+                    )));
                 }
                 build_user(spec, home)
             }
@@ -679,34 +703,30 @@ pub fn extract_identity_candidates(der: &[u8]) -> Vec<String> {
         return out;
     };
 
-    // SAN extension: iterate in dNSName -> rfc822Name -> URI order
+    // SAN extension: emit in dNSName -> rfc822Name -> URI order
     // so DNS-style names (the closest analogue to a user identifier
-    // in modern PKI) win when both SAN and CN exist.
+    // in modern PKI) win when both SAN and CN exist. Bucket the names
+    // in a single pass over `general_names`, preserving each category's
+    // intra-order, then flush the buckets in the precedence order.
     if let Ok(Some(san)) = cert.subject_alternative_name() {
+        let mut dns: Vec<String> = Vec::new();
+        let mut email: Vec<String> = Vec::new();
+        let mut uri: Vec<String> = Vec::new();
         for gn in &san.value.general_names {
-            if let GeneralName::DNSName(s) = gn {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() && is_safe(trimmed) {
-                    out.push(trimmed.to_string());
-                }
+            let (bucket, s) = match gn {
+                GeneralName::DNSName(s) => (&mut dns, s),
+                GeneralName::RFC822Name(s) => (&mut email, s),
+                GeneralName::URI(s) => (&mut uri, s),
+                _ => continue,
+            };
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && is_safe(trimmed) {
+                bucket.push(trimmed.to_string());
             }
         }
-        for gn in &san.value.general_names {
-            if let GeneralName::RFC822Name(s) = gn {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() && is_safe(trimmed) {
-                    out.push(trimmed.to_string());
-                }
-            }
-        }
-        for gn in &san.value.general_names {
-            if let GeneralName::URI(s) = gn {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() && is_safe(trimmed) {
-                    out.push(trimmed.to_string());
-                }
-            }
-        }
+        out.extend(dns);
+        out.extend(email);
+        out.extend(uri);
     }
 
     // CN fallback, last so SAN wins when both exist.

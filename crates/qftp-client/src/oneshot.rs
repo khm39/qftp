@@ -161,6 +161,41 @@ pub enum ClobberPolicy {
     Interactive,
 }
 
+/// The action a clobber policy dictates for a given destination
+/// existence state. Centralizes the policy×exists matrix that `run_put`
+/// and `run_get` both branch on; each call site still emits its own
+/// messages and performs its own side effects (prompt I/O, `remove_file`,
+/// the wire `no_clobber` flag, run_get's deferred remote-size probe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClobberDecision {
+    /// Refuse: the destination exists and the policy forbids overwrite.
+    Skip,
+    /// Overwrite the existing destination without asking.
+    Overwrite,
+    /// Ask the user before overwriting the existing destination.
+    Prompt,
+    /// Nothing in the way (or `--force`): proceed with the transfer.
+    Proceed,
+}
+
+/// Map a clobber policy + destination-exists flag to the action to take.
+/// `--force` always proceeds (overwriting if needed); the other policies
+/// only matter when the destination already exists.
+fn decide_clobber(policy: ClobberPolicy, exists: bool) -> ClobberDecision {
+    match policy {
+        ClobberPolicy::Force => {
+            if exists {
+                ClobberDecision::Overwrite
+            } else {
+                ClobberDecision::Proceed
+            }
+        }
+        _ if !exists => ClobberDecision::Proceed,
+        ClobberPolicy::NoClobber => ClobberDecision::Skip,
+        ClobberPolicy::Interactive => ClobberDecision::Prompt,
+    }
+}
+
 fn resolve_clobber(no_clobber: bool, force: bool, interactive: bool) -> ClobberPolicy {
     if no_clobber {
         ClobberPolicy::NoClobber
@@ -359,26 +394,25 @@ fn run_get(
     // from scratch" depending on the flag.
     let local_exists = local_path.exists();
     if dry_run {
-        if local_exists {
-            match clobber {
-                ClobberPolicy::NoClobber => {
-                    println!(
-                        "would skip (exists, --no-clobber): {}",
-                        local_path.display()
-                    );
-                }
-                ClobberPolicy::Force => {
-                    println!(
-                        "would overwrite (exists, --force): {}",
-                        local_path.display()
-                    );
-                }
-                ClobberPolicy::Interactive => {
-                    println!("would prompt (exists): {}", local_path.display());
-                }
+        match decide_clobber(clobber, local_exists) {
+            ClobberDecision::Skip => {
+                println!(
+                    "would skip (exists, --no-clobber): {}",
+                    local_path.display()
+                );
             }
-        } else {
-            println!("would download: {} -> {}", r.path, local_path.display());
+            ClobberDecision::Overwrite => {
+                println!(
+                    "would overwrite (exists, --force): {}",
+                    local_path.display()
+                );
+            }
+            ClobberDecision::Prompt => {
+                println!("would prompt (exists): {}", local_path.display());
+            }
+            ClobberDecision::Proceed => {
+                println!("would download: {} -> {}", r.path, local_path.display());
+            }
         }
         return Ok(exit::OK);
     }
@@ -416,10 +450,10 @@ fn run_get(
             // overwriting an *already complete* file, not block
             // resuming an incomplete partial. Mirrors run_put's Stat
             // probe.
-            match remote_exists_size(session, &r.path)? {
-                Some(remote_size) => {
+            match stat_remote(session, &r.path)? {
+                Some(s) => {
                     let local_len = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
-                    if local_len >= remote_size {
+                    if local_len >= s.size {
                         eprintln!("skipping (exists, --no-clobber): {}", local_path.display());
                         return Ok(exit::OK);
                     }
@@ -427,9 +461,12 @@ fn run_get(
                     // let do_get resume it.
                 }
                 None => {
-                    // Couldn't learn the remote size (server error /
-                    // unexpected response). Be conservative and keep
-                    // the no-clobber refusal rather than overwriting.
+                    // Couldn't learn the remote size (NotFound, server
+                    // error, or unexpected response). Be conservative
+                    // and keep the no-clobber refusal rather than
+                    // overwriting. A missing remote is also handled here:
+                    // there is nothing complete to protect, so a skip is
+                    // the same outcome as the old `Some(0)` comparison.
                     eprintln!("skipping (exists, --no-clobber): {}", local_path.display());
                     return Ok(exit::OK);
                 }
@@ -502,34 +539,36 @@ fn run_put(
             // and pays no extra round-trip.
             let mut effective_no_clobber = false;
             if !matches!(clobber, ClobberPolicy::Force) {
-                let exists = remote_exists(session, &dest)?.unwrap_or(false);
-                match clobber {
-                    ClobberPolicy::Force => {}
-                    ClobberPolicy::NoClobber => {
-                        if exists {
-                            if dry_run {
-                                println!("would skip (exists, --no-clobber): {local} -> {dest}");
-                            } else {
-                                eprintln!("skipping (exists, --no-clobber): {local} -> {dest}");
-                            }
+                let exists = stat_remote(session, &dest)?.is_some();
+                match decide_clobber(clobber, exists) {
+                    ClobberDecision::Skip => {
+                        if dry_run {
+                            println!("would skip (exists, --no-clobber): {local} -> {dest}");
+                        } else {
+                            eprintln!("skipping (exists, --no-clobber): {local} -> {dest}");
+                        }
+                        continue;
+                    }
+                    ClobberDecision::Prompt => {
+                        if dry_run {
+                            println!("would prompt (exists): {local} -> {dest}");
                             continue;
                         }
-                        // Wire it on regardless so a race between the
-                        // probe and the upload still gets refused.
-                        effective_no_clobber = true;
-                    }
-                    ClobberPolicy::Interactive => {
-                        if exists {
-                            if dry_run {
-                                println!("would prompt (exists): {local} -> {dest}");
-                                continue;
-                            }
-                            if !prompt_overwrite(&dest)? {
-                                eprintln!("skipped: {dest}");
-                                continue;
-                            }
+                        if !prompt_overwrite(&dest)? {
+                            eprintln!("skipped: {dest}");
+                            continue;
                         }
                     }
+                    // No remote destination in the way. For --no-clobber
+                    // wire the flag on regardless so a race between the
+                    // probe and the upload still gets refused.
+                    ClobberDecision::Proceed => {
+                        if matches!(clobber, ClobberPolicy::NoClobber) {
+                            effective_no_clobber = true;
+                        }
+                    }
+                    // Unreachable here: --force skips this whole block.
+                    ClobberDecision::Overwrite => {}
                 }
             }
             if dry_run {
@@ -574,34 +613,25 @@ fn run_put(
     })
 }
 
-/// Probe whether `path` exists on the remote via `Stat`. Returns
-/// `Some(bool)` for a definitive yes/no, `None` if the server
-/// answered with an error we couldn't interpret (treated as "unknown
-/// — don't skip the upload"). Used by `run_put` to short-circuit
-/// `--no-clobber` and `--interactive` without sending body bytes.
-fn remote_exists(session: &mut Session, path: &str) -> Result<Option<bool>> {
+/// Probe `path` on the remote via `Stat`. Returns `Some(stat)` for an
+/// existing path, and `None` both for a definite `NotFound` and for any
+/// other error/response we couldn't interpret. Used by `run_put` and
+/// `run_get` to decide `--no-clobber` / `--interactive` handling
+/// without sending body bytes.
+///
+/// Folding `NotFound` and "unparseable response" into the same `None`
+/// is deliberate and matches the callers: `run_put` treats both as
+/// "don't skip" (a missing destination is uploaded; an indecipherable
+/// answer errs toward attempting the upload), and `run_get`'s
+/// no-clobber probe treats both as "keep the refusal" (a missing remote
+/// is `Some(0)`-equivalent, which the `local_len >= remote_size` check
+/// already short-circuits to a skip).
+fn stat_remote(session: &mut Session, path: &str) -> Result<Option<FileStat>> {
     let resp = session.request_response(&Request::Stat {
         path: path.to_string(),
     })?;
     Ok(match resp {
-        Response::FileStat(_) => Some(true),
-        Response::Err(e) if matches!(e.code, ErrorCode::NotFound) => Some(false),
-        _ => None,
-    })
-}
-
-/// Probe the size of `path` on the remote via `Stat`. Returns
-/// `Some(size)` for an existing file, `Some(0)` if the file is absent
-/// (`NotFound`), and `None` for any error/response we couldn't
-/// interpret. Used by `run_get` to decide whether a pre-existing local
-/// file under `--no-clobber` is already a complete download.
-fn remote_exists_size(session: &mut Session, path: &str) -> Result<Option<u64>> {
-    let resp = session.request_response(&Request::Stat {
-        path: path.to_string(),
-    })?;
-    Ok(match resp {
-        Response::FileStat(s) => Some(s.size),
-        Response::Err(e) if matches!(e.code, ErrorCode::NotFound) => Some(0),
+        Response::FileStat(s) => Some(s),
         _ => None,
     })
 }

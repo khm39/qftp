@@ -60,9 +60,12 @@ pub fn safe_entry_name(name: &str) -> bool {
 ///   * directory listings: 100 000 entries (a single Ls response
 ///     larger than this is itself an abuse vector and should be
 ///     refused at the source).
-pub const MAX_PATH_LEN: usize = 4 * 1024;
-pub const MAX_ERROR_MESSAGE_LEN: usize = 1024;
-pub const MAX_DIR_ENTRIES: usize = 100_000;
+mod limits {
+    pub const MAX_PATH_LEN: usize = 4 * 1024;
+    pub const MAX_ERROR_MESSAGE_LEN: usize = 1024;
+    pub const MAX_DIR_ENTRIES: usize = 100_000;
+}
+pub use limits::*;
 
 /// Errors surfaced by [`validate_request`] / [`validate_response`].
 ///
@@ -85,8 +88,6 @@ pub enum ValidationError {
     ErrorMessageTooLong { len: usize, max: usize },
     #[error("DirListing has {len} entries, exceeds MAX_DIR_ENTRIES ({max}) (#140)")]
     DirEntriesTooMany { len: usize, max: usize },
-    #[error("DirEntry.name is {len} bytes, exceeds MAX_PATH_LEN ({max}) (#140)")]
-    DirEntryNameTooLong { len: usize, max: usize },
 }
 
 fn check_path(field: &'static str, value: &str) -> Result<(), ValidationError> {
@@ -145,12 +146,7 @@ pub fn validate_response(resp: &Response) -> Result<(), ValidationError> {
                 });
             }
             for entry in entries {
-                if entry.name.len() > MAX_PATH_LEN {
-                    return Err(ValidationError::DirEntryNameTooLong {
-                        len: entry.name.len(),
-                        max: MAX_PATH_LEN,
-                    });
-                }
+                check_path("DirEntry.name", &entry.name)?;
             }
             Ok(())
         }

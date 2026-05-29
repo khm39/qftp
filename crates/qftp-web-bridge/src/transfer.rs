@@ -58,12 +58,25 @@ async fn handle_stream_impl(
         return finish(&mut send).await;
     }
 
+    dispatch_request(&mut send, &mut recv, user, req, leftover).await
+}
+
+/// Dispatch a validated, ACL-cleared request to its per-kind handler.
+/// `Get`/`Put` stream a body; the remaining variants are one-shot
+/// replies. Decode/validation/ACL already ran in `handle_stream_impl`.
+async fn dispatch_request(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    user: &Arc<User>,
+    req: Request,
+    leftover: Vec<u8>,
+) -> Result<()> {
     match req {
         Request::Get {
             path,
             offset,
             length,
-        } => do_get(&mut send, user, &path, offset, length).await,
+        } => do_get(send, user, &path, offset, length).await,
 
         Request::Put {
             path,
@@ -75,8 +88,8 @@ async fn handle_stream_impl(
             checksum_trailer,
         } => {
             do_put(
-                &mut send,
-                &mut recv,
+                send,
+                recv,
                 user,
                 &path,
                 size,
@@ -100,7 +113,7 @@ async fn handle_stream_impl(
             // is advisory only and no longer tracked exactly, matching
             // the native server's `Quota` reply.
             send_framed(
-                &mut send,
+                send,
                 &Response::QuotaInfo {
                     used_bytes: user.current_usage(),
                     file_count: 0,
@@ -108,10 +121,10 @@ async fn handle_stream_impl(
                 },
             )
             .await?;
-            finish(&mut send).await
+            finish(send).await
         }
 
-        Request::Quit => finish(&mut send).await,
+        Request::Quit => finish(send).await,
 
         // The remaining variants (Pwd / Cd / Ls / Mkdir / Rmdir / Rm /
         // Rename / Chmod / Stat) are stateless one-shot operations the
@@ -129,8 +142,8 @@ async fn handle_stream_impl(
                 "handler request",
             )
             .await?;
-            send_framed(&mut send, &resp).await?;
-            finish(&mut send).await
+            send_framed(send, &resp).await?;
+            finish(send).await
         }
     }
 }
@@ -210,11 +223,12 @@ async fn do_get(
     // each issue blocking syscalls (lstat per ancestor, plus the open
     // itself). Hand the whole bundle to the blocking pool so a slow FS
     // can't park the tokio worker servicing this stream.
-    let root_owned = root.clone();
-    let path_owned = path.to_string();
     type OpenOutcome = std::result::Result<(std::fs::File, std::fs::Metadata), ErrorResponse>;
-    let open_outcome: OpenOutcome = await_blocking(
-        tokio::task::spawn_blocking(move || {
+    let open_outcome: OpenOutcome = run_blocking_path_op(
+        path.to_string(),
+        root.clone(),
+        "do_get open",
+        |path_owned, root_owned| {
             let file_path = handler::resolve(&root_owned, &root_owned, &path_owned)?;
             handler::recheck_ancestors_no_symlinks(&file_path, &root_owned)?;
             let mut open_opts = std::fs::OpenOptions::new();
@@ -230,8 +244,7 @@ async fn do_get(
                 )
             })?;
             Ok((std_file, meta))
-        }),
-        "do_get open",
+        },
     )
     .await?;
     let (std_file, meta) = match open_outcome {
@@ -454,17 +467,17 @@ async fn do_put(
     // Same shape as `do_get`'s resolve: bundle the path validation
     // syscalls (resolve_parent, ancestor lstats, optional no_clobber
     // lstat) into one blocking task.
-    let root_owned = root.clone();
-    let path_owned = path.to_string();
     type ResolveOutcome = std::result::Result<(PathBuf, bool), ErrorResponse>;
-    let resolve_outcome: ResolveOutcome = await_blocking(
-        tokio::task::spawn_blocking(move || {
+    let resolve_outcome: ResolveOutcome = run_blocking_path_op(
+        path.to_string(),
+        root.clone(),
+        "do_put resolve",
+        |path_owned, root_owned| {
             let final_path = handler::resolve_parent(&root_owned, &root_owned, &path_owned)?;
             handler::recheck_ancestors_no_symlinks(&final_path, &root_owned)?;
             let exists = std::fs::symlink_metadata(&final_path).is_ok();
             Ok((final_path, exists))
-        }),
-        "do_put resolve",
+        },
     )
     .await?;
     let (final_path, exists) = match resolve_outcome {
@@ -526,11 +539,12 @@ async fn do_put(
     // open a TOCTOU window where an attacker can swap a parent dir to
     // a symlink between the recheck and the open.
     let temp_path_for_open = temp_path.clone();
-    let root_for_open = root.clone();
-    let final_for_open = final_path.clone();
     type TempOpenOutcome = std::result::Result<std::fs::File, ErrorResponse>;
-    let open_outcome: TempOpenOutcome = await_blocking(
-        tokio::task::spawn_blocking(move || {
+    let open_outcome: TempOpenOutcome = run_blocking_path_op(
+        final_path.clone(),
+        root.clone(),
+        "do_put temp-file open",
+        move |final_for_open, root_for_open| {
             handler::recheck_ancestors_no_symlinks(&final_for_open, &root_for_open)?;
             let mut open_opts = std::fs::OpenOptions::new();
             open_opts.write(true).create(true).truncate(true);
@@ -558,8 +572,7 @@ async fn do_put(
                     })?;
             }
             Ok(std_file)
-        }),
-        "do_put temp-file open",
+        },
     )
     .await?;
     let std_file = match open_outcome {
@@ -662,11 +675,12 @@ async fn do_put(
     // in the gap; bundling them keeps the file invisible at
     // `final_path` until both succeed.
     let temp_for_commit = temp_path.clone();
-    let final_for_commit = final_path.clone();
-    let root_for_commit = root.clone();
     type CommitOutcome = std::result::Result<(), ErrorResponse>;
-    let commit_outcome: CommitOutcome = await_blocking(
-        tokio::task::spawn_blocking(move || {
+    let commit_outcome: CommitOutcome = run_blocking_path_op(
+        final_path.clone(),
+        root.clone(),
+        "do_put commit",
+        move |final_for_commit, root_for_commit| {
             handler::recheck_ancestors_no_symlinks(&final_for_commit, &root_for_commit)?;
             std::fs::rename(&temp_for_commit, &final_for_commit).map_err(|e| {
                 ErrorResponse::new(ErrorCode::Internal, format!("Failed to finalize file: {e}"))
@@ -677,8 +691,7 @@ async fn do_put(
             // server (qftp_protocol::stream::apply_mode).
             apply_mode(&final_for_commit, mode);
             Ok(())
-        }),
-        "do_put commit",
+        },
     )
     .await?;
     if let Err(e) = commit_outcome {
@@ -698,7 +711,7 @@ async fn do_put(
 
 /// Map the transport-agnostic [`PutOverflow`] from the shared
 /// classifier (#269) onto the bridge's `ErrorResponse`.
-fn put_overflow_err(o: PutOverflow) -> ErrorResponse {
+fn put_overflow_response(o: PutOverflow) -> ErrorResponse {
     match o {
         PutOverflow::BodyExceeded => {
             ErrorResponse::new(ErrorCode::UploadOverflow, "Upload exceeded declared size")
@@ -733,7 +746,7 @@ async fn route_put_chunk(
         trailer_buf.remaining(),
     ) {
         Ok(s) => s,
-        Err(o) => return Ok(Some(put_overflow_err(o))),
+        Err(o) => return Ok(Some(put_overflow_response(o))),
     };
     if split.to_body > 0 {
         file.write_all(&chunk[..split.to_body])
@@ -769,6 +782,36 @@ pub async fn await_blocking<T: Send + 'static>(
         }
         anyhow::anyhow!("{desc}: {je}")
     })
+}
+
+/// Run a path-validating filesystem operation on the blocking pool.
+///
+/// The `resolve` / `recheck_ancestors_no_symlinks` / open / rename
+/// syscalls all block, so each `do_get`/`do_put` step that touches the
+/// path bundles them into one `spawn_blocking` and awaits it through
+/// `await_blocking`. This helper captures only that owning-then-spawn
+/// plumbing: `path_owned` and `root_owned` move into the closure, which
+/// runs the whole operation. The closure must keep performing its
+/// own `recheck_ancestors_no_symlinks` so that recheck stays atomic
+/// with the open/rename inside the single blocking task -- splitting it
+/// across the await boundary would reopen the TOCTOU window the bundle
+/// closes.
+async fn run_blocking_path_op<P, T, F>(
+    path_owned: P,
+    root_owned: PathBuf,
+    desc: &'static str,
+    f: F,
+) -> Result<T>
+where
+    P: Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(P, PathBuf) -> T + Send + 'static,
+{
+    await_blocking(
+        tokio::task::spawn_blocking(move || f(path_owned, root_owned)),
+        desc,
+    )
+    .await
 }
 
 // `temp_path_for` lives in `qftp_protocol::stream` and is tested

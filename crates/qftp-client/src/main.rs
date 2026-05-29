@@ -538,6 +538,24 @@ fn run_one_line(
     };
 
     match cmd {
+        repl::Command::Lcd(_)
+        | repl::Command::Lpwd
+        | repl::Command::Lls(_)
+        | repl::Command::Lmkdir(_)
+        | repl::Command::Stats
+        | repl::Command::Shell(_) => run_local_command(cmd, local_cwd),
+        repl::Command::Remote(req) => run_remote_command(session, req, quit_out),
+        repl::Command::Get { .. } | repl::Command::Put { .. } | repl::Command::Mget { .. } => {
+            run_transfer_command(session, cmd, local_cwd)
+        }
+    }
+}
+
+/// Local-only REPL commands: no protocol round-trip. Mutates the REPL's
+/// `local_cwd` for `lcd`. The caller routes only the local `Command`
+/// variants here.
+fn run_local_command(cmd: repl::Command, local_cwd: &mut PathBuf) -> Result<()> {
+    match cmd {
         repl::Command::Lcd(target) => {
             let dest = match target.as_deref() {
                 Some(p) => {
@@ -558,14 +576,12 @@ fn run_one_line(
                     *local_cwd = c;
                     println!("local cwd: {}", local_cwd.display());
                 }
-                Ok(_) => println!("lcd: not a directory: {}", dest.display()),
-                Err(e) => println!("lcd: {}: {e}", dest.display()),
+                Ok(_) => eprintln!("lcd: not a directory: {}", dest.display()),
+                Err(e) => eprintln!("lcd: {}: {e}", dest.display()),
             }
-            return Ok(());
         }
         repl::Command::Lpwd => {
             println!("{}", local_cwd.display());
-            return Ok(());
         }
         repl::Command::Lls(path) => {
             let target = match path {
@@ -587,20 +603,17 @@ fn run_one_line(
                         println!("{n}");
                     }
                 }
-                Err(e) => println!("lls {}: {e}", target.display()),
+                Err(e) => eprintln!("lls {}: {e}", target.display()),
             }
-            return Ok(());
         }
         repl::Command::Lmkdir(path) => {
             let target = resolve_local(local_cwd, &path);
             if let Err(e) = std::fs::create_dir_all(&target) {
-                println!("lmkdir {}: {e}", target.display());
+                eprintln!("lmkdir {}: {e}", target.display());
             }
-            return Ok(());
         }
         repl::Command::Stats => {
             stats::print(&stats::snapshot());
-            return Ok(());
         }
         repl::Command::Shell(rest) => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -613,16 +626,28 @@ fn run_one_line(
                 cmd_proc.arg("-c").arg(&rest);
                 let _ = cmd_proc.status();
             }
-            return Ok(());
         }
-        repl::Command::Remote(req) => {
-            let is_quit = matches!(req, Request::Quit);
-            let resp = session.request_response(&req)?;
-            repl::display_response(&resp);
-            if is_quit {
-                *quit_out = true;
-            }
-        }
+        _ => unreachable!("run_local_command received a non-local command"),
+    }
+    Ok(())
+}
+
+/// A single remote protocol round-trip (the `repl::Command::Remote`
+/// variant). Sets `*quit_out` when the request was `Quit`.
+fn run_remote_command(session: &mut Session, req: Request, quit_out: &mut bool) -> Result<()> {
+    let is_quit = matches!(req, Request::Quit);
+    let resp = session.request_response(&req)?;
+    repl::display_response(&resp);
+    if is_quit {
+        *quit_out = true;
+    }
+    Ok(())
+}
+
+/// Bulk-transfer REPL commands: `get` / `put` / `mget`. The caller
+/// routes only those `Command` variants here.
+fn run_transfer_command(session: &mut Session, cmd: repl::Command, local_cwd: &Path) -> Result<()> {
+    match cmd {
         repl::Command::Get {
             remote,
             local,
@@ -647,7 +672,7 @@ fn run_one_line(
                     }
                 };
                 if let Err(e) = transfer::do_get(session, &remote, &local_path) {
-                    println!("get failed: {e}");
+                    eprintln!("get failed: {e}");
                 }
             }
         }
@@ -663,7 +688,7 @@ fn run_one_line(
                 .into_owned();
             let locals = expand_glob(&pattern);
             if locals.is_empty() {
-                println!("no local files match {local}");
+                eprintln!("no local files match {local}");
                 return Ok(());
             }
             if recursive {
@@ -674,18 +699,19 @@ fn run_one_line(
                             .unwrap_or_else(|| ".".to_string())
                     });
                     if let Err(e) = do_recursive_put(session, &path, &remote_root) {
-                        println!("put -r {} failed: {e}", path.display());
+                        eprintln!("put -r {} failed: {e}", path.display());
                     }
                 }
             } else {
-                for path in locals {
-                    let target = remote.clone().unwrap_or_else(|| {
-                        path.file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "uploaded".to_string())
-                    });
+                for (path, target) in prepare_puts(locals, remote.as_deref()) {
                     // Auto-resume an interrupted upload, mirroring the
-                    // way `get` resumes from a partial local file.
+                    // way `get` resumes from a partial local file. The
+                    // probe stays interleaved with the upload (not
+                    // batched up front): when a glob maps several locals
+                    // onto one explicit remote target, each file's resume
+                    // probe must observe the prior file's just-completed
+                    // upload, so probing all of them ahead of time would
+                    // change the offset each sees.
                     let local_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     let offset = transfer::probe_put_resume_offset(session, &target, local_size);
                     let stream_id = session.take_stream();
@@ -695,17 +721,17 @@ fn run_one_line(
                             if offset > 0
                                 && e.downcast_ref::<transfer::StalePartial>().is_some() =>
                         {
-                            println!(
+                            eprintln!(
                                 "put {target}: server partial is stale, re-uploading from scratch"
                             );
                             let sid = session.take_stream();
                             if let Err(e2) =
                                 transfer::do_put(session, sid, &path, &target, 0, false)
                             {
-                                println!("put {} failed: {e2}", path.display());
+                                eprintln!("put {} failed: {e2}", path.display());
                             }
                         }
-                        Err(e) => println!("put {} failed: {e}", path.display()),
+                        Err(e) => eprintln!("put {} failed: {e}", path.display()),
                     }
                 }
             }
@@ -713,6 +739,7 @@ fn run_one_line(
         repl::Command::Mget { pattern, local_dir } => {
             do_mget(session, &pattern, local_dir.as_deref(), local_cwd)?;
         }
+        _ => unreachable!("run_transfer_command received a non-transfer command"),
     }
     Ok(())
 }
@@ -728,6 +755,28 @@ fn resolve_local(local_cwd: &Path, p: &str) -> PathBuf {
     } else {
         local_cwd.join(pb)
     }
+}
+
+/// Pair each local upload path with its derived remote target. When an
+/// explicit `remote` is given every local maps onto it; otherwise each
+/// local uploads under its own basename (falling back to `"uploaded"`
+/// for a path with no file name). Pure (no network / no filesystem
+/// probe): the per-file resume probe and `do_put` stay in the caller's
+/// execution loop so each upload still observes the prior one.
+fn prepare_puts(locals: Vec<PathBuf>, remote: Option<&str>) -> Vec<(PathBuf, String)> {
+    locals
+        .into_iter()
+        .map(|path| {
+            let target = match remote {
+                Some(r) => r.to_string(),
+                None => path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "uploaded".to_string()),
+            };
+            (path, target)
+        })
+        .collect()
 }
 
 fn expand_glob(pattern: &str) -> Vec<PathBuf> {
@@ -822,8 +871,7 @@ fn do_mget(
         // not get reported as a misleading "no remote files match".
         // The raw name is deliberately not echoed -- it could carry
         // terminal escape sequences -- only the count is shown.
-        if !qftp_common::protocol::safe_entry_name(&entry.name) {
-            tracing::warn!(name = %entry.name, "mget: skipping unsafe entry name");
+        if !proto::entry_name_safe(&entry.name, "mget: skipping unsafe entry name") {
             unsafe_rejected += 1;
             continue;
         }
@@ -900,15 +948,15 @@ fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<Stri
     // sub-directory name on every listing, driving the client to
     // recurse without bound; cap the number of directories visited so
     // the walk terminates with a clear error instead.
-    const MAX_REMOTE_DIRS: usize = 10_000;
     let mut queue: Vec<(String, PathBuf)> = vec![(remote.to_string(), local_root.clone())];
     let mut visited: usize = 0;
     while let Some((rdir, ldir)) = queue.pop() {
         visited += 1;
-        if visited > MAX_REMOTE_DIRS {
+        if visited > proto::MAX_DIRS {
             anyhow::bail!(
                 "recursive get aborted: remote directory tree too large \
-                 or cyclic (exceeded {MAX_REMOTE_DIRS} directories)"
+                 or cyclic (exceeded {} directories)",
+                proto::MAX_DIRS
             );
         }
         let req = Request::Ls { path: rdir.clone() };
@@ -930,11 +978,10 @@ fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<Stri
             // `..` or absolute paths; `PathBuf::join` would silently
             // escape `ldir`. Reject lexically before we touch the
             // filesystem.
-            if !qftp_common::protocol::safe_entry_name(&entry.name) {
-                tracing::warn!(
-                    name = %entry.name,
-                    "recursive get: server returned unsafe entry name; skipping"
-                );
+            if !proto::entry_name_safe(
+                &entry.name,
+                "recursive get: server returned unsafe entry name; skipping",
+            ) {
                 continue;
             }
             let remote_child = join_remote(&rdir, Path::new(&entry.name));
@@ -972,11 +1019,6 @@ enum PutOp {
     PutFile { local: PathBuf, remote: String },
 }
 
-/// Visit cap shared with `do_recursive_get`'s `MAX_REMOTE_DIRS`: a
-/// symlink cycle (`dir/loop -> .`) or a pathologically deep tree must
-/// terminate with a clear error instead of recursing without bound.
-const MAX_LOCAL_DIRS: usize = 10_000;
-
 /// Walk `local` and produce the ordered upload plan for `remote_root`,
 /// skipping symlinks and bounding the number of directories visited.
 ///
@@ -990,10 +1032,11 @@ fn plan_recursive_put(local: &Path, remote_root: &str) -> Result<Vec<PutOp>> {
     let mut visited: usize = 0;
     while let Some((dir, rremote)) = queue.pop() {
         visited += 1;
-        if visited > MAX_LOCAL_DIRS {
+        if visited > proto::MAX_DIRS {
             anyhow::bail!(
                 "recursive put aborted: local directory tree too large \
-                 or cyclic (exceeded {MAX_LOCAL_DIRS} directories)"
+                 or cyclic (exceeded {} directories)",
+                proto::MAX_DIRS
             );
         }
         let read = match std::fs::read_dir(&dir) {

@@ -388,26 +388,33 @@ impl IgnoreMatcher {
                 continue;
             }
             if rule.anchored {
-                if rule.pattern.matches(&rel_str) {
+                if check_anchored(rule, &rel_str) {
                     return true;
                 }
-            } else {
-                if rule.pattern.matches(&rel_str) {
-                    return true;
-                }
-                // Non-anchored patterns also match any individual
-                // component along the path so `target/` excludes
-                // `a/b/target/c.bin`.
-                for comp in rel.components() {
-                    let c = comp.as_os_str().to_string_lossy();
-                    if rule.pattern.matches(&c) {
-                        return true;
-                    }
-                }
+            } else if check_anchored(rule, &rel_str) || walk_components(rule, rel) {
+                return true;
             }
         }
         false
     }
+}
+
+/// Match an anchored (or full-path) rule against the slash-normalized
+/// relative path string.
+fn check_anchored(rule: &Rule, rel_str: &str) -> bool {
+    rule.pattern.matches(rel_str)
+}
+
+/// Non-anchored patterns also match any individual component along the
+/// path so `target/` excludes `a/b/target/c.bin`.
+fn walk_components(rule: &Rule, rel: &Path) -> bool {
+    for comp in rel.components() {
+        let c = comp.as_os_str().to_string_lossy();
+        if rule.pattern.matches(&c) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Send `Mkdir(path)` and tolerate every application-level error so a
@@ -428,61 +435,75 @@ fn ensure_remote_dir(session: &mut Session, path: String) -> Result<()> {
     let resp = session
         .request_response(&Request::Mkdir { path: path.clone() })
         .with_context(|| format!("sync: Mkdir({path}) request failed"))?;
-    use qftp_common::protocol::ErrorCode;
     match resp {
         Response::Ok => Ok(()),
-        // Session-fatal codes: continuing would fail every
-        // subsequent request the same way. Bail at the first one
-        // so the operator sees the root cause instead of N
-        // confusing per-file do_put errors.
-        //
-        // Note: `Malformed` is intentionally NOT in this set. The
-        // server emits Malformed for per-path issues too (a
-        // `Component::Prefix` in one path, a parent-less path, ...
-        // -- see qftp-protocol handler.rs walk_safe /
-        // resolve_parent), so bailing on the first one would abort
-        // the whole sync when 999/1000 paths are fine.
-        Response::Err(e) if matches!(e.code, ErrorCode::Unauthorized | ErrorCode::Unsupported) => {
-            anyhow::bail!(
-                "sync: Mkdir({path}) failed with fatal code [{:?}] {}",
-                e.code,
-                e.message
-            )
-        }
-        // AlreadyExists is the expected case on a re-sync; debug! so
-        // operators tailing the log on a 5000-directory tree don't
-        // get a wall of warns. The other tolerated codes (Internal
-        // / NotADirectory / PermissionDenied / QuotaExceeded / etc.)
-        // stay at warn! because they're surprising enough to want
-        // visible.
-        Response::Err(e) if e.code == ErrorCode::AlreadyExists => {
-            tracing::debug!(
-                path = %path,
-                msg = %e.message,
-                "sync: remote dir already exists (expected on re-sync)",
-            );
-            Ok(())
-        }
-        Response::Err(e) => {
-            tracing::warn!(
-                path = %path,
-                code = ?e.code,
-                msg = %e.message,
-                "sync: remote Mkdir returned an application-level error; \
-                 continuing (the subsequent do_put will fail concretely if the \
-                 path is not a usable directory)",
-            );
-            Ok(())
-        }
+        Response::Err(e) => match classify_mkdir_error(e.code) {
+            // Session-fatal codes: continuing would fail every
+            // subsequent request the same way. Bail at the first one
+            // so the operator sees the root cause instead of N
+            // confusing per-file do_put errors.
+            MkdirErrorClass::Fatal => {
+                anyhow::bail!(
+                    "sync: Mkdir({path}) failed with fatal code [{:?}] {}",
+                    e.code,
+                    e.message
+                )
+            }
+            // AlreadyExists is the expected case on a re-sync; debug! so
+            // operators tailing the log on a 5000-directory tree don't
+            // get a wall of warns.
+            MkdirErrorClass::AlreadyExists => {
+                tracing::debug!(
+                    path = %path,
+                    msg = %e.message,
+                    "sync: remote dir already exists (expected on re-sync)",
+                );
+                Ok(())
+            }
+            // The other tolerated codes (Internal / NotADirectory /
+            // PermissionDenied / QuotaExceeded / etc.) stay at warn!
+            // because they're surprising enough to want visible.
+            MkdirErrorClass::Benign => {
+                tracing::warn!(
+                    path = %path,
+                    code = ?e.code,
+                    msg = %e.message,
+                    "sync: remote Mkdir returned an application-level error; \
+                     continuing (the subsequent do_put will fail concretely if the \
+                     path is not a usable directory)",
+                );
+                Ok(())
+            }
+        },
         other => anyhow::bail!("sync: Mkdir({path}) got unexpected response: {other:?}"),
     }
 }
 
-/// Upper bound on the number of remote directories `walk_remote` will
-/// visit. A malicious or buggy server can return the same sub-directory
-/// name on every `Ls`, driving the client to recurse forever; this cap
-/// makes the walk terminate with a clear error instead.
-const MAX_REMOTE_DIRS: usize = 10_000;
+/// Classification of a `Mkdir` application-level error during sync's
+/// directory pre-creation pass.
+enum MkdirErrorClass {
+    /// Session-fatal: every later request would fail the same way.
+    Fatal,
+    /// The directory already exists -- the expected re-sync case.
+    AlreadyExists,
+    /// Tolerated per-path error; warn and continue.
+    Benign,
+}
+
+/// Classify a `Mkdir` `ErrorCode`.
+///
+/// `Malformed` is intentionally NOT fatal. The server emits Malformed
+/// for per-path issues too (a `Component::Prefix` in one path, a
+/// parent-less path, ... -- see qftp-protocol handler.rs walk_safe /
+/// resolve_parent), so bailing on the first one would abort the whole
+/// sync when 999/1000 paths are fine.
+fn classify_mkdir_error(code: ErrorCode) -> MkdirErrorClass {
+    match code {
+        ErrorCode::Unauthorized | ErrorCode::Unsupported => MkdirErrorClass::Fatal,
+        ErrorCode::AlreadyExists => MkdirErrorClass::AlreadyExists,
+        _ => MkdirErrorClass::Benign,
+    }
+}
 
 fn walk_remote(session: &mut Session, root: &str) -> Result<HashMap<PathBuf, Meta>> {
     let mut out: HashMap<PathBuf, Meta> = HashMap::new();
@@ -491,13 +512,14 @@ fn walk_remote(session: &mut Session, root: &str) -> Result<HashMap<PathBuf, Met
     let mut visited: usize = 0;
     while let Some((abs, rel)) = stack.pop() {
         visited += 1;
-        if visited > MAX_REMOTE_DIRS {
+        if visited > crate::proto::MAX_DIRS {
             // Bailing out: returning a partial map could leave `sync`
             // believing the remote tree is complete (and with
             // `--delete`, delete files that were simply never walked).
             anyhow::bail!(
                 "sync: remote directory tree too large or cyclic \
-                 (exceeded {MAX_REMOTE_DIRS} directories)"
+                 (exceeded {} directories)",
+                crate::proto::MAX_DIRS
             );
         }
         let req = Request::Ls { path: abs.clone() };
@@ -525,12 +547,10 @@ fn walk_remote(session: &mut Session, root: &str) -> Result<HashMap<PathBuf, Met
             // be echoed back as `Rm` requests, asking the server to
             // delete arbitrary paths. Reject lexically before we even
             // remember the name.
-            if !qftp_common::protocol::safe_entry_name(&e.name) {
-                tracing::warn!(
-                    name = %e.name,
-                    parent = %abs,
-                    "sync: ignoring unsafe entry name from server"
-                );
+            if !crate::proto::entry_name_safe(
+                &e.name,
+                &format!("sync: ignoring unsafe entry name from server (parent: {abs})"),
+            ) {
                 continue;
             }
             let child_abs = join_remote(&abs, Path::new(&e.name));

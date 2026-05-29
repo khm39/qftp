@@ -111,121 +111,109 @@ impl Metrics {
     }
 
     pub fn render(&self) -> String {
+        use std::fmt::Write as _;
         let mut out = String::new();
-        let g = |out: &mut String, name: &str, help: &str, kind: Kind, v: u64| {
-            use std::fmt::Write as _;
-            writeln!(out, "# HELP {name} {help}").ok();
-            writeln!(out, "# TYPE {name} {}", kind.as_str()).ok();
-            writeln!(out, "{name} {v}").ok();
-        };
+        macro_rules! metric {
+            ($name:literal, $help:literal, $kind:expr, $field:ident) => {{
+                let v = self.$field.load(Ordering::Relaxed);
+                writeln!(out, "# HELP {} {}", $name, $help).ok();
+                writeln!(out, "# TYPE {} {}", $name, $kind.as_str()).ok();
+                writeln!(out, "{} {}", $name, v).ok();
+            }};
+        }
         // connections_open is the one quantity that can go down (we
         // decrement it on close), so it needs to be a gauge -- exporting
         // a decreasing value as a counter would break rate()/increase()
         // queries in Prometheus.
-        g(
-            &mut out,
+        metric!(
             "qftp_connections_open",
             "Currently open QUIC connections.",
             Kind::Gauge,
-            self.connections_open.load(Ordering::Relaxed),
+            connections_open
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_connections_total",
             "Total accepted QUIC connections since startup.",
             Kind::Counter,
-            self.connections_total.load(Ordering::Relaxed),
+            connections_total
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_connections_rejected_caps_total",
             "Connections dropped because per-IP or global caps were exceeded.",
             Kind::Counter,
-            self.connections_rejected_caps.load(Ordering::Relaxed),
+            connections_rejected_caps
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_connections_rejected_rate_total",
             "Connections dropped by the rate limiter.",
             Kind::Counter,
-            self.connections_rejected_rate.load(Ordering::Relaxed),
+            connections_rejected_rate
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_initials_dropped_bad_dcid_total",
             "Initials dropped because the client-chosen DCID was out of the RFC 9000 §7.2 range.",
             Kind::Counter,
-            self.initials_dropped_bad_dcid.load(Ordering::Relaxed),
+            initials_dropped_bad_dcid
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_retries_issued_total",
             "QUIC stateless retries issued for address validation.",
             Kind::Counter,
-            self.retries_issued.load(Ordering::Relaxed),
+            retries_issued
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_bytes_received_total",
             "Bytes received in Put uploads.",
             Kind::Counter,
-            self.bytes_received.load(Ordering::Relaxed),
+            bytes_received
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_bytes_sent_total",
             "Bytes sent in Get downloads.",
             Kind::Counter,
-            self.bytes_sent.load(Ordering::Relaxed),
+            bytes_sent
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_requests_total",
             "Protocol requests handled.",
             Kind::Counter,
-            self.requests_total.load(Ordering::Relaxed),
+            requests_total
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_requests_failed_total",
             "Protocol requests that returned Response::Err.",
             Kind::Counter,
-            self.requests_failed.load(Ordering::Relaxed),
+            requests_failed
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_requests_rate_limited_total",
             "Per-request protocol calls rejected by the in-connection rate limiter.",
             Kind::Counter,
-            self.requests_rate_limited.load(Ordering::Relaxed),
+            requests_rate_limited
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_uploads_completed_total",
             "Successful Put uploads.",
             Kind::Counter,
-            self.uploads_completed.load(Ordering::Relaxed),
+            uploads_completed
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_downloads_completed_total",
             "Successful Get downloads.",
             Kind::Counter,
-            self.downloads_completed.load(Ordering::Relaxed),
+            downloads_completed
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_zero_rtt_accepted_total",
             "Requests accepted while the QUIC handshake was still in the early-data phase. These are read-only ops served at 0-RTT.",
             Kind::Counter,
-            self.zero_rtt_accepted.load(Ordering::Relaxed),
+            zero_rtt_accepted
         );
-        g(
-            &mut out,
+        metric!(
             "qftp_zero_rtt_rejected_total",
             "Requests refused because they arrived during 0-RTT and would have mutated server state. The client retries them under 1-RTT.",
             Kind::Counter,
-            self.zero_rtt_rejected.load(Ordering::Relaxed),
+            zero_rtt_rejected
         );
         out
     }

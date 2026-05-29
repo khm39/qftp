@@ -28,8 +28,6 @@ percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
-# The e2e test frames its own requests on the wire.
-bincode = "1"
 # The e2e test drives the bridge over a real WebTransport connection;
 # it needs tokio timers (startup-wait retry) and a TCP client (to
 # check the SPA HTTP listener).

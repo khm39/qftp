@@ -14,6 +14,28 @@ use qftp_common::transport::{
     flush_egress, handle_ingress, recv_message, send_message, stream_send_all,
 };
 
+/// Upper bound on the number of directories any recursive client walk
+/// (`do_recursive_get`, `plan_recursive_put`, sync's `walk_remote`) will
+/// visit. A malicious or buggy server can return the same sub-directory
+/// name on every `Ls`, and a local symlink cycle (`dir/loop -> .`) does
+/// the same on the upload side; this cap makes every walk terminate with
+/// a clear error instead of recursing without bound.
+pub(crate) const MAX_DIRS: usize = 10_000;
+
+/// Returns `true` if `name` is a safe remote entry name. On an unsafe
+/// name (containing `..`, a path separator, or other rejected
+/// characters), logs a warn carrying the structured `name` field plus
+/// the caller's `context` message and returns `false`, so the caller can
+/// count and/or skip it. The raw name is only logged via `tracing`,
+/// never echoed to stdout, since it could carry terminal escapes.
+pub(crate) fn entry_name_safe(name: &str, context: &str) -> bool {
+    if qftp_common::protocol::safe_entry_name(name) {
+        return true;
+    }
+    tracing::warn!(name = %name, "{}", context);
+    false
+}
+
 /// Allocate the next client-initiated bidirectional stream id. QUIC
 /// numbers them 0, 4, 8, ... so each call bumps the cursor by 4.
 pub fn take_stream(next: &mut u64) -> u64 {
