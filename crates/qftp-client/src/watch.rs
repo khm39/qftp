@@ -369,3 +369,32 @@ fn run_session(
         last_event_at = None;
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_signals_masks_sigint_and_sigterm() {
+        // `block_signals` mutates the *calling* thread's mask, and cargo
+        // reuses test threads, so snapshot the mask and restore it after
+        // asserting to avoid leaking a blocked state into other tests.
+        unsafe {
+            let mut saved: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut saved);
+
+            block_signals();
+
+            let mut current: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current);
+
+            let int_blocked = libc::sigismember(&current, libc::SIGINT) == 1;
+            let term_blocked = libc::sigismember(&current, libc::SIGTERM) == 1;
+
+            libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut());
+
+            assert!(int_blocked, "block_signals must block SIGINT");
+            assert!(term_blocked, "block_signals must block SIGTERM");
+        }
+    }
+}
