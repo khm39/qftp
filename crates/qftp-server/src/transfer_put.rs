@@ -47,7 +47,7 @@ pub(crate) struct PutRequest {
     pub size: u64,
     pub mode: u32,
     pub offset: u64,
-    pub expected_checksum: Option<[u8; 32]>,
+    pub expected_checksum: Option<Vec<u8>>,
     pub no_clobber: bool,
     pub checksum_trailer: bool,
     pub leftover: Vec<u8>,
@@ -235,10 +235,18 @@ pub(crate) fn start_put(
         };
         let have = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
         if have != offset {
-            return send_err(
+            return fail_stream(
                 ctx,
-                ErrorCode::InvalidRange,
-                format!("resume offset {offset} does not match partial length {have}"),
+                stream_id,
+                metrics,
+                Response::Err(ErrorResponse::with_details(
+                    ErrorCode::InvalidRange,
+                    format!("resume offset {offset} does not match partial length {have}"),
+                    ErrorDetails::Range {
+                        offset,
+                        file_size: have,
+                    },
+                )),
             );
         }
         // Position the write handle to append after the prefix.
@@ -609,13 +617,15 @@ pub(crate) fn drive_put(
         // complete streaming trailer overrides the legacy header
         // checksum when both are present (defensive; client shouldn't
         // set both).
-        let expected: Option<[u8; 32]> = match trailer_buf.as_ref() {
-            Some(buf) => qftp_protocol::stream::resolve_put_checksum(true, buf, *expected_checksum),
-            None => *expected_checksum,
+        let expected: Option<Vec<u8>> = match trailer_buf.as_ref() {
+            Some(buf) => {
+                qftp_protocol::stream::resolve_put_checksum(true, buf, expected_checksum.clone())
+            }
+            None => expected_checksum.clone(),
         };
         if let Some(expected) = expected {
             let got = *hasher.finalize().as_bytes();
-            if got != expected {
+            if got.as_slice() != expected.as_slice() {
                 // The bytes on disk are known-corrupt; a resume would
                 // re-hash the same temp and fail forever. Remove it so
                 // the next upload starts fresh (mirrors `do_get`

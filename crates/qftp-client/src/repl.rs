@@ -76,7 +76,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
     match cmd.as_str() {
         "ls" | "dir" => {
             let path = args.first().unwrap_or(&"").to_string();
-            Some(Command::Remote(Request::Ls { path }))
+            Some(Command::Remote(Request::Ls { path, cursor: None }))
         }
         "cd" => {
             let path = args.first().unwrap_or(&"/").to_string();
@@ -230,11 +230,11 @@ pub fn display_response(resp: &Response) {
         Response::Ok => println!("OK"),
         Response::Err(e) => display_error(e),
         Response::Path(p) => println!("{}", sanitize_for_terminal(p)),
-        Response::DirListing(entries) => {
+        Response::DirListing { entries, .. } => {
             println!("{:<12} {:>10}  {:<4}  NAME", "MODE", "SIZE", "TYPE");
             println!("{}", "-".repeat(50));
             for entry in entries {
-                let type_str = if entry.is_dir { "DIR" } else { "file" };
+                let type_str = if entry.is_dir() { "DIR" } else { "file" };
                 println!(
                     "{:<12} {:>10}  {:<4}  {}",
                     format_mode(entry.mode),
@@ -245,7 +245,7 @@ pub fn display_response(resp: &Response) {
             }
         }
         Response::FileStat(s) => {
-            let type_str = if s.is_dir { "directory" } else { "file" };
+            let type_str = if s.is_dir() { "directory" } else { "file" };
             println!("  Size: {}", format_size(s.size));
             println!("  Type: {type_str}");
             println!("  Mode: {:o}", s.mode & 0o777);
@@ -273,6 +273,7 @@ pub fn display_response(resp: &Response) {
             size,
             total_size,
             checksum_follows,
+            ..
         } => {
             println!(
                 "File ready: {size} bytes (total {total_size}{})",

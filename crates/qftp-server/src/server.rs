@@ -1205,7 +1205,7 @@ enum PendingAction {
         size: u64,
         mode: u32,
         offset: u64,
-        expected_checksum: Option<[u8; 32]>,
+        expected_checksum: Option<Vec<u8>>,
         no_clobber: bool,
         checksum_trailer: bool,
         leftover: Vec<u8>,
@@ -1279,7 +1279,15 @@ fn validate_request_prerequisites(
     // command floods.
     if !rate_limiter.try_consume(peer_ip) {
         metrics.inc_requests_rate_limited();
-        return Some(err(ErrorCode::RateLimited, "Rate limit exceeded"));
+        return Some(Response::Err(
+            qftp_common::protocol::ErrorResponse::with_details(
+                ErrorCode::RateLimited,
+                "Rate limit exceeded",
+                qftp_common::protocol::ErrorDetails::RetryAfter {
+                    millis: rate_limiter.retry_after_millis(),
+                },
+            ),
+        ));
     }
 
     // 0-RTT replay protection. Any request decoded
@@ -1416,10 +1424,24 @@ fn plan_actions(
                             size,
                             mode,
                             offset,
+                            hash_algorithm,
                             checksum,
                             no_clobber,
                             checksum_trailer,
                         } => {
+                            // qftp/1 negotiates BLAKE3 only; anything else is
+                            // refused rather than silently treated as BLAKE3.
+                            if hash_algorithm != qftp_common::protocol::HashAlgorithm::Blake3 {
+                                actions.push(PendingAction::AclReject {
+                                    stream_id,
+                                    resp: err(
+                                        ErrorCode::Unsupported,
+                                        "unsupported hash algorithm (only BLAKE3 is supported)",
+                                    ),
+                                });
+                                *state = StreamState::Done;
+                                continue;
+                            }
                             let leftover = std::mem::take(stream_buf);
                             actions.push(PendingAction::StartPut {
                                 stream_id,
@@ -1618,7 +1640,10 @@ mod tests {
 
     #[test]
     fn replay_safe_allows_readonly_ops() {
-        assert!(request_is_replay_safe(&Request::Ls { path: "/".into() }));
+        assert!(request_is_replay_safe(&Request::Ls {
+            path: "/".into(),
+            cursor: None
+        }));
         assert!(request_is_replay_safe(&Request::Cd { path: "/".into() }));
         assert!(request_is_replay_safe(&Request::Pwd));
         assert!(request_is_replay_safe(&Request::Stat { path: "x".into() }));
@@ -1645,7 +1670,8 @@ mod tests {
             size: 0,
             mode: 0o644,
             offset: 0,
-            checksum: Some([0u8; 32]),
+            hash_algorithm: qftp_common::protocol::HashAlgorithm::Blake3,
+            checksum: Some(vec![0u8; 32]),
             no_clobber: false,
             checksum_trailer: false,
         }));

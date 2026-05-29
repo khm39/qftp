@@ -17,7 +17,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use qftp_common::protocol::{validate_request, ErrorCode, ErrorResponse, Request, Response};
+use qftp_common::protocol::{
+    validate_request, ErrorCode, ErrorDetails, ErrorResponse, HashAlgorithm, Request, Response,
+};
 use qftp_common::transport::{decode_framed_message, MAX_MESSAGE_SIZE};
 use qftp_protocol::handler;
 use qftp_protocol::stream::{
@@ -83,10 +85,22 @@ async fn dispatch_request(
             size,
             mode,
             offset,
+            hash_algorithm,
             checksum,
             no_clobber,
             checksum_trailer,
         } => {
+            // qftp/1 negotiates BLAKE3 only.
+            if hash_algorithm != HashAlgorithm::Blake3 {
+                return reply_err(
+                    send,
+                    ErrorResponse::new(
+                        ErrorCode::Unsupported,
+                        "unsupported hash algorithm (only BLAKE3 is supported)",
+                    ),
+                )
+                .await;
+            }
             do_put(
                 send,
                 recv,
@@ -271,9 +285,13 @@ async fn do_get(
     if offset > meta.len() {
         return reply_err(
             send,
-            ErrorResponse::new(
+            ErrorResponse::with_details(
                 ErrorCode::InvalidRange,
                 format!("offset {offset} past end of file (size {})", meta.len()),
+                ErrorDetails::Range {
+                    offset,
+                    file_size: meta.len(),
+                },
             ),
         )
         .await;
@@ -289,6 +307,7 @@ async fn do_get(
             size: to_send,
             total_size: meta.len(),
             checksum_follows: true,
+            hash_algorithm: HashAlgorithm::Blake3,
         },
     )
     .await?;
@@ -405,7 +424,7 @@ async fn do_put(
     size: u64,
     mode: u32,
     offset: u64,
-    expected_checksum: Option<[u8; 32]>,
+    expected_checksum: Option<Vec<u8>>,
     no_clobber: bool,
     checksum_trailer: bool,
     leftover: Vec<u8>,
@@ -651,7 +670,7 @@ async fn do_put(
     // when both are present.
     let expected = resolve_put_checksum(checksum_trailer, &trailer_buf, expected_checksum);
     if let Some(expected) = expected {
-        if *hasher.finalize().as_bytes() != expected {
+        if hasher.finalize().as_bytes().as_slice() != expected.as_slice() {
             return reply_err(
                 send,
                 ErrorResponse::new(

@@ -843,9 +843,10 @@ fn do_mget(
 
     let resp = session.request_response(&Request::Ls {
         path: rdir.to_string(),
+        cursor: None,
     })?;
     let entries = match resp {
-        Response::DirListing(e) => e,
+        Response::DirListing { entries, .. } => entries,
         Response::Err(e) => {
             repl::display_error(&e);
             return Ok(());
@@ -861,7 +862,7 @@ fn do_mget(
     let mut skipped = 0usize;
     let mut unsafe_rejected = 0usize;
     for entry in entries {
-        if entry.is_dir || !matcher.matches_with(&entry.name, glob_opts) {
+        if entry.is_dir() || !matcher.matches_with(&entry.name, glob_opts) {
             continue;
         }
         // A malicious server can return entry names containing `..` or
@@ -959,10 +960,13 @@ fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<Stri
                 proto::MAX_DIRS
             );
         }
-        let req = Request::Ls { path: rdir.clone() };
+        let req = Request::Ls {
+            path: rdir.clone(),
+            cursor: None,
+        };
         let resp = session.request_response(&req)?;
         let entries = match resp {
-            Response::DirListing(e) => e,
+            Response::DirListing { entries, .. } => entries,
             Response::Err(e) => {
                 repl::display_error(&e);
                 continue;
@@ -986,7 +990,7 @@ fn do_recursive_get(session: &mut Session, remote: &str, local_root: Option<Stri
             }
             let remote_child = join_remote(&rdir, Path::new(&entry.name));
             let local_child = ldir.join(&entry.name);
-            if entry.is_dir {
+            if entry.is_dir() {
                 queue.push((remote_child, local_child));
             } else {
                 // Same existing-destination guard as `do_mget`: never

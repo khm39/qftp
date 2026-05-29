@@ -221,6 +221,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
             size,
             total_size,
             checksum_follows,
+            ..
         } => (size, total_size, checksum_follows),
         Response::Err(e) => {
             // A resumed Get whose offset is past the (now shorter)
@@ -504,6 +505,7 @@ fn do_put_inner(
         size: bytes_to_send,
         mode,
         offset,
+        hash_algorithm: qftp_common::protocol::HashAlgorithm::Blake3,
         // checksum_trailer below carries the verification path; leave
         // the legacy header field empty so the server ignores it.
         checksum: None,
@@ -713,7 +715,7 @@ pub fn probe_put_resume_offset(session: &mut Session, remote: &str, local_size: 
         path: partial.to_string_lossy().into_owned(),
     };
     match session.request_response(&req) {
-        Ok(Response::FileStat(s)) if !s.is_dir && s.size > 0 && s.size <= local_size => s.size,
+        Ok(Response::FileStat(s)) if !s.is_dir() && s.size > 0 && s.size <= local_size => s.size,
         _ => 0,
     }
 }

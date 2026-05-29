@@ -86,6 +86,18 @@ impl RateLimiter {
         }
     }
 
+    /// Approximate wait before the next token is available, in
+    /// milliseconds: the bucket refills at `rps` tokens/sec, so one
+    /// token takes `1000 / rps` ms. Surfaced as the `RetryAfter` hint
+    /// on a `RateLimited` error so clients back off by the right order
+    /// of magnitude rather than a fixed guess.
+    pub fn retry_after_millis(&self) -> u32 {
+        if self.rps <= 0.0 {
+            return 1000;
+        }
+        (1000.0 / self.rps).ceil().clamp(1.0, u32::MAX as f64) as u32
+    }
+
     pub fn try_consume(&mut self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let key = bucket_key(ip);

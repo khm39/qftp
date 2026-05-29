@@ -522,7 +522,10 @@ fn walk_remote(session: &mut Session, root: &str) -> Result<HashMap<PathBuf, Met
                 crate::proto::MAX_DIRS
             );
         }
-        let req = Request::Ls { path: abs.clone() };
+        let req = Request::Ls {
+            path: abs.clone(),
+            cursor: None,
+        };
         let resp = match session.request_response(&req) {
             Ok(r) => r,
             Err(e) => {
@@ -533,7 +536,7 @@ fn walk_remote(session: &mut Session, root: &str) -> Result<HashMap<PathBuf, Met
             }
         };
         let entries = match resp {
-            Response::DirListing(e) => e,
+            Response::DirListing { entries, .. } => entries,
             Response::Err(e) => {
                 anyhow::bail!("sync: remote Ls failed for {abs}: {}", e.message);
             }
@@ -555,7 +558,7 @@ fn walk_remote(session: &mut Session, root: &str) -> Result<HashMap<PathBuf, Met
             }
             let child_abs = join_remote(&abs, Path::new(&e.name));
             let child_rel = rel.join(&e.name);
-            if e.is_dir {
+            if e.is_dir() {
                 stack.push((child_abs, child_rel));
             } else {
                 out.insert(
