@@ -564,24 +564,23 @@ pub fn run(
 
         // 1. Drain incoming UDP packets.
         let local_addr = socket.local_addr().context("failed to get local addr")?;
-        phase_ingress(
-            &mut connections,
-            &mut counter,
-            &mut rate_limiter,
-            &mut quiche_config,
-            &retry_key,
-            &conn_id_seed,
-            &server_config,
-            &users,
-            &metrics,
-            &rng,
-            &socket,
-            &mut next_generation,
-            &mut buf,
-            &mut out_pkt,
-            local_addr,
-            closing,
-        )?;
+        {
+            let mut ax = AcceptCtx {
+                connections: &mut connections,
+                counter: &mut counter,
+                rate_limiter: &mut rate_limiter,
+                quiche_config: &mut quiche_config,
+                retry_key: &retry_key,
+                conn_id_seed: &conn_id_seed,
+                cfg: &server_config,
+                users: &users,
+                metrics: &metrics,
+                rng: &rng,
+                socket: &socket,
+                next_generation: &mut next_generation,
+            };
+            phase_ingress(&mut ax, &mut buf, &mut out_pkt, local_addr, closing)?;
+        }
 
         // 1.5. Drain completed handler jobs and send their responses.
         phase_drain_handler_results(&mut connections, &handler_pool, &metrics);
@@ -590,19 +589,19 @@ pub fn run(
         phase_on_timeout(&mut connections);
 
         // 3-5. Per-connection work: streams + sending + egress.
-        phase_per_connection_work(
-            &mut connections,
-            &socket,
-            &users,
-            &metrics,
-            &mut rate_limiter,
-            &mut buf,
-            &handler_pool,
-            &mut readable_ids,
-            &mut send_buf,
-            &mut sender_ids,
-            &server_config,
-        );
+        let mut stream_ctx = StreamCtx {
+            socket: &socket,
+            users: &users,
+            metrics: &metrics,
+            rate_limiter: &mut rate_limiter,
+            pool: &handler_pool,
+            tmp: &mut buf,
+            readable_ids: &mut readable_ids,
+            send_buf: &mut send_buf,
+            sender_ids: &mut sender_ids,
+            mtls_required: server_config.mtls_required,
+        };
+        phase_per_connection_work(&mut connections, &mut stream_ctx);
 
         // 6. Reap closed / timed-out connections.
         phase_reap_connections(&mut connections, &mut counter, &metrics);
@@ -687,27 +686,15 @@ fn compute_poll_timeout(
 /// Phase 1: drain incoming UDP packets and route each to its connection
 /// (or to the accept path for Initials). A fatal socket error aborts the
 /// loop via `?`; per-packet and accept-time errors stay scoped and logged.
-#[allow(clippy::too_many_arguments)]
 fn phase_ingress(
-    connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
-    counter: &mut ConnectionCounter,
-    rate_limiter: &mut RateLimiter,
-    quiche_config: &mut quiche::Config,
-    retry_key: &RetryKey,
-    conn_id_seed: &[u8; 32],
-    server_config: &ServerConfig,
-    users: &Arc<UserDirectory>,
-    metrics: &Arc<Metrics>,
-    rng: &ring::rand::SystemRandom,
-    socket: &mio::net::UdpSocket,
-    next_generation: &mut u64,
+    ax: &mut AcceptCtx,
     buf: &mut [u8; 65536],
     out_pkt: &mut [u8; 1350],
     local_addr: std::net::SocketAddr,
     closing: bool,
 ) -> Result<()> {
     loop {
-        let (len, from) = match socket.recv_from(buf) {
+        let (len, from) = match ax.socket.recv_from(buf) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e).context("UDP recv_from failed"),
@@ -730,7 +717,7 @@ fn phase_ingress(
             from,
             to: local_addr,
         };
-        if let Some(ctx) = connections.get_mut(&hdr.dcid) {
+        if let Some(ctx) = ax.connections.get_mut(&hdr.dcid) {
             if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
                 warn!(peer = %from, error = ?e, "QUIC recv error");
             }
@@ -738,8 +725,8 @@ fn phase_ingress(
         }
         // Miss: Initial retransmits during the handshake still carry
         // the peer's original DCID, so try its derived alias too.
-        let alias = derive_scid(conn_id_seed, &hdr.dcid);
-        if let Some(ctx) = connections.get_mut(&alias) {
+        let alias = derive_scid(ax.conn_id_seed, &hdr.dcid);
+        if let Some(ctx) = ax.connections.get_mut(&alias) {
             if let Err(e) = ctx.conn.recv(&mut buf[..len], recv_info) {
                 warn!(peer = %from, error = ?e, "QUIC recv error");
             }
@@ -756,34 +743,13 @@ fn phase_ingress(
             continue;
         }
 
-        let mut ax = AcceptCtx {
-            connections,
-            counter,
-            rate_limiter,
-            quiche_config,
-            retry_key,
-            conn_id_seed,
-            cfg: server_config,
-            users,
-            metrics,
-            rng,
-            socket,
-            next_generation,
-        };
         // An accept-time failure (a transient UDP send error while
         // issuing a RETRY, a quiche::accept rejection) must stay
         // scoped to this one Initial: propagating it out of `run()`
         // would tear down the whole server and every other client's
         // connection. Log and drop the packet, like the
         // per-connection work below.
-        if let Err(e) = try_accept(
-            &mut ax,
-            from,
-            local_addr,
-            &hdr,
-            &mut buf[..len],
-            out_pkt,
-        ) {
+        if let Err(e) = try_accept(ax, from, local_addr, &hdr, &mut buf[..len], out_pkt) {
             warn!(peer = %from, error = %e, "accept failed; dropping Initial");
         }
     }
@@ -820,50 +786,30 @@ fn phase_on_timeout(
 /// instead close just the offending connection (the reap sweep
 /// below drops it) and keep serving everyone else. Truly fatal
 /// socket errors still surface via the ingress `recv_from` path.
-#[allow(clippy::too_many_arguments)]
 fn phase_per_connection_work(
     connections: &mut HashMap<quiche::ConnectionId<'static>, ConnectionContext>,
-    socket: &mio::net::UdpSocket,
-    users: &UserDirectory,
-    metrics: &Metrics,
-    rate_limiter: &mut RateLimiter,
-    buf: &mut [u8],
-    handler_pool: &HandlerPool,
-    readable_ids: &mut Vec<u64>,
-    send_buf: &mut [u8],
-    sender_ids: &mut Vec<u64>,
-    server_config: &ServerConfig,
+    sx: &mut StreamCtx,
 ) {
     for ctx in connections.values_mut() {
-        if let Err(e) = process_readable_streams(
-            ctx,
-            socket,
-            users,
-            metrics,
-            rate_limiter,
-            buf,
-            handler_pool,
-            readable_ids,
-            server_config.mtls_required,
-        ) {
+        if let Err(e) = process_readable_streams(ctx, sx) {
             warn!(peer = %ctx.peer_addr, error = %e, "stream processing failed; closing connection");
             let _ = ctx.conn.close(true, 0x01, b"connection error");
         }
-        if let Err(e) = crate::transfer_get::drive_rehash_streams(ctx, buf, metrics) {
+        if let Err(e) = crate::transfer_get::drive_rehash_streams(ctx, sx.tmp, sx.metrics) {
             warn!(peer = %ctx.peer_addr, error = %e, "resume re-hash failed; closing connection");
             let _ = ctx.conn.close(true, 0x01, b"connection error");
         }
         if let Err(e) = crate::transfer_get::drive_sending_streams(
             ctx,
-            socket,
-            metrics,
-            send_buf,
-            sender_ids,
+            sx.socket,
+            sx.metrics,
+            sx.send_buf,
+            sx.sender_ids,
         ) {
             warn!(peer = %ctx.peer_addr, error = %e, "send processing failed; closing connection");
             let _ = ctx.conn.close(true, 0x01, b"connection error");
         }
-        if let Err(e) = flush_egress(&mut ctx.conn, socket) {
+        if let Err(e) = flush_egress(&mut ctx.conn, sx.socket) {
             warn!(peer = %ctx.peer_addr, error = %e, "egress flush failed; closing connection");
             let _ = ctx.conn.close(true, 0x01, b"connection error");
         }
@@ -1277,30 +1223,38 @@ enum PendingAction {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_readable_streams(
-    ctx: &mut ConnectionContext,
-    socket: &mio::net::UdpSocket,
-    users: &UserDirectory,
-    metrics: &Metrics,
-    rate_limiter: &mut RateLimiter,
-    tmp: &mut [u8],
-    pool: &HandlerPool,
-    readable_ids: &mut Vec<u64>,
+/// Per-connection work services shared across every connection in one
+/// loop iteration, bundled so the stream-processing path takes a single
+/// handle (plus the `&mut ConnectionContext` it operates on) rather than
+/// a long positional argument list. Built from disjoint fields of the
+/// run loop's state, so it never aliases the `connections` table it is
+/// iterated alongside.
+struct StreamCtx<'a> {
+    socket: &'a mio::net::UdpSocket,
+    users: &'a UserDirectory,
+    metrics: &'a Metrics,
+    rate_limiter: &'a mut RateLimiter,
+    pool: &'a HandlerPool,
+    tmp: &'a mut [u8],
+    readable_ids: &'a mut Vec<u64>,
+    send_buf: &'a mut [u8],
+    sender_ids: &'a mut Vec<u64>,
     mtls_required: bool,
-) -> Result<()> {
-    if !upgrade_user_from_cert(ctx, users, mtls_required) {
+}
+
+fn process_readable_streams(ctx: &mut ConnectionContext, sx: &mut StreamCtx) -> Result<()> {
+    if !upgrade_user_from_cert(ctx, sx.users, sx.mtls_required) {
         // Connection was rejected (mTLS / identity failure); its
         // CONNECTION_CLOSE is flushed by the caller and the reap
         // sweep drops it. Don't serve any requests on it.
         return Ok(());
     }
-    readable_ids.clear();
-    readable_ids.extend(ctx.conn.readable());
+    sx.readable_ids.clear();
+    sx.readable_ids.extend(ctx.conn.readable());
 
-    let actions = plan_actions(ctx, metrics, rate_limiter, tmp, readable_ids)?;
+    let actions = plan_actions(ctx, sx.metrics, sx.rate_limiter, sx.tmp, sx.readable_ids)?;
 
-    execute_pending_actions(ctx, socket, metrics, pool, tmp, actions)
+    execute_pending_actions(ctx, sx.socket, sx.metrics, sx.pool, sx.tmp, actions)
 }
 
 /// Gate a freshly decoded request through the rate limiter, 0-RTT replay
