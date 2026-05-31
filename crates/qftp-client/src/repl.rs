@@ -213,7 +213,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
 /// Every control character (the C0 set `< 0x20`, `0x7f` DEL, and the
 /// C1 set) is replaced with a visible `\xNN` escape; ordinary
 /// printable text, including non-ASCII UTF-8, is left untouched.
-fn sanitize_for_terminal(s: &str) -> String {
+pub fn sanitize_for_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         if ch.is_control() {

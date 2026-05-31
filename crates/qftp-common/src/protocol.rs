@@ -71,10 +71,17 @@ pub fn safe_entry_name(name: &str) -> bool {
 ///   * directory listings: 100 000 entries (a single Ls response
 ///     larger than this is itself an abuse vector and should be
 ///     refused at the source).
+///   * checksums: 64 bytes. A fixed bound rather than the negotiated
+///     [`HashAlgorithm::digest_len`] because `hash_algorithm` may be an
+///     `Unknown(n)` whose `digest_len()` is `None`; 64 bytes covers any
+///     realistic digest (incl. SHA-512). The exact length-for-algorithm
+///     check happens later in the transfer path — this is only the
+///     defense-in-depth allocation cap.
 mod limits {
     pub const MAX_PATH_LEN: usize = 4 * 1024;
     pub const MAX_ERROR_MESSAGE_LEN: usize = 1024;
     pub const MAX_DIR_ENTRIES: usize = 100_000;
+    pub const MAX_CHECKSUM_LEN: usize = 64;
 }
 pub use limits::*;
 
@@ -99,6 +106,8 @@ pub enum ValidationError {
     ErrorMessageTooLong { len: usize, max: usize },
     #[error("DirListing has {len} entries, exceeds MAX_DIR_ENTRIES ({max}) (#140)")]
     DirEntriesTooMany { len: usize, max: usize },
+    #[error("Put.checksum is {len} bytes, exceeds MAX_CHECKSUM_LEN ({max}) (#140)")]
+    ChecksumTooLong { len: usize, max: usize },
 }
 
 fn check_path(field: &'static str, value: &str) -> Result<(), ValidationError> {
@@ -118,10 +127,29 @@ fn check_path(field: &'static str, value: &str) -> Result<(), ValidationError> {
 /// fields are no-ops.
 pub fn validate_request(req: &Request) -> Result<(), ValidationError> {
     match req {
-        Request::Ls { path, .. }
-        | Request::Cd { path }
+        Request::Ls { path, cursor } => {
+            check_path("path", path)?;
+            // `cursor` is an opaque server-issued pagination token; cap
+            // it like a path so a peer can't pack ~16 MiB into it (#309).
+            if let Some(c) = cursor {
+                check_path("cursor", c)?;
+            }
+            Ok(())
+        }
+        Request::Put { path, checksum, .. } => {
+            check_path("path", path)?;
+            if let Some(c) = checksum {
+                if c.len() > MAX_CHECKSUM_LEN {
+                    return Err(ValidationError::ChecksumTooLong {
+                        len: c.len(),
+                        max: MAX_CHECKSUM_LEN,
+                    });
+                }
+            }
+            Ok(())
+        }
+        Request::Cd { path }
         | Request::Get { path, .. }
-        | Request::Put { path, .. }
         | Request::Mkdir { path }
         | Request::Rmdir { path }
         | Request::Rm { path }
@@ -851,6 +879,87 @@ mod tests {
             length: None,
         };
         validate_request(&req).expect("MAX_PATH_LEN exactly should pass");
+    }
+
+    #[test]
+    fn validate_request_rejects_oversized_cursor() {
+        let req = Request::Ls {
+            path: "ok".into(),
+            cursor: Some("c".repeat(MAX_PATH_LEN + 1)),
+        };
+        let e = validate_request(&req).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ValidationError::PathTooLong {
+                    field: "cursor",
+                    ..
+                }
+            ),
+            "expected `cursor` field cited, got: {e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_request_accepts_borderline_cursor() {
+        let req = Request::Ls {
+            path: "ok".into(),
+            cursor: Some("c".repeat(MAX_PATH_LEN)),
+        };
+        validate_request(&req).expect("MAX_PATH_LEN cursor exactly should pass");
+    }
+
+    #[test]
+    fn validate_request_rejects_oversized_checksum() {
+        let req = Request::Put {
+            path: "ok".into(),
+            size: 1,
+            mode: 0o644,
+            offset: 0,
+            hash_algorithm: HashAlgorithm::Blake3,
+            checksum: Some(vec![0u8; MAX_CHECKSUM_LEN + 1]),
+            no_clobber: false,
+            checksum_trailer: false,
+        };
+        let e = validate_request(&req).unwrap_err();
+        assert!(
+            matches!(e, ValidationError::ChecksumTooLong { .. }),
+            "expected ChecksumTooLong, got: {e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_request_accepts_borderline_checksum() {
+        let req = Request::Put {
+            path: "ok".into(),
+            size: 1,
+            mode: 0o644,
+            offset: 0,
+            hash_algorithm: HashAlgorithm::Blake3,
+            checksum: Some(vec![0u8; MAX_CHECKSUM_LEN]),
+            no_clobber: false,
+            checksum_trailer: false,
+        };
+        validate_request(&req).expect("MAX_CHECKSUM_LEN exactly should pass");
+    }
+
+    #[test]
+    fn validate_request_put_still_checks_path() {
+        let req = Request::Put {
+            path: "p".repeat(MAX_PATH_LEN + 1),
+            size: 1,
+            mode: 0o644,
+            offset: 0,
+            hash_algorithm: HashAlgorithm::Blake3,
+            checksum: None,
+            no_clobber: false,
+            checksum_trailer: false,
+        };
+        let e = validate_request(&req).unwrap_err();
+        assert!(
+            matches!(e, ValidationError::PathTooLong { field: "path", .. }),
+            "expected `path` field cited, got: {e:?}"
+        );
     }
 
     #[test]

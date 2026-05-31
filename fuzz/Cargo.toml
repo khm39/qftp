@@ -9,7 +9,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bincode = "1"
 tempfile = "3"
 qftp-common = { path = "../crates/qftp-common" }
 qftp-protocol = { path = "../crates/qftp-protocol" }

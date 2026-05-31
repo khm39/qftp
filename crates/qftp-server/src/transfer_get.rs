@@ -4,6 +4,7 @@
 //! Split out of `server.rs` for cohesion (#271); behavior is unchanged.
 
 use std::io::Read;
+use std::path::Path;
 
 use anyhow::Result;
 use qftp_common::protocol::*;
@@ -55,23 +56,19 @@ pub(crate) fn start_get(
     if let Err(e) = handler::recheck_ancestors_no_symlinks(&file_path, &ctx.user.home) {
         return send_err(ctx, e.code, e.message);
     }
-    // Open with O_NOFOLLOW first, then derive metadata from the
-    // resulting fd. This binds the metadata + the bytes we stream to
-    // the same inode the path resolved to, eliminating the TOCTOU
+    // Open with O_NOFOLLOW|O_NONBLOCK first, then derive metadata from
+    // the resulting fd. O_NOFOLLOW rejects a planted symlink at the
+    // leaf; O_NONBLOCK keeps the open from blocking the single-threaded
+    // event loop when the leaf is a FIFO whose writer never appears
+    // (O_NOFOLLOW does not cover FIFOs). For a regular file O_NONBLOCK
+    // is harmless -- the subsequent reads behave as before. Deriving
+    // metadata from the fd binds the type check + the bytes we stream
+    // to the same inode the path resolved to, eliminating the TOCTOU
     // window between `walk_safe` and `fs::open`.
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.read(true);
-    qftp_common::fs_safe::apply_no_follow(&mut open_opts);
-    let file = match open_opts.open(&file_path) {
-        Ok(f) => f,
+    let (file, meta) = match open_get_file(&file_path) {
+        Ok(pair) => pair,
         Err(e) => {
             return send_err(ctx, io_code(&e), format!("Failed to open file: {e}"));
-        }
-    };
-    let meta = match file.metadata() {
-        Ok(m) => m,
-        Err(e) => {
-            return send_err(ctx, io_code(&e), format!("Failed to stat file: {e}"));
         }
     };
     if !meta.is_file() {
@@ -124,8 +121,12 @@ pub(crate) fn start_get(
     )?;
     // The reader stays at position 0 even for a resumed Get: the
     // streaming state machine re-hashes the [0..offset) prefix into
-    // `hasher` before sending any body bytes, so the trailer is a
-    // whole-file BLAKE3 the client can verify its local prefix against.
+    // `hasher` before sending any body bytes, so the trailer is the
+    // cumulative BLAKE3 over the range [0, offset + bytes_to_send) the
+    // client can verify its local prefix against. That equals the
+    // whole-file BLAKE3 only when `length` is unset (bytes_to_send then
+    // runs to EOF); a bounded `length` makes it the hash of just the
+    // sent prefix range, which the client can still verify against.
     ctx.streams.insert(
         stream_id,
         StreamState::SendingFileData {
@@ -140,6 +141,24 @@ pub(crate) fn start_get(
         },
     );
     Ok(())
+}
+
+/// Open a Get target with `O_NOFOLLOW|O_NONBLOCK` and return the fd
+/// together with its (fstat-derived) metadata.
+///
+/// `O_NONBLOCK` is the FIFO guard: an `O_RDONLY` open of a named pipe
+/// whose writer never appears would otherwise block the single-threaded
+/// event loop forever. With `O_NONBLOCK` the open returns immediately
+/// even for such a FIFO; the caller then rejects it via the
+/// `metadata().is_file()` check, since the metadata is taken from the
+/// open fd (no fresh lstat, so no new TOCTOU window).
+fn open_get_file(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.read(true);
+    qftp_common::fs_safe::apply_no_follow_nonblock(&mut open_opts);
+    let file = open_opts.open(path)?;
+    let meta = file.metadata()?;
+    Ok((file, meta))
 }
 
 pub(crate) fn drive_sending_streams(
@@ -283,8 +302,10 @@ fn drive_one_sender(
 /// `hasher` before streaming any body bytes. Doing this incrementally
 /// (one chunk per call) keeps a large resumed Get from stalling the
 /// event loop; once `prefix_remaining` reaches 0 the next call falls
-/// through to Phase A. The trailer is therefore a whole-file BLAKE3,
-/// so the client can verify its local prefix against it (#221).
+/// through to Phase A. The trailer is therefore the cumulative BLAKE3
+/// over [0, offset + bytes_to_send) -- the whole file when `length` is
+/// unset, the sent prefix range otherwise -- so the client can verify
+/// its local prefix against it (#221).
 ///
 /// `Some(outcome)` returns from `drive_one_sender`; `None` falls through
 /// to Phase A.
@@ -418,4 +439,51 @@ fn send_phase_trailer(
     *bs.finished = true;
     metrics.inc_downloads_completed();
     SendOutcome::Finished
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Get whose leaf is a writerless FIFO must not hang the event
+    /// loop. With `O_NONBLOCK` the open returns immediately (an
+    /// `O_RDONLY` open of a writerless FIFO succeeds rather than
+    /// erroring), and the fd's metadata reports a non-regular file so
+    /// `start_get` rejects it. The fact that this test completes at all
+    /// -- no writer is ever attached -- is the proof of the non-blocking
+    /// behaviour: without `O_NONBLOCK` the open would block forever.
+    #[cfg(unix)]
+    #[test]
+    fn open_get_file_on_fifo_does_not_block_and_is_not_a_regular_file() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        // Open returns (no writer is ever attached); the metadata from
+        // the fd shows it is not a regular file.
+        let (file, meta) = open_get_file(&fifo).expect("open of writerless FIFO");
+        assert!(
+            !meta.is_file(),
+            "FIFO unexpectedly reported as a regular file"
+        );
+        drop(file);
+    }
+
+    /// A regular file still opens and reports `is_file()`, so the
+    /// `O_NONBLOCK` addition doesn't regress the normal Get path.
+    #[cfg(unix)]
+    #[test]
+    fn open_get_file_on_regular_file_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, b"hello").unwrap();
+        let (file, meta) = open_get_file(&path).expect("open of regular file");
+        assert!(meta.is_file(), "regular file not reported as is_file()");
+        assert_eq!(meta.len(), 5);
+        drop(file);
+    }
 }

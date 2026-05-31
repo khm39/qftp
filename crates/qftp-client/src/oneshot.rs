@@ -14,8 +14,9 @@ use anyhow::{anyhow, Context, Result};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
 
-use crate::config::{self, ConnectionSpec, Overrides};
+use crate::config::{self, ConfigFile, ConnectionSpec, Overrides};
 use crate::proto::{take_stream, Session};
+use crate::repl::sanitize_for_terminal;
 use crate::session_store;
 use crate::transfer;
 use crate::OneShot;
@@ -29,44 +30,63 @@ pub mod exit {
     pub const NOPERM: i32 = 77;
 }
 
-/// Parsed `qftp://host[:port]/path` URL with the host/port split out
-/// for connection setup and the path retained for the operation
-/// itself.
+/// Parsed one-shot remote reference: either a `qftp://host[:port]/path`
+/// URL (host/port split out for connection setup) or a config-file host
+/// alias (`<alias>[:/path]`). The `path` is retained for the operation
+/// itself; `target` carries the host selector (`qftp://…` URL or bare
+/// alias name) that `spec_from_url` feeds back through `config::resolve`.
 #[derive(Debug, Clone)]
 struct RemoteRef {
-    host_port: String,
-    /// SNI / cert CN expected on the server. Currently unused —
-    /// `spec_from_url` rebuilds it via `config::resolve` — but kept
-    /// in the struct for clarity and for future per-URL overrides.
-    #[allow(dead_code)]
-    server_name: String,
-    user: Option<String>,
+    /// Host selector handed to `config::resolve`: a `qftp://…` URL
+    /// (without the path component) for URL inputs, or the bare alias
+    /// name for non-URL inputs.
+    target: String,
     path: String,
 }
 
 fn parse_remote(input: &str) -> Result<RemoteRef> {
-    let url = config::parse_url(input).with_context(|| format!("invalid remote URL: {input}"))?;
-    let path = url.initial_path.unwrap_or_else(|| "/".to_string());
+    if config::looks_like_url(input) {
+        let url =
+            config::parse_url(input).with_context(|| format!("invalid remote URL: {input}"))?;
+        let path = url.initial_path.unwrap_or_else(|| "/".to_string());
+        let host_port = config::format_host_port(&url.host, url.port);
+        let target = match &url.user {
+            Some(u) => format!("qftp://{u}@{host_port}"),
+            None => format!("qftp://{host_port}"),
+        };
+        return Ok(RemoteRef { target, path });
+    }
+    // Non-URL input is a config-file host alias, optionally suffixed
+    // with `:/path` (scp-style `alias:remote/path`). Everything before
+    // the first ':' is the alias; the rest (if any) is the remote path.
+    let (alias, path) = match input.split_once(':') {
+        Some((a, p)) => (a.to_string(), p.to_string()),
+        None => (input.to_string(), "/".to_string()),
+    };
+    if alias.is_empty() {
+        return Err(anyhow!("invalid remote '{input}': empty host alias"));
+    }
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    };
     Ok(RemoteRef {
-        host_port: config::format_host_port(&url.host, url.port),
-        server_name: url.host.clone(),
-        user: url.user,
+        target: alias,
         path,
     })
 }
 
-/// Resolve a `ConnectionSpec` from a one-shot URL + overrides. The
-/// URL host/port wins; CLI flags still override on top, mirroring
-/// the REPL flow.
-fn spec_from_url(remote: &RemoteRef, overrides: &Overrides) -> Result<ConnectionSpec> {
-    // We feed the URL through the resolver so CLI overrides
-    // (--host, --ca, …) follow identical precedence as REPL mode.
-    let target = if let Some(u) = &remote.user {
-        format!("qftp://{u}@{}{}", remote.host_port, remote.path)
-    } else {
-        format!("qftp://{}{}", remote.host_port, remote.path)
-    };
-    config::resolve(Some(&target), &config::ConfigFile::default(), overrides)
+/// Resolve a `ConnectionSpec` from a one-shot remote ref + the loaded
+/// config file + CLI overrides. URL host/port wins for URL targets;
+/// alias targets are resolved against `[host.<alias>]`. CLI flags
+/// override on top, mirroring the REPL flow.
+fn spec_from_url(
+    remote: &RemoteRef,
+    cfg_file: &ConfigFile,
+    overrides: &Overrides,
+) -> Result<ConnectionSpec> {
+    config::resolve(Some(&remote.target), cfg_file, overrides)
 }
 
 /// Open a connection and run a callback against the established
@@ -133,7 +153,13 @@ fn report_response_for_status(resp: &Response) -> i32 {
     match resp {
         Response::Ok => exit::OK,
         Response::Err(e) => {
-            eprintln!("Error [{:?}]: {}", e.code, e.message);
+            // `e.message` is server-supplied; strip terminal escapes
+            // before printing (same threat model as the REPL path).
+            eprintln!(
+                "Error [{:?}]: {}",
+                e.code,
+                sanitize_for_terminal(&e.message)
+            );
             err_to_exit(&e.code)
         }
         other => {
@@ -212,7 +238,7 @@ fn resolve_clobber(no_clobber: bool, force: bool, interactive: bool) -> ClobberP
 
 /// Dispatch entry point called from `main`. Returns the process
 /// exit code; `main` calls `std::process::exit` with it.
-pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
+pub fn run(cmd: OneShot, cfg_file: &ConfigFile, overrides: Overrides) -> Result<i32> {
     match cmd {
         OneShot::Put {
             local,
@@ -228,6 +254,7 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
             recursive,
             resolve_clobber(no_clobber, force, interactive),
             dry_run,
+            cfg_file,
             &overrides,
         ),
         OneShot::Get {
@@ -244,23 +271,26 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
             recursive,
             resolve_clobber(no_clobber, force, interactive),
             dry_run,
+            cfg_file,
             &overrides,
         ),
-        OneShot::Ls { remote } => run_remote_oneshot(&remote, &overrides, |path| Request::Ls {
-            path: path.into(),
-            cursor: None,
+        OneShot::Ls { remote } => {
+            run_remote_oneshot(&remote, cfg_file, &overrides, |path| Request::Ls {
+                path: path.into(),
+                cursor: None,
+            })
+        }
+        OneShot::Rm { remote } => run_remote_oneshot(&remote, cfg_file, &overrides, |path| {
+            Request::Rm { path: path.into() }
         }),
-        OneShot::Rm { remote } => run_remote_oneshot(&remote, &overrides, |path| Request::Rm {
-            path: path.into(),
-        }),
-        OneShot::Mkdir { remote } => run_remote_oneshot(&remote, &overrides, |path| {
+        OneShot::Mkdir { remote } => run_remote_oneshot(&remote, cfg_file, &overrides, |path| {
             Request::Mkdir { path: path.into() }
         }),
-        OneShot::Rmdir { remote } => run_remote_oneshot(&remote, &overrides, |path| {
+        OneShot::Rmdir { remote } => run_remote_oneshot(&remote, cfg_file, &overrides, |path| {
             Request::Rmdir { path: path.into() }
         }),
-        OneShot::Rename { from, to } => run_rename(&from, &to, &overrides),
-        OneShot::Stat { remote } => run_stat(&remote, &overrides),
+        OneShot::Rename { from, to } => run_rename(&from, &to, cfg_file, &overrides),
+        OneShot::Stat { remote } => run_stat(&remote, cfg_file, &overrides),
         OneShot::Watch {
             local,
             remote,
@@ -294,25 +324,28 @@ pub fn run(cmd: OneShot, overrides: Overrides) -> Result<i32> {
 /// Generic "URL -> single request -> single response -> exit code".
 fn run_remote_oneshot(
     url: &str,
+    cfg_file: &ConfigFile,
     overrides: &Overrides,
     build: impl FnOnce(&str) -> Request,
 ) -> Result<i32> {
     let r = parse_remote(url)?;
-    let spec = spec_from_url(&r, overrides)?;
+    let spec = spec_from_url(&r, cfg_file, overrides)?;
     let req = build(&r.path);
     with_connection(&spec, |session| {
         let resp = session.request_response(&req)?;
         // Special-case Response::Path for Pwd / Stat-like reads:
         // print the value so the user actually sees something.
+        // Both the path and the directory entry names are
+        // server-supplied; strip terminal escapes before printing.
         if let Response::Path(p) = &resp {
-            println!("{p}");
+            println!("{}", sanitize_for_terminal(p));
         } else if let Response::DirListing { entries, .. } = &resp {
             for e in entries {
                 println!(
                     "{} {} {}",
                     if e.is_dir() { 'd' } else { '-' },
                     e.size,
-                    e.name
+                    sanitize_for_terminal(&e.name)
                 );
             }
         }
@@ -320,9 +353,9 @@ fn run_remote_oneshot(
     })
 }
 
-fn run_stat(url: &str, overrides: &Overrides) -> Result<i32> {
+fn run_stat(url: &str, cfg_file: &ConfigFile, overrides: &Overrides) -> Result<i32> {
     let r = parse_remote(url)?;
-    let spec = spec_from_url(&r, overrides)?;
+    let spec = spec_from_url(&r, cfg_file, overrides)?;
     let req = Request::Stat {
         path: r.path.clone(),
     };
@@ -341,17 +374,22 @@ fn run_stat(url: &str, overrides: &Overrides) -> Result<i32> {
     })
 }
 
-fn run_rename(from_url: &str, to_url: &str, overrides: &Overrides) -> Result<i32> {
+fn run_rename(
+    from_url: &str,
+    to_url: &str,
+    cfg_file: &ConfigFile,
+    overrides: &Overrides,
+) -> Result<i32> {
     let from = parse_remote(from_url)?;
     let to = parse_remote(to_url)?;
-    if from.host_port != to.host_port {
+    if from.target != to.target {
         return Err(anyhow!(
             "rename across hosts is not supported ({} vs {})",
-            from.host_port,
-            to.host_port
+            from.target,
+            to.target
         ));
     }
-    let spec = spec_from_url(&from, overrides)?;
+    let spec = spec_from_url(&from, cfg_file, overrides)?;
     let req = Request::Rename {
         from: from.path.clone(),
         to: to.path.clone(),
@@ -368,6 +406,7 @@ fn run_get(
     recursive: bool,
     clobber: ClobberPolicy,
     dry_run: bool,
+    cfg_file: &ConfigFile,
     overrides: &Overrides,
 ) -> Result<i32> {
     if recursive {
@@ -381,7 +420,7 @@ fn run_get(
         ));
     }
     let r = parse_remote(remote_url)?;
-    let spec = spec_from_url(&r, overrides)?;
+    let spec = spec_from_url(&r, cfg_file, overrides)?;
     let local_path = match local {
         Some(p) => PathBuf::from(p),
         None => {
@@ -494,6 +533,7 @@ fn run_put(
     recursive: bool,
     clobber: ClobberPolicy,
     dry_run: bool,
+    cfg_file: &ConfigFile,
     overrides: &Overrides,
 ) -> Result<i32> {
     if locals.is_empty() {
@@ -506,7 +546,7 @@ fn run_put(
         ));
     }
     let r = parse_remote(remote_url)?;
-    let spec = spec_from_url(&r, overrides)?;
+    let spec = spec_from_url(&r, cfg_file, overrides)?;
 
     // The remote URL path can be either a directory (every local
     // file lands under it with its original basename) or a single
@@ -664,4 +704,120 @@ fn prompt_overwrite(target: &str) -> Result<bool> {
 
 fn flush_stdout() {
     let _ = std::io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConfigFile, Overrides};
+
+    #[test]
+    fn parse_remote_url_splits_target_and_path() {
+        let r = parse_remote("qftp://files.example:9000/data/x").unwrap();
+        assert_eq!(r.target, "qftp://files.example:9000");
+        assert_eq!(r.path, "/data/x");
+    }
+
+    #[test]
+    fn parse_remote_url_with_user_preserves_user_in_target() {
+        let r = parse_remote("qftp://alice@h:4433/p").unwrap();
+        assert_eq!(r.target, "qftp://alice@h:4433");
+        assert_eq!(r.path, "/p");
+    }
+
+    #[test]
+    fn parse_remote_url_without_path_defaults_to_root() {
+        let r = parse_remote("qftp://h:4433").unwrap();
+        assert_eq!(r.target, "qftp://h:4433");
+        assert_eq!(r.path, "/");
+    }
+
+    #[test]
+    fn parse_remote_alias_with_path() {
+        let r = parse_remote("work:/dst/file").unwrap();
+        assert_eq!(r.target, "work");
+        assert_eq!(r.path, "/dst/file");
+    }
+
+    #[test]
+    fn parse_remote_bare_alias_defaults_to_root() {
+        let r = parse_remote("work").unwrap();
+        assert_eq!(r.target, "work");
+        assert_eq!(r.path, "/");
+    }
+
+    #[test]
+    fn parse_remote_empty_alias_is_error() {
+        assert!(parse_remote(":/dst").is_err());
+    }
+
+    /// #307: a one-shot alias target must resolve against the loaded
+    /// config file (endpoint / ca / server_name), not an empty default.
+    #[test]
+    fn spec_from_url_resolves_alias_from_config() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+                [host.work]
+                endpoint = "qftps://files.work.example:9000"
+                ca = "/etc/qftp/ca.pem"
+                server_name = "custom-sni.example"
+            "#,
+        )
+        .unwrap();
+        let r = parse_remote("work:/data").unwrap();
+        let spec = spec_from_url(&r, &cfg, &Overrides::default()).unwrap();
+        assert_eq!(spec.host, "files.work.example:9000");
+        assert_eq!(spec.server_name, "custom-sni.example");
+        assert_eq!(spec.ca.as_deref(), Some("/etc/qftp/ca.pem"));
+        // The remote operation path comes from the alias suffix.
+        assert_eq!(r.path, "/data");
+    }
+
+    /// #306/#307: CLI overrides still win over an alias's config fields.
+    #[test]
+    fn spec_from_url_overrides_beat_alias() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+                [host.work]
+                endpoint = "qftps://files.work.example:9000"
+            "#,
+        )
+        .unwrap();
+        let overrides = Overrides {
+            ca: Some("/tmp/override-ca.pem".to_string()),
+            insecure: Some(true),
+            ..Overrides::default()
+        };
+        let r = parse_remote("work").unwrap();
+        let spec = spec_from_url(&r, &cfg, &overrides).unwrap();
+        assert_eq!(spec.ca.as_deref(), Some("/tmp/override-ca.pem"));
+        assert!(spec.insecure);
+    }
+
+    /// A URL one-shot target ignores the config-file aliases and uses
+    /// the URL host directly.
+    #[test]
+    fn spec_from_url_url_target_uses_url_host() {
+        let cfg = ConfigFile::default();
+        let r = parse_remote("qftp://example.com:5555/data").unwrap();
+        let spec = spec_from_url(&r, &cfg, &Overrides::default()).unwrap();
+        assert_eq!(spec.host, "example.com:5555");
+        assert_eq!(spec.server_name, "example.com");
+    }
+
+    /// #308: server-supplied error messages are stripped of terminal
+    /// escapes when reported by the one-shot status path.
+    #[test]
+    fn report_response_sanitizes_error_message() {
+        use qftp_common::protocol::{ErrorCode, ErrorResponse};
+        // We can't capture stderr easily here, but we can at least
+        // assert the sanitizer the path uses neutralizes escapes.
+        let raw = "boom\x1b]0;pwned\x07\x1b[2J";
+        let cleaned = sanitize_for_terminal(raw);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(!cleaned.contains('\x07'));
+        // And the status code mapping is unaffected by the message.
+        let resp = Response::Err(ErrorResponse::new(ErrorCode::PermissionDenied, raw));
+        assert_eq!(report_response_for_status(&resp), exit::NOPERM);
+    }
 }

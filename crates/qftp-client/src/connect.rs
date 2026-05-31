@@ -204,25 +204,18 @@ fn try_connect(
     // first Initial can carry early data. A rejected ticket falls back
     // to 1-RTT; the stale blob is forgotten so it isn't replayed.
     let mut resumed = false;
-    if opts.zero_rtt {
-        let dir = opts.ticket_dir.clone().or_else(session_store::default_dir);
-        if let Some(dir) = &dir {
-            if let Some(ticket) =
-                session_store::load(dir, &spec.host, opts.expected_cert_fingerprint.as_ref())
-            {
-                match conn.set_session(&ticket) {
-                    Ok(()) => {
-                        resumed = true;
-                        tracing::info!(host = %spec.host, "0-RTT: resuming session");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = ?e,
-                            "stale session ticket; falling back to 1-RTT"
-                        );
-                        let _ = session_store::forget(dir, &spec.host);
-                    }
-                }
+    if let Some((dir, ticket)) = resume_ticket(opts, &spec.host) {
+        match conn.set_session(&ticket) {
+            Ok(()) => {
+                resumed = true;
+                tracing::info!(host = %spec.host, "0-RTT: resuming session");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "stale session ticket; falling back to 1-RTT"
+                );
+                let _ = session_store::forget(&dir, &spec.host);
             }
         }
     }
@@ -292,13 +285,39 @@ fn try_connect(
     })
 }
 
+/// Decide whether — and which — stored 0-RTT ticket to offer for `host`.
+///
+/// Returns `Some((ticket_dir, ticket_bytes))` only when 0-RTT is enabled
+/// and a fresh ticket is found; the dir is returned so the caller can
+/// `forget` it if quiche later rejects the blob in `set_session`.
+///
+/// This is the security-critical resumption seam: in TOFU mode
+/// `opts.expected_cert_fingerprint` is the pinned known_hosts value and
+/// is threaded straight into `session_store::load`, so a ticket is only
+/// resumed against the same server identity it was saved for. Dropping
+/// that argument here would let a repointed host replay a stolen ticket;
+/// keeping the load behind `opts.zero_rtt` lets `--no-zero-rtt` disable
+/// resumption entirely.
+fn resume_ticket(opts: &EstablishOpts, host: &str) -> Option<(PathBuf, Vec<u8>)> {
+    if !opts.zero_rtt {
+        return None;
+    }
+    let dir = opts
+        .ticket_dir
+        .clone()
+        .or_else(session_store::default_dir)?;
+    let ticket = session_store::load(&dir, host, opts.expected_cert_fingerprint.as_ref())?;
+    Some((dir, ticket))
+}
+
 /// Check whether the DER-encoded leaf certificate identifies `host`.
 ///
 /// Follows RFC 6125 / 9525: a literal IP target is matched only against
 /// SAN iPAddress entries; a DNS target is matched against SAN dNSName
 /// entries (with a single left-most wildcard label), and the Subject CN
 /// is consulted only as a legacy fallback when the certificate carries
-/// no dNSName SANs at all.
+/// no SAN extension at all. A SAN extension that lists only non-dNSName
+/// entries still disables the CN fallback.
 fn cert_matches_hostname(der: &[u8], host: &str) -> bool {
     use x509_parser::prelude::*;
 
@@ -316,7 +335,7 @@ fn cert_matches_hostname(der: &[u8], host: &str) -> bool {
         // forbid the CN fallback; fail closed rather than fall through.
         DnsSanVerdict::FailClosed => false,
         DnsSanVerdict::DnsSanPresentNoMatch => false,
-        // Legacy CN fallback only when no dNSName SAN constrains the cert.
+        // Legacy CN fallback only when no SAN extension constrains the cert.
         DnsSanVerdict::NoDnsSan => match_cn_fallback(&cert, host),
     }
 }
@@ -342,10 +361,14 @@ fn match_ip_san(cert: &x509_parser::certificate::X509Certificate, ip: &std::net:
 enum DnsSanVerdict {
     /// A dNSName SAN matched the host.
     Matched,
-    /// One or more dNSName SANs were present but none matched. The CN
-    /// fallback must NOT run -- a present SAN constrains the cert.
+    /// A SAN extension was present (with or without dNSName entries) but
+    /// none matched the host. The CN fallback must NOT run -- once a SAN
+    /// extension exists it is authoritative for identity (RFC 6125 /
+    /// 9525), so a cert whose SAN lists only unrelated entries (e.g.
+    /// iPAddress / rfc822Name and no dNSName) must not be authenticated
+    /// for a DNS host via a matching legacy CN.
     DnsSanPresentNoMatch,
-    /// No dNSName SAN present at all. The CN fallback may run.
+    /// No SAN extension present at all. The CN fallback may run.
     NoDnsSan,
     /// The SAN extension could not be parsed; fail closed (an
     /// unparseable SAN may carry a dNSName that would forbid the CN
@@ -358,12 +381,14 @@ enum DnsSanVerdict {
 /// gate the legacy CN fallback and fail closed on a parse error.
 fn match_dns_san(cert: &x509_parser::certificate::X509Certificate, host: &str) -> DnsSanVerdict {
     use x509_parser::prelude::*;
-    let mut had_dns_san = false;
+    let mut san_present = false;
     match cert.subject_alternative_name() {
         Ok(Some(san)) => {
+            // The extension itself is present: this alone disables the CN
+            // fallback, regardless of whether it carries any dNSName.
+            san_present = true;
             for gn in &san.value.general_names {
                 if let GeneralName::DNSName(pat) = gn {
-                    had_dns_san = true;
                     if dns_name_matches(pat, host) {
                         return DnsSanVerdict::Matched;
                     }
@@ -373,7 +398,7 @@ fn match_dns_san(cert: &x509_parser::certificate::X509Certificate, host: &str) -
         Ok(None) => {}
         Err(_) => return DnsSanVerdict::FailClosed,
     }
-    if had_dns_san {
+    if san_present {
         DnsSanVerdict::DnsSanPresentNoMatch
     } else {
         DnsSanVerdict::NoDnsSan
@@ -381,7 +406,7 @@ fn match_dns_san(cert: &x509_parser::certificate::X509Certificate, host: &str) -
 }
 
 /// Legacy Subject CN fallback. Only consulted when the cert carries no
-/// dNSName SAN at all (see `match_dns_san`).
+/// SAN extension at all (see `match_dns_san`).
 fn match_cn_fallback(cert: &x509_parser::certificate::X509Certificate, host: &str) -> bool {
     for attr in cert.subject().iter_common_name() {
         if let Ok(cn) = attr.as_str() {
@@ -497,6 +522,31 @@ mod tests {
     }
 
     #[test]
+    fn ip_only_san_disables_cn_fallback_for_dns_host() {
+        // CWE-295 / RFC 6125 §6.4.4: a SAN extension that is present but
+        // carries no dNSName (here only an iPAddress) is still
+        // authoritative for identity. A DNS-host connection must NOT be
+        // authenticated by a matching legacy CN when any SAN extension
+        // exists. Before the fix the empty-dNSName case fell through to
+        // the CN.
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("rcgen new");
+        params.subject_alt_names = vec![SanType::IpAddress("192.0.2.1".parse().unwrap())];
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "target.example.com");
+        params.distinguished_name = dn;
+        let key = KeyPair::generate().expect("rcgen keypair");
+        let der = params
+            .self_signed(&key)
+            .expect("self_signed")
+            .der()
+            .to_vec();
+        // SAN present (iPAddress only) -> CN must not rescue the DNS host.
+        assert!(!cert_matches_hostname(&der, "target.example.com"));
+        // The iPAddress SAN itself still authenticates the IP target.
+        assert!(cert_matches_hostname(&der, "192.0.2.1"));
+    }
+
+    #[test]
     fn cn_fallback_only_without_dns_san() {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("rcgen new");
         let mut dn = rcgen::DistinguishedName::new();
@@ -571,5 +621,92 @@ mod tests {
     fn garbage_cert_never_matches() {
         assert!(!cert_matches_hostname(b"not a cert", "example.com"));
         assert!(!cert_matches_hostname(&[], "example.com"));
+    }
+
+    // ---- 0-RTT resume wiring (try_connect's resume_ticket seam) ----
+
+    fn opts_with(zero_rtt: bool, dir: &std::path::Path, fp: Option<[u8; 32]>) -> EstablishOpts {
+        EstablishOpts {
+            verify_peer: true,
+            zero_rtt,
+            ticket_dir: Some(dir.to_path_buf()),
+            expected_cert_fingerprint: fp,
+        }
+    }
+
+    #[test]
+    fn resume_ticket_skipped_when_zero_rtt_disabled() {
+        // --no-zero-rtt: even with a fresh ticket on disk, none is
+        // offered, so set_session is never reached.
+        let tmp = tempfile::TempDir::new().unwrap();
+        session_store::save(tmp.path(), "host:4433", Some(b"opaque"), &[0u8; 32]).unwrap();
+        assert!(resume_ticket(&opts_with(false, tmp.path(), None), "host:4433").is_none());
+    }
+
+    #[test]
+    fn resume_ticket_returns_dir_and_bytes_when_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        session_store::save(tmp.path(), "host:4433", Some(b"opaque"), &[0u8; 32]).unwrap();
+        let got = resume_ticket(&opts_with(true, tmp.path(), None), "host:4433");
+        let (dir, ticket) = got.expect("ticket should be offered");
+        // The returned dir is the one forget() will target on a
+        // set_session error.
+        assert_eq!(dir, tmp.path());
+        assert_eq!(ticket, b"opaque");
+    }
+
+    #[test]
+    fn resume_ticket_threads_matching_fingerprint() {
+        // A TOFU caller's pinned fingerprint that matches the stored
+        // binding still resumes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut fp = [0u8; 32];
+        fp[0] = 0xab;
+        session_store::save(tmp.path(), "host:4433", Some(b"opaque"), &fp).unwrap();
+        let got = resume_ticket(&opts_with(true, tmp.path(), Some(fp)), "host:4433");
+        assert_eq!(got.map(|(_, t)| t), Some(b"opaque".to_vec()));
+    }
+
+    #[test]
+    fn resume_ticket_drops_on_fingerprint_mismatch() {
+        // The security-critical seam: a pinned fingerprint that does NOT
+        // match the stored binding (DNS repoint / cert rotation) yields
+        // no ticket, so a stolen ticket is never replayed against a
+        // repointed host. A regression that dropped
+        // expected_cert_fingerprint would resume here and fail this.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut saved_fp = [0u8; 32];
+        saved_fp[0] = 0xab;
+        session_store::save(tmp.path(), "host:4433", Some(b"opaque"), &saved_fp).unwrap();
+        let mut wrong = [0u8; 32];
+        wrong[0] = 0xcd;
+        assert!(
+            resume_ticket(&opts_with(true, tmp.path(), Some(wrong)), "host:4433").is_none(),
+            "mismatched pin must not offer a ticket"
+        );
+        // And the bad ticket was purged so it isn't re-offered.
+        assert!(!session_store::ticket_path(tmp.path(), "host:4433").exists());
+    }
+
+    #[test]
+    fn resume_ticket_none_when_no_ticket_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(resume_ticket(&opts_with(true, tmp.path(), None), "host:4433").is_none());
+    }
+
+    #[test]
+    fn forget_clears_ticket_on_set_session_error_path() {
+        // Mirrors the do-on-set_session-error branch: when quiche rejects
+        // the ticket, the stored blob is forgotten so the next connect
+        // doesn't replay it. We can't drive quiche's set_session to fail
+        // in a unit test, so assert the forget() the error arm calls
+        // actually removes the ticket the resume_ticket seam returned.
+        let tmp = tempfile::TempDir::new().unwrap();
+        session_store::save(tmp.path(), "host:4433", Some(b"opaque"), &[0u8; 32]).unwrap();
+        let (dir, _ticket) =
+            resume_ticket(&opts_with(true, tmp.path(), None), "host:4433").unwrap();
+        session_store::forget(&dir, "host:4433").unwrap();
+        assert!(!session_store::ticket_path(tmp.path(), "host:4433").exists());
+        assert!(resume_ticket(&opts_with(true, tmp.path(), None), "host:4433").is_none());
     }
 }

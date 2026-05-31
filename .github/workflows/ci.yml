@@ -62,6 +62,13 @@ jobs:
       - name: Test web/blake3.js against Rust blake3 vectors
         run: node web/blake3.test.js
 
+      # The browser client hand-rolls the bincode wire codec in app.js.
+      # This pins it to the same golden vectors the Rust impl is checked
+      # against, so a future wire-format change can't silently desync the
+      # JS encoder/decoder (see Issue #304 / #310).
+      - name: Test web/app.js codec against conformance vectors
+        run: node web/wire.test.js
+
   deny:
     name: cargo-deny (advisories / licenses / sources)
     runs-on: ubuntu-latest

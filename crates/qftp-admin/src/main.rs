@@ -264,6 +264,32 @@ fn init_users(path: &Path) -> Result<()> {
 }
 
 fn add_user(path: &Path, name: &str, home: Option<&Path>, perms: Perms) -> Result<()> {
+    // Validate before any file I/O so bad input fails fast.
+    // The server keys `by_name` on the raw spec name but resolves
+    // connections via `cn.trim()` (qftp-protocol/src/user.rs), so a
+    // name with surrounding whitespace would be stored un-trimmed yet
+    // looked up trimmed and never match; an empty name is unusable too.
+    if name.is_empty() || name != name.trim() {
+        bail!("user name must be non-empty and contain no leading/trailing whitespace");
+    }
+    // `anonymous` is the server's reserved fallback identity (the
+    // top-level `[anonymous]` key); a `[[users]]` entry by that name is
+    // never resolvable as that user, so reject it.
+    if name == "anonymous" {
+        bail!("user name 'anonymous' is reserved");
+    }
+
+    // Reject non-UTF-8 homes instead of lossily coercing them: the
+    // server reads `home` as a string, so writing a U+FFFD-mangled path
+    // would silently denote a different (or invalid) location.
+    let home = match home {
+        Some(h) => Some(
+            h.to_str()
+                .ok_or_else(|| anyhow!("--home is not valid UTF-8"))?,
+        ),
+        None => None,
+    };
+
     let mut doc = load_or_default(path)?;
     let users = ensure_users_array(&mut doc)?;
 
@@ -274,7 +300,7 @@ fn add_user(path: &Path, name: &str, home: Option<&Path>, perms: Perms) -> Resul
     let mut table = toml_edit::Table::new();
     table.insert("name", toml_edit::value(name));
     if let Some(h) = home {
-        table.insert("home", toml_edit::value(h.to_string_lossy().to_string()));
+        table.insert("home", toml_edit::value(h));
     }
     table.insert(
         "permissions",
@@ -721,5 +747,100 @@ mod tests {
         init_users(&p).unwrap();
         let err = set_quota(&p, "anyone", Some(i64::MAX as u64 + 1)).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "got: {err}");
+    }
+
+    fn ro_perms() -> Perms {
+        Perms {
+            read: true,
+            write: false,
+            delete: false,
+            mkdir: false,
+            rmdir: false,
+            rename: false,
+            chmod: false,
+        }
+    }
+
+    #[test]
+    fn add_user_rejects_empty_name() {
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        let err = add_user(&p, "", None, ro_perms()).unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "got: {err}");
+        // Nothing should have been written for the rejected name.
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(cfg.users.is_empty());
+    }
+
+    #[test]
+    fn add_user_rejects_padded_name() {
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        let err = add_user(&p, " alice", None, ro_perms()).unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "got: {err}");
+        let err = add_user(&p, "alice\t", None, ro_perms()).unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "got: {err}");
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(cfg.users.is_empty());
+    }
+
+    #[test]
+    fn add_user_rejects_reserved_anonymous() {
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        let err = add_user(&p, "anonymous", None, ro_perms()).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(cfg.users.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_user_rejects_non_utf8_home() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        init_users(&p).unwrap();
+        let bad = Path::new(std::ffi::OsStr::from_bytes(&[0xff, 0xfe]));
+        let err = add_user(&p, "alice", Some(bad), ro_perms()).unwrap_err();
+        assert!(err.to_string().contains("valid UTF-8"), "got: {err}");
+        // The user must not have been added with a mangled home.
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(cfg.users.is_empty());
+    }
+
+    #[test]
+    fn set_permissions_preserves_subtable_form() {
+        // A hand-edited standard sub-table (`[users.permissions]`) must be
+        // lifted into an inline table without dropping pre-existing flags
+        // (exercises the `Item::Table` arm in set_permissions, which
+        // add_user's inline-table output never reaches).
+        let d = tmp();
+        let p = d.path().join("users.toml");
+        let body = "\
+[[users]]
+name = \"alice\"
+
+[users.permissions]
+read = true
+";
+        std::fs::write(&p, body).unwrap();
+        set_permissions(
+            &p,
+            "alice",
+            PartialPerms {
+                write: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cfg: UserConfig = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        // Pre-existing read survives the lift; the new write is applied.
+        assert!(cfg.users[0].permissions.read);
+        assert!(cfg.users[0].permissions.write);
+        assert!(!cfg.users[0].permissions.delete);
     }
 }

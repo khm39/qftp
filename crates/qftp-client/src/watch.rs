@@ -325,16 +325,33 @@ fn run_session(
             };
             match action {
                 Action::Upload => {
-                    if !path.is_file() {
-                        // create-then-delete arrived in the same
-                        // window; skip silently.
+                    // Upload through the *canonical* (fully symlink-
+                    // resolved) path, not the raw event path. The raw
+                    // `path` may have a symlink component that points
+                    // outside `canonical_root`; we already confirmed
+                    // `canonical` stays under the root, so opening it
+                    // closes the canonicalize-then-open TOCTOU window
+                    // where a planted symlink could redirect the open to
+                    // an out-of-tree file (e.g. ~/.ssh/id_rsa). The
+                    // regular-file gate below operates on the resolved
+                    // leaf via `symlink_metadata`, not a symlink target.
+                    let Some(upload_path) = resolve_upload_target(&canonical, &canonical_root)
+                    else {
+                        // create-then-delete in the same window, the
+                        // resolved leaf is not a regular file, or it
+                        // escapes the root; skip silently.
                         continue;
-                    }
+                    };
                     let stream_id = session.take_stream();
-                    if let Err(e) =
-                        transfer::do_put(&mut session, stream_id, &path, &remote_path, 0, false)
-                    {
-                        tracing::warn!(error = %e, path = %path.display(), "watch: put failed");
+                    if let Err(e) = transfer::do_put(
+                        &mut session,
+                        stream_id,
+                        &upload_path,
+                        &remote_path,
+                        0,
+                        false,
+                    ) {
+                        tracing::warn!(error = %e, path = %upload_path.display(), "watch: put failed");
                     } else {
                         tracing::info!(path = %remote_path, "watch: uploaded");
                     }
@@ -370,6 +387,29 @@ fn run_session(
     }
 }
 
+/// Decide the concrete path to open for an upload.
+///
+/// `canonical` is the fully symlink-resolved real path of the event;
+/// `canonical_root` is the resolved watched root. Returns the path to
+/// hand to `do_put` (the resolved real path, which has no remaining
+/// symlink components, so opening it cannot be redirected out of the
+/// tree by a planted symlink), or `None` when the event should be
+/// skipped because:
+///   - the real path escaped the watched root (defense in depth: the
+///     caller already checked, but a symlink-upload must never leak an
+///     out-of-tree file), or
+///   - the resolved leaf is not a regular file (a directory, FIFO, or a
+///     create-then-delete that vanished within the debounce window).
+fn resolve_upload_target(canonical: &Path, canonical_root: &Path) -> Option<PathBuf> {
+    if !canonical.starts_with(canonical_root) {
+        return None;
+    }
+    match std::fs::symlink_metadata(canonical) {
+        Ok(m) if m.file_type().is_file() => Some(canonical.to_path_buf()),
+        _ => None,
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -396,5 +436,82 @@ mod tests {
             assert!(int_blocked, "block_signals must block SIGINT");
             assert!(term_blocked, "block_signals must block SIGTERM");
         }
+    }
+
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    // Resolve `p` the way run_session does (canonicalize the raw event
+    // path), then run the upload-target gate.
+    fn gate(p: &Path, root: &Path) -> Option<PathBuf> {
+        let canonical = p.canonicalize().ok()?;
+        resolve_upload_target(&canonical, root)
+    }
+
+    #[test]
+    fn upload_target_accepts_in_tree_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let f = root.join("a.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        assert_eq!(gate(&f, &root), Some(f.clone()));
+    }
+
+    #[test]
+    fn upload_target_rejects_symlink_escaping_root() {
+        // The core fix: a symlink planted *inside* the watched root that
+        // points at a file *outside* the root must never be uploaded.
+        // Its resolved real path escapes the root, so the gate drops it
+        // instead of opening the out-of-tree target.
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("id_rsa");
+        std::fs::write(&secret, b"PRIVATE KEY").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let link = root.join("leak");
+        symlink(&secret, &link).unwrap();
+
+        // The raw event path (the symlink) resolves to the out-of-tree
+        // secret; the gate must reject it.
+        assert_eq!(gate(&link, &root), None);
+    }
+
+    #[test]
+    fn upload_target_resolves_in_tree_symlink_to_real_path() {
+        // A symlink inside the root that points to another in-tree
+        // regular file is allowed, but the path returned for opening is
+        // the *resolved* real file, not the symlink -- so do_put's
+        // File::open can't be redirected by a later symlink swap.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let real = root.join("real.txt");
+        std::fs::write(&real, b"hi").unwrap();
+        let link = root.join("alias");
+        symlink(&real, &link).unwrap();
+        assert_eq!(gate(&link, &root), Some(real.clone()));
+    }
+
+    #[test]
+    fn upload_target_rejects_directory() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(gate(&sub, &root), None);
+    }
+
+    #[test]
+    fn upload_target_rejects_path_outside_root() {
+        // Defense in depth: a canonical path that is simply not under
+        // the root is dropped even though it is a real regular file.
+        let outside = TempDir::new().unwrap();
+        let f = outside.path().join("x.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        let canonical = f.canonicalize().unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert_eq!(resolve_upload_target(&canonical, &root), None);
     }
 }

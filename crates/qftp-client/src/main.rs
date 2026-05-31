@@ -35,7 +35,7 @@ const LONG_VERSION: &str = concat!(
     env!("TARGET_TRIPLE"),
 );
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "qftp-client",
     about = "QUIC File Transfer Protocol Client",
@@ -49,7 +49,6 @@ const LONG_VERSION: &str = concat!(
         (put / get / ls / rm / mkdir / rmdir / rename / stat), it performs the \
         single operation and exits."
 )]
-#[command(args_conflicts_with_subcommands = true)]
 struct Args {
     #[command(subcommand)]
     command: Option<OneShot>,
@@ -60,42 +59,42 @@ struct Args {
     target: Option<String>,
     /// Path to the client config file. Defaults to
     /// `~/.qftp/config.toml`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Override host (and optionally port) as `ip:port`. Beats URL /
     /// alias.
-    #[arg(long)]
+    #[arg(long, global = true)]
     host: Option<String>,
     /// Override SNI / certificate name expected on the server cert.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server_name: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     ca: Option<String>,
     /// Skip server certificate verification. Development only.
-    #[arg(long)]
+    #[arg(long, global = true)]
     insecure: bool,
     /// Pin the server's TLS leaf certificate on first connect
     /// (SSH-style known_hosts). Subsequent connects refuse to
     /// continue if the fingerprint changes. Use this instead of
     /// `--insecure` when there is no CA infrastructure.
-    #[arg(long = "trust-on-first-use", short = 'T')]
+    #[arg(long = "trust-on-first-use", short = 'T', global = true)]
     trust_on_first_use: bool,
     /// Override the known_hosts file location.
     /// Defaults to `~/.qftp/known_hosts`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     known_hosts: Option<PathBuf>,
     /// Disable 0-RTT session resumption. The client will still
     /// receive new tickets but won't replay them. Useful for
     /// debugging and when you need to ensure a fresh handshake.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     no_zero_rtt: bool,
     /// Override the session-ticket directory.
     /// Defaults to `~/.qftp/session-tickets/`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     session_ticket_dir: Option<PathBuf>,
-    #[arg(long, requires = "client_key")]
+    #[arg(long, requires = "client_key", global = true)]
     client_cert: Option<String>,
-    #[arg(long, requires = "client_cert")]
+    #[arg(long, requires = "client_cert", global = true)]
     client_key: Option<String>,
     /// Run a single command non-interactively and exit. Repeatable.
     #[arg(long = "execute", short = 'e')]
@@ -109,16 +108,16 @@ struct Args {
     #[arg(long)]
     history: Option<PathBuf>,
     /// Quiet mode: hide progress bars, print errors only.
-    #[arg(long, short = 'q', default_value_t = false)]
+    #[arg(long, short = 'q', default_value_t = false, global = true)]
     quiet: bool,
     /// Increase log verbosity. `-v` info, `-vv` debug, `-vvv` trace.
     /// Beats `RUST_LOG`.
-    #[arg(long, short = 'v', action = clap::ArgAction::Count)]
+    #[arg(long, short = 'v', action = clap::ArgAction::Count, global = true)]
     verbose: u8,
     /// Throttle uploads to this byte rate. Accepts K/M/G (SI) or
     /// Ki/Mi/Gi (binary) suffixes; `0` (default) is unlimited.
     /// Examples: `--bwlimit 5M` = 5 MB/s, `--bwlimit 100Ki`.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "0", global = true)]
     bwlimit: String,
     /// Print a shell-completion script to stdout and exit.
     /// Pipe it into the right place for your shell, e.g.
@@ -137,15 +136,16 @@ struct Args {
 ///   * 64 = usage error (bad URL, missing argument)
 ///   * 65 = data / transfer error (network, ACL, checksum)
 ///   * 77 = auth failure (mTLS / TOFU mismatch)
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum OneShot {
     /// Upload one or more local files to a remote URL.
     Put {
-        /// Local path(s). Globs are expanded by the shell or, when
-        /// quoted, by qftp itself.
-        local: Vec<String>,
-        /// Destination `qftp://host[:port]/path`. The last argument.
+        /// Destination `qftp://host[:port]/path`.
         remote: String,
+        /// Local path(s). Globs are expanded by the shell or, when
+        /// quoted, by qftp itself. Trailing positional (clap requires a
+        /// variadic `Vec` to come after any required positionals).
+        local: Vec<String>,
         /// Recurse into directories.
         #[arg(short = 'r', long)]
         recursive: bool,
@@ -307,7 +307,18 @@ fn main() -> Result<()> {
     // One-shot subcommand path. Bypasses the REPL entirely and exits
     // with a sysexits-style code so shell scripts can branch.
     if let Some(cmd) = args.command {
-        let code = oneshot::run(cmd, overrides)?;
+        // TOFU / known_hosts / session-ticket controls are honored only
+        // by the REPL/connect path, not by one-shot's `with_connection`.
+        // They now *parse* alongside a subcommand (global flags), so warn
+        // loudly rather than silently dropping a `-T` the user expected
+        // to pin a fingerprint.
+        if args.trust_on_first_use || args.known_hosts.is_some() {
+            eprintln!(
+                "warning: --trust-on-first-use / --known-hosts are not honored \
+                 in one-shot mode; use --ca, --insecure, or the interactive REPL"
+            );
+        }
+        let code = oneshot::run(cmd, &cfg_file, overrides)?;
         std::process::exit(code);
     }
 
@@ -456,7 +467,7 @@ fn main() -> Result<()> {
             run_one_line(&line, &mut session, &mut quit_requested, &mut local_cwd)?;
         }
     } else {
-        run_interactive(&args, &mut session, &mut local_cwd)?;
+        run_interactive(&args, &mut session, &mut quit_requested, &mut local_cwd)?;
     }
 
     if !quit_requested {
@@ -483,7 +494,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_interactive(args: &Args, session: &mut Session, local_cwd: &mut PathBuf) -> Result<()> {
+fn run_interactive(
+    args: &Args,
+    session: &mut Session,
+    quit_out: &mut bool,
+    local_cwd: &mut PathBuf,
+) -> Result<()> {
     // Tab completion wired through `ReplHelper`. Without an
     // explicit helper rustyline emits a beep on TAB; with it we get
     // first-word command completion + local-path completion for the
@@ -494,9 +510,11 @@ fn run_interactive(args: &Args, session: &mut Session, local_cwd: &mut PathBuf) 
     if let Some(p) = &hist_path {
         let _ = rl.load_history(p);
     }
-    let mut quit = false;
+    // Propagate the quit state into `main`'s `quit_requested` so a
+    // `quit`/`exit` typed in the REPL (which already sent Request::Quit)
+    // is not followed by a second polite Quit on shutdown.
     loop {
-        if quit {
+        if *quit_out {
             break;
         }
         let line = match rl.readline("qftp> ") {
@@ -510,7 +528,7 @@ fn run_interactive(args: &Args, session: &mut Session, local_cwd: &mut PathBuf) 
             }
         };
         let _ = rl.add_history_entry(&line);
-        run_one_line(&line, session, &mut quit, local_cwd)?;
+        run_one_line(&line, session, quit_out, local_cwd)?;
     }
     if let Some(p) = hist_path {
         let _ = rl.save_history(&p);
@@ -1108,6 +1126,101 @@ fn do_recursive_put(session: &mut Session, local: &Path, remote_root: &str) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Args, OneShot};
+    use clap::{CommandFactory, Parser};
+
+    /// clap's own structural self-check. Catches, among other things,
+    /// a non-required variadic positional placed before a required one
+    /// (the #305 regression that made `put` panic in debug builds).
+    #[test]
+    fn command_definition_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    /// `put REMOTE LOCAL...`: the remote is the first positional, the
+    /// variadic locals trail it. Regression guard for #305.
+    #[test]
+    fn put_parses_remote_then_locals() {
+        let args = Args::try_parse_from(["qftp-client", "put", "qftp://h/b", "/tmp/a"])
+            .expect("put REMOTE LOCAL must parse");
+        match args.command {
+            Some(OneShot::Put { remote, local, .. }) => {
+                assert_eq!(remote, "qftp://h/b");
+                assert_eq!(local, vec!["/tmp/a".to_string()]);
+            }
+            other => panic!("expected Put, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_parses_multiple_locals() {
+        let args =
+            Args::try_parse_from(["qftp-client", "put", "qftp://h/dir/", "/tmp/a", "/tmp/b"])
+                .expect("put REMOTE LOCAL... must parse");
+        match args.command {
+            Some(OneShot::Put { remote, local, .. }) => {
+                assert_eq!(remote, "qftp://h/dir/");
+                assert_eq!(local, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+            }
+            other => panic!("expected Put, got {other:?}"),
+        }
+    }
+
+    /// `put --help` must render without panicking. Before #305 the
+    /// debug_assert fired during arg construction, so even `--help`
+    /// crashed in debug builds.
+    #[test]
+    fn put_help_does_not_panic() {
+        let err = Args::try_parse_from(["qftp-client", "put", "--help"])
+            .expect_err("--help short-circuits to an Err(DisplayHelp)");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    /// #306: connection flags are `global = true`, so they may appear
+    /// *before* a one-shot subcommand without a usage error.
+    #[test]
+    fn global_flag_before_subcommand() {
+        let args = Args::try_parse_from(["qftp-client", "--insecure", "get", "qftp://h/b"])
+            .expect("--insecure before subcommand must parse");
+        assert!(args.insecure);
+        assert!(matches!(args.command, Some(OneShot::Get { .. })));
+    }
+
+    /// #306: the same global flags may also appear *after* the
+    /// subcommand and its positionals.
+    #[test]
+    fn global_flags_after_subcommand() {
+        let args = Args::try_parse_from([
+            "qftp-client",
+            "get",
+            "qftp://h/b",
+            "--ca",
+            "/tmp/ca.pem",
+            "--client-cert",
+            "/tmp/c.pem",
+            "--client-key",
+            "/tmp/k.pem",
+        ])
+        .expect("--ca/--client-cert/--client-key after subcommand must parse");
+        assert_eq!(args.ca.as_deref(), Some("/tmp/ca.pem"));
+        assert_eq!(args.client_cert.as_deref(), Some("/tmp/c.pem"));
+        assert_eq!(args.client_key.as_deref(), Some("/tmp/k.pem"));
+    }
+
+    /// The bare-target REPL form (no subcommand) still parses; making
+    /// the connection flags global must not break the legacy path.
+    #[test]
+    fn bare_target_without_subcommand_still_parses() {
+        let args = Args::try_parse_from(["qftp-client", "--insecure", "qftp://h/b"])
+            .expect("bare target with global flag must parse");
+        assert!(args.command.is_none());
+        assert_eq!(args.target.as_deref(), Some("qftp://h/b"));
+        assert!(args.insecure);
+    }
 }
 
 #[cfg(test)]

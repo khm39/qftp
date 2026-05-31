@@ -569,6 +569,50 @@ mod tests {
     }
 
     #[test]
+    fn trailer_buf_extend_accumulates_across_split_writes() {
+        // The 32-byte trailer arrives across multiple QUIC reads in
+        // practice, so `extend` is called incrementally. Verify it
+        // accumulates, caps the consumed count at the remaining space,
+        // reaches is_full, and refuses further bytes.
+        let mut tb = TrailerBuf::new();
+        assert_eq!(tb.remaining(), 32);
+        assert!(!tb.is_full());
+
+        // First partial write: all 20 bytes consumed.
+        let consumed = tb.extend(&[1u8; 20]);
+        assert_eq!(consumed, 20);
+        assert_eq!(tb.remaining(), 12);
+        assert!(!tb.is_full());
+
+        // Second write offers 20 but only 12 remain: capped at 12.
+        let consumed = tb.extend(&[2u8; 20]);
+        assert_eq!(consumed, 12);
+        assert_eq!(tb.remaining(), 0);
+        assert!(tb.is_full());
+
+        // The buffer holds the first 20 bytes of `1` then 12 of `2`.
+        let arr = tb.as_array();
+        assert!(arr[..20].iter().all(|&b| b == 1), "first 20 bytes");
+        assert!(arr[20..].iter().all(|&b| b == 2), "trailing 12 bytes");
+
+        // Once full, further extends consume nothing.
+        assert_eq!(tb.extend(&[3u8; 8]), 0);
+        assert!(tb.is_full());
+    }
+
+    #[test]
+    fn trailer_buf_extend_caps_oversized_first_write() {
+        // A single write larger than the whole trailer is capped at 32
+        // and the surplus is reported as not consumed.
+        let mut tb = TrailerBuf::new();
+        let consumed = tb.extend(&[9u8; 40]);
+        assert_eq!(consumed, 32);
+        assert!(tb.is_full());
+        assert_eq!(tb.remaining(), 0);
+        assert!(tb.as_array().iter().all(|&b| b == 9));
+    }
+
+    #[test]
     fn resolve_checksum_trailer_overrides_header() {
         let mut tb = TrailerBuf::new();
         tb.extend(&[7u8; 32]);

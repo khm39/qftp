@@ -508,6 +508,14 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             Err(e) => Response::Err(e),
         },
 
+        // `cursor` is destructured away (`..`): Ls pagination is wire-
+        // reserved but UNIMPLEMENTED in this reference server. The
+        // server returns the whole listing in a single page with
+        // `next_cursor: None` and rejects directories larger than
+        // MAX_DIR_ENTRIES with an Internal error (rather than silently
+        // truncating). See "Ls pagination" in spec/qftp-protocol.md and
+        // the per-page cap note in spec/wire-format.md for the documented
+        // known limitation.
         Request::Ls { path, .. } => {
             let dir: Result<Cow<Path>, ErrorResponse> = if path.is_empty() {
                 Ok(Cow::Borrowed(cwd.as_path()))
@@ -554,6 +562,12 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
                                     ),
                                 );
                             }
+                            // Known limitation: pagination is reserved
+                            // but unimplemented (see the Ls arm comment
+                            // and spec/qftp-protocol.md). A directory with
+                            // more than MAX_DIR_ENTRIES listable entries is
+                            // refused here rather than silently truncated;
+                            // such a directory is currently unlistable.
                             if listing.len() >= MAX_DIR_ENTRIES {
                                 return err(
                                     ErrorCode::Internal,
@@ -716,28 +730,51 @@ pub fn handle_request(req: &Request, cwd: &mut PathBuf, root: &Path) -> Response
             // target's size/mode/mtime. If the leaf turned into a
             // symlink between resolve() and here, refuse instead of
             // reporting on the link.
-            Ok(target) => match fs::symlink_metadata(&target) {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        return err(
-                            ErrorCode::PermissionDenied,
-                            "target became a symlink between resolve and stat (#106)",
-                        );
+            //
+            // The leaf check below catches only a swapped *final*
+            // component; `symlink_metadata` still FOLLOWS intermediate
+            // symlinks. Without the ancestor re-check every other
+            // FS-touching arm performs, an attacker who swaps a parent
+            // component to a symlink after `resolve` could make Stat
+            // report metadata of a file outside the root (#137). Run
+            // the same ancestor re-check Chmod/Rm/etc. use first.
+            //
+            // Skip the ancestor re-check when `target == root`:
+            // `check_path_safe` walks `target.parent()` up toward root
+            // and has no root self-guard (unlike `recheck_path_no_symlinks`
+            // used by Ls/Cd), so it would reject `root.parent()` as
+            // "outside root" and regress `stat .` / `stat /`. Root has no
+            // in-root ancestor to swap, and a symlinked root is still
+            // caught by the leaf `#106` check below.
+            Ok(target) => {
+                if target != root {
+                    if let Some(resp) = check_path_safe(&target, root) {
+                        return resp;
                     }
-                    let (modified, mtime_nanos) = mtime_of(&meta);
-                    let (uid, gid) = owner_of(&meta);
-                    Response::FileStat(FileStat {
-                        file_type: file_type_of(meta.file_type()),
-                        size: meta.len(),
-                        modified,
-                        mtime_nanos,
-                        uid,
-                        gid,
-                        mode: mode_of(&meta),
-                    })
                 }
-                Err(e) => err(io_code(&e), format!("stat failed: {e}")),
-            },
+                match fs::symlink_metadata(&target) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return err(
+                                ErrorCode::PermissionDenied,
+                                "target became a symlink between resolve and stat (#106)",
+                            );
+                        }
+                        let (modified, mtime_nanos) = mtime_of(&meta);
+                        let (uid, gid) = owner_of(&meta);
+                        Response::FileStat(FileStat {
+                            file_type: file_type_of(meta.file_type()),
+                            size: meta.len(),
+                            modified,
+                            mtime_nanos,
+                            uid,
+                            gid,
+                            mode: mode_of(&meta),
+                        })
+                    }
+                    Err(e) => err(io_code(&e), format!("stat failed: {e}")),
+                }
+            }
             Err(e) => Response::Err(e),
         },
 
@@ -919,6 +956,74 @@ mod tests {
             !outside.path().join("new").exists(),
             "mkdir leaked into symlink target -- TOCTOU still open"
         );
+    }
+
+    /// Stat ancestor TOCTOU: an attacker swaps a parent component for a
+    /// symlink after `resolve` returns. `fs::symlink_metadata` only
+    /// refrains from following the *leaf*; it still dereferences
+    /// intermediate symlinks. Without the ancestor re-check the Stat arm
+    /// would report metadata of a file outside the root. The re-check
+    /// must refuse the request (#137).
+    #[test]
+    fn stat_refuses_when_parent_is_symlink() {
+        let (_dir, root) = setup_root();
+        let outside = TempDir::new().unwrap();
+        // Place a secret file the attacker wants metadata for outside
+        // the root, then point the (formerly real) `sub` dir at it.
+        fs::write(outside.path().join("secret.txt"), b"top-secret").unwrap();
+        fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+        let mut cwd = root.clone();
+        let resp = handle_request(
+            &Request::Stat {
+                path: "sub/secret.txt".into(),
+            },
+            &mut cwd,
+            &root,
+        );
+        match resp {
+            Response::Err(e) => assert_eq!(e.code, ErrorCode::PermissionDenied),
+            other => panic!("expected PermissionDenied (escape via parent symlink), got {other:?}"),
+        }
+    }
+
+    /// A normal `Stat` of a clean file under the root must still succeed
+    /// after the ancestor re-check was added.
+    #[test]
+    fn stat_clean_file_still_works() {
+        let (_dir, root) = setup_root();
+        let mut cwd = root.clone();
+        let resp = handle_request(
+            &Request::Stat {
+                path: "sub/inner.txt".into(),
+            },
+            &mut cwd,
+            &root,
+        );
+        match resp {
+            Response::FileStat(s) => assert_eq!(s.size, 5),
+            other => panic!("expected FileStat, got {other:?}"),
+        }
+    }
+
+    /// `Stat` of the root directory itself (`.` / `/` when `cwd == root`)
+    /// must still return `FileStat`. The ancestor re-check walks
+    /// `target.parent()` and has no root self-guard, so it must be
+    /// skipped for `target == root` or stat-of-root regresses to
+    /// PermissionDenied.
+    #[test]
+    fn stat_root_directory_still_works() {
+        let (_dir, root) = setup_root();
+        let mut cwd = root.clone();
+        for path in [".", "/", ""] {
+            let resp = handle_request(&Request::Stat { path: path.into() }, &mut cwd, &root);
+            match resp {
+                Response::FileStat(s) => {
+                    assert_eq!(s.file_type, FileType::Directory, "path {path:?}")
+                }
+                other => panic!("expected FileStat for root path {path:?}, got {other:?}"),
+            }
+        }
     }
 
     /// cwd poisoning: a real directory the connection `Cd`'d into is

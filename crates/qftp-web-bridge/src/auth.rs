@@ -14,6 +14,7 @@
 //! the only secret gating access over this transport.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,27 +22,69 @@ use anyhow::{bail, Context, Result};
 use qftp_protocol::user::{User, UserDirectory};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+// `TokenSpec`, `TokenConfig` and `TokenDirectory` all carry raw bearer
+// tokens -- the only secret gating access over this transport (see the
+// module doc). They deliberately do *not* derive `Debug`: an
+// accidental `{:?}` (a new `tracing` field, an `expect`/panic message,
+// or a `Debug` on an enclosing type) would otherwise dump every token
+// in plaintext. The manual impls below redact the secrets.
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TokenSpec {
     token: String,
     user: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+impl fmt::Debug for TokenSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenSpec")
+            .field("token", &"<redacted>")
+            .field("user", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TokenConfig {
     #[serde(default)]
     tokens: Vec<TokenSpec>,
 }
 
+impl fmt::Debug for TokenConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenConfig")
+            .field("tokens", &self.tokens.len())
+            .finish()
+    }
+}
+
 /// Maps opaque bearer tokens to configured user names. When the
 /// directory is in the disabled state (`anonymous`), token auth is off
 /// and every session is served as the anonymous user -- mirroring the
 /// qftp-server fallback when no `--users` file is configured.
-#[derive(Debug)]
 pub struct TokenDirectory {
     by_token: Option<HashMap<String, String>>,
+}
+
+impl fmt::Debug for TokenDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The map keys are raw bearer tokens and the values are user
+        // names, so neither is printed. Expose only whether auth is on
+        // and, when it is, how many tokens are configured.
+        match &self.by_token {
+            None => f
+                .debug_struct("TokenDirectory")
+                .field("auth_enabled", &false)
+                .finish(),
+            Some(map) => f
+                .debug_struct("TokenDirectory")
+                .field("auth_enabled", &true)
+                .field("tokens", &map.len())
+                .finish(),
+        }
+    }
 }
 
 impl TokenDirectory {
@@ -206,6 +249,41 @@ mod tests {
         .unwrap();
         let err = TokenDirectory::load(&tokens_file, &users).unwrap_err();
         assert!(err.to_string().contains("ghost"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        // A `{:?}` of any token-bearing type must never leak the raw
+        // token or the user name it maps to.
+        let spec = TokenSpec {
+            token: "super-secret-token".to_string(),
+            user: "alice".to_string(),
+        };
+        let spec_dbg = format!("{spec:?}");
+        assert!(!spec_dbg.contains("super-secret-token"), "{spec_dbg}");
+        assert!(!spec_dbg.contains("alice"), "{spec_dbg}");
+
+        let cfg = TokenConfig { tokens: vec![spec] };
+        let cfg_dbg = format!("{cfg:?}");
+        assert!(!cfg_dbg.contains("super-secret-token"), "{cfg_dbg}");
+        assert!(!cfg_dbg.contains("alice"), "{cfg_dbg}");
+        assert!(
+            cfg_dbg.contains('1'),
+            "should report the token count: {cfg_dbg}"
+        );
+
+        let mut map = HashMap::new();
+        map.insert("super-secret-token".to_string(), "alice".to_string());
+        let dir = TokenDirectory {
+            by_token: Some(map),
+        };
+        let dir_dbg = format!("{dir:?}");
+        assert!(!dir_dbg.contains("super-secret-token"), "{dir_dbg}");
+        assert!(!dir_dbg.contains("alice"), "{dir_dbg}");
+        assert!(dir_dbg.contains("auth_enabled"), "{dir_dbg}");
+
+        let anon_dbg = format!("{:?}", TokenDirectory::anonymous());
+        assert!(anon_dbg.contains("false"), "{anon_dbg}");
     }
 
     #[test]

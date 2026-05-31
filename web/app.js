@@ -69,17 +69,36 @@ class Reader {
 // qftp protocol encode / decode.
 // ---------------------------------------------------------------------
 
-const ERROR_CODES = [
-  "NotFound", "PermissionDenied", "AlreadyExists", "NotADirectory",
-  "IsADirectory", "FileTooLarge", "UploadOverflow", "UploadTruncated",
-  "ChecksumMismatch", "RateLimited", "Malformed", "Internal",
-  "Unauthorized", "InvalidRange", "Unsupported", "QuotaExceeded",
-];
+// ErrorCode is encoded on the wire as a numeric u32 status (HTTP-like:
+// 4xx caller-caused, 5xx server-caused), not a positional index --
+// see ErrorCode in crates/qftp-common/src/protocol.rs. Map status to
+// name; unknown values fall back to "Unknown".
+const ERROR_CODES = {
+  400: "Malformed",
+  401: "Unauthorized",
+  403: "PermissionDenied",
+  404: "NotFound",
+  405: "Unsupported",
+  409: "AlreadyExists",
+  413: "FileTooLarge",
+  416: "InvalidRange",
+  420: "NotADirectory",
+  421: "IsADirectory",
+  422: "ChecksumMismatch",
+  423: "UploadOverflow",
+  424: "UploadTruncated",
+  429: "RateLimited",
+  430: "QuotaExceeded",
+  500: "Internal",
+};
 
 function encodeRequest(req) {
   const w = new Writer();
   switch (req.type) {
-    case "Ls": w.u32(0); w.str(req.path); break;
+    case "Ls":
+      w.u32(0); w.str(req.path);
+      if (req.cursor == null) { w.u8(0); } else { w.u8(1); w.str(req.cursor); }
+      break;
     case "Cd": w.u32(1); w.str(req.path); break;
     case "Pwd": w.u32(2); break;
     case "Get":
@@ -89,9 +108,10 @@ function encodeRequest(req) {
     case "Put":
       w.u32(4); w.str(req.path); w.u64(req.size); w.u32(req.mode);
       w.u64(req.offset || 0);
+      w.u32(0); // hash_algorithm: Blake3 (the only algorithm in qftp/1)
       w.u8(0); // checksum: None (header-checksum path unused by the web client)
       w.bool(req.noClobber || false);
-      w.bool(true); // checksum_trailer: a 32-byte BLAKE3 trailer follows the body
+      w.bool(req.checksumTrailer || false);
       break;
     case "Mkdir": w.u32(5); w.str(req.path); break;
     case "Rmdir": w.u32(6); w.str(req.path); break;
@@ -111,23 +131,55 @@ function decodeResponse(r) {
   switch (tag) {
     case 0:
       return { type: "Ok" };
-    case 1:
-      return { type: "Err", code: ERROR_CODES[r.u32()] || "Unknown", message: r.str() };
+    case 1: {
+      const status = r.u32();
+      // message, then a trailing details Option. The frame is exact-
+      // length, so leaving the (unmodelled) details tag unread is fine;
+      // we expose the numeric status so callers can branch on it even
+      // for codes this build has no name for.
+      return {
+        type: "Err",
+        status,
+        code: ERROR_CODES[status] || "Unknown",
+        message: r.str(),
+      };
+    }
     case 2: {
       const n = Number(r.u64());
       const entries = [];
       for (let i = 0; i < n; i++) {
+        const name = r.str();
+        const fileType = r.u32();
+        const size = r.u64();
+        const modified = r.u64();
+        const mtimeNanos = r.u32();
+        const uid = r.u32();
+        const gid = r.u32();
+        const mode = r.u32();
         entries.push({
-          name: r.str(), isDir: r.bool(),
-          size: r.u64(), modified: r.u64(), mode: r.u32(),
+          name, fileType, isDir: fileType === 1,
+          size, modified, mtimeNanos, uid, gid, mode,
         });
       }
-      return { type: "DirListing", entries };
+      const nextCursor = r.u8v() ? r.str() : null;
+      return { type: "DirListing", entries, nextCursor };
     }
     case 3:
       return { type: "Path", path: r.str() };
-    case 4:
-      return { type: "FileStat", size: r.u64(), isDir: r.bool(), modified: r.u64(), mode: r.u32() };
+    case 4: {
+      const fileType = r.u32();
+      const size = r.u64();
+      const modified = r.u64();
+      const mtimeNanos = r.u32();
+      const uid = r.u32();
+      const gid = r.u32();
+      const mode = r.u32();
+      return {
+        type: "FileStat",
+        fileType, isDir: fileType === 1,
+        size, modified, mtimeNanos, uid, gid, mode,
+      };
+    }
     case 5:
       return { type: "FileReady", size: r.u64(), totalSize: r.u64(), checksumFollows: r.bool() };
     case 6: {
@@ -249,10 +301,21 @@ class Qftp {
   }
 
   async list(path) {
-    const resp = await this.request({ type: "Ls", path });
-    if (resp.type === "Err") throw new QftpError(resp);
-    if (resp.type !== "DirListing") throw new Error("unexpected reply to Ls");
-    return resp.entries;
+    // Follow next_cursor across pages: a server may split a large
+    // directory into multiple DirListing responses, each carrying a
+    // cursor to echo back. A server that never paginates returns
+    // next_cursor = null and the loop ends after one round-trip.
+    const all = [];
+    let cursor = null;
+    for (;;) {
+      const resp = await this.request({ type: "Ls", path, cursor });
+      if (resp.type === "Err") throw new QftpError(resp);
+      if (resp.type !== "DirListing") throw new Error("unexpected reply to Ls");
+      for (const entry of resp.entries) all.push(entry);
+      if (resp.nextCursor == null) break;
+      cursor = resp.nextCursor;
+    }
+    return all;
   }
 
   async download(path, onProgress) {
@@ -303,6 +366,7 @@ class Qftp {
     const size = file.size;
     await writer.write(frame(encodeRequest({
       type: "Put", path, size, mode: 0o644, offset: 0, noClobber: false,
+      checksumTrailer: true,
     })));
 
     // Hash the body as it streams so the server can verify integrity
@@ -685,21 +749,33 @@ function wireUp() {
   });
 }
 
-document.addEventListener("DOMContentLoaded", async () => {
-  for (const id of ["unsupported", "login", "browser", "conn-status", "url",
-    "token", "connect", "login-error", "up", "path", "mkdir", "refresh",
-    "disconnect", "dropzone", "filepick", "transfers", "rows", "empty-dir", "log"]) {
-    el[id.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = $(id);
-  }
+// Browser bootstrap only. Guarded so this file can be `require()`d by
+// the node wire-conformance test (web/wire.test.js) without touching
+// the DOM; the codec exports below give that test its entry points.
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", async () => {
+    for (const id of ["unsupported", "login", "browser", "conn-status", "url",
+      "token", "connect", "login-error", "up", "path", "mkdir", "refresh",
+      "disconnect", "dropzone", "filepick", "transfers", "rows", "empty-dir", "log"]) {
+      el[id.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = $(id);
+    }
 
-  if (typeof WebTransport === "undefined") {
-    el.unsupported.hidden = false;
-    return;
-  }
+    if (typeof WebTransport === "undefined") {
+      el.unsupported.hidden = false;
+      return;
+    }
 
-  el.login.hidden = false;
-  await loadConfig();
-  el.url.value = "https://" + (location.hostname || "localhost")
-    + ":" + appConfig.webtransportPort + "/";
-  wireUp();
-});
+    el.login.hidden = false;
+    await loadConfig();
+    el.url.value = "https://" + (location.hostname || "localhost")
+      + ":" + appConfig.webtransportPort + "/";
+    wireUp();
+  });
+}
+
+// CommonJS export for the node test harness (web/wire.test.js).
+// `module` is undefined when this file is loaded as a browser <script>,
+// so the SPA is unaffected.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { encodeRequest, decodeResponse, ERROR_CODES, Writer, Reader, frame };
+}

@@ -56,9 +56,12 @@ pub struct RateLimiter {
     burst: f64,
     buckets: HashMap<IpKey, Bucket>,
     /// Hard cap on the number of distinct IP buckets we will track at
-    /// once. On overflow the least-recently-used bucket is dropped
-    ///, so an attacker who fills the table just under the
-    /// idle threshold cannot poison it indefinitely.
+    /// once. On overflow an idle bucket is dropped, so an attacker who
+    /// fills the table just under the idle threshold cannot poison it
+    /// indefinitely. Eviction samples a bounded set of buckets and drops
+    /// the oldest of them (see [`Self::make_room_for`]), so each insert at
+    /// capacity is O(`EVICT_SAMPLE`), not O(max_tracked); keep this cap
+    /// modest regardless.
     max_tracked: usize,
     /// Run a periodic sweep at most this often. Combined with the
     /// at-capacity LRU eviction, this keeps the table tight even if
@@ -67,6 +70,17 @@ pub struct RateLimiter {
     last_sweep: Instant,
     idle_cutoff: Duration,
 }
+
+/// Number of buckets sampled when evicting at capacity. The oldest of
+/// the sample is dropped, giving O(`EVICT_SAMPLE`) eviction instead of
+/// an O(`max_tracked`) full scan on the attack hot path. `HashMap`
+/// iteration order is seeded per process by `RandomState` and is
+/// uncorrelated with the buckets' `last` timestamps, so the leading
+/// `EVICT_SAMPLE` entries are an effectively random sample with respect
+/// to recency. When the table holds fewer than this many buckets the
+/// whole table is sampled, so eviction is exact LRU for small tables
+/// (and for the unit tests below).
+const EVICT_SAMPLE: usize = 8;
 
 struct Bucket {
     tokens: f64,
@@ -131,9 +145,16 @@ impl RateLimiter {
             .retain(|_, b| now.saturating_duration_since(b.last) < cutoff);
     }
 
-    /// When at capacity, drop the single least-recently-used
-    /// entry to make room for the new one rather than refusing the
-    /// insert. Bounded memory, fair-ish under attack.
+    /// When at capacity, drop the least-recently-used entry *among a
+    /// bounded sample* to make room for the new one rather than refusing
+    /// the insert. The previous implementation took an exact LRU victim
+    /// via a full `min_by_key` scan over every bucket; that scan ran
+    /// once per inbound Initial on the single-threaded event loop and
+    /// was O(`max_tracked`) precisely in the flood scenario that fills
+    /// the table — turning the rate limiter into its own amplifier.
+    /// Sampling the first `EVICT_SAMPLE` buckets keeps eviction O(k)
+    /// while still preferring an idle victim (approximate LRU). Bounded
+    /// memory, fair-ish under attack.
     fn make_room_for(&mut self, key: &IpKey, _now: Instant) {
         if self.buckets.len() < self.max_tracked {
             return;
@@ -144,6 +165,7 @@ impl RateLimiter {
         if let Some(oldest_key) = self
             .buckets
             .iter()
+            .take(EVICT_SAMPLE)
             .min_by_key(|(_, b)| b.last)
             .map(|(k, _)| *k)
         {
@@ -291,6 +313,61 @@ mod tests {
         assert!(!rl.buckets.contains_key(&bucket_key(a)));
         assert!(rl.buckets.contains_key(&bucket_key(b)));
         assert!(rl.buckets.contains_key(&bucket_key(c)));
+    }
+
+    #[test]
+    fn flood_never_exceeds_max_tracked() {
+        // Under a flood of distinct source IPs — the exact DoS scenario
+        // sampled eviction has to bound — the bucket table must stay
+        // capped at max_tracked no matter how many fresh sources arrive.
+        // This exercises the O(k) sampling path (len > EVICT_SAMPLE), not
+        // just the small-table exact-LRU case above.
+        let mut rl = RateLimiter::new(1000.0, 1000.0);
+        rl.max_tracked = 32;
+        for i in 0..5000u32 {
+            // Each /32 is distinct, so every call inserts a new bucket
+            // and (once full) must evict one to stay at capacity.
+            let ip = IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + i));
+            assert!(rl.try_consume(ip));
+            assert!(
+                rl.buckets.len() <= rl.max_tracked,
+                "table grew past max_tracked at i={i}: {}",
+                rl.buckets.len()
+            );
+        }
+        // After the flood the table is pinned exactly at the cap.
+        assert_eq!(rl.buckets.len(), rl.max_tracked);
+    }
+
+    #[test]
+    fn eviction_prefers_idle_over_recent_in_sample() {
+        // Sampled eviction must still bias toward dropping an idle
+        // bucket: when the whole table fits in one sample (len <=
+        // EVICT_SAMPLE) it is exact LRU. Fill just past capacity with the
+        // first inserts aged the most and confirm a recently-touched
+        // bucket survives.
+        let mut rl = RateLimiter::new(1000.0, 1000.0);
+        rl.max_tracked = EVICT_SAMPLE;
+        let mut ips = Vec::new();
+        for i in 0..EVICT_SAMPLE as u32 {
+            let ip = IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + i));
+            ips.push(ip);
+            assert!(rl.try_consume(ip));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Touch the most-recent existing bucket again so it is clearly
+        // not the eviction victim.
+        let kept = *ips.last().unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(rl.try_consume(kept));
+        // A brand new source forces an eviction; the oldest (ips[0])
+        // should go, the freshly-touched one must remain.
+        let fresh = IpAddr::V4(Ipv4Addr::from(0x0A00_1000));
+        assert!(rl.try_consume(fresh));
+        assert_eq!(rl.buckets.len(), EVICT_SAMPLE);
+        assert!(!rl.buckets.contains_key(&bucket_key(ips[0])));
+        assert!(rl.buckets.contains_key(&bucket_key(kept)));
+        assert!(rl.buckets.contains_key(&bucket_key(fresh)));
     }
 
     #[test]

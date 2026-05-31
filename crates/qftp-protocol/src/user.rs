@@ -274,10 +274,15 @@ struct WalkLogs {
 
 /// Stack-based DFS over `root`, invoking `visit` for every regular file
 /// with its `DirEntry` and `Metadata`. Directories are recursed into
-/// (LIFO order); non-regular entries (and symlink-to-non-file, since
-/// `metadata()` follows the link) are skipped. read_dir / dir-entry /
-/// metadata errors are logged via the caller-supplied `logs` and the
-/// offending node is skipped, never aborting the whole walk.
+/// (LIFO order); non-regular entries are skipped. On Unix,
+/// `DirEntry::metadata()` does **not** follow symlinks (it is the
+/// equivalent of `symlink_metadata`), so a symlink — whether it points
+/// at a file or a directory — has both `is_file()` and `is_dir()` false
+/// and is skipped wholesale. The link target is therefore never visited:
+/// no symlink-cycle infinite loop and no double-counting of the target's
+/// bytes through the link. read_dir / dir-entry / metadata errors are
+/// logged via the caller-supplied `logs` and the offending node is
+/// skipped, never aborting the whole walk.
 fn walk_directory<F>(root: &Path, logs: &WalkLogs, mut visit: F)
 where
     F: FnMut(&std::fs::DirEntry, &std::fs::Metadata),
@@ -467,6 +472,12 @@ fn resolve_home(global_root: &Path, canonical_root: &Path, spec: &UserSpec) -> R
         }
         None => global_root.join(&spec.name),
     };
+    // We must create the directory before canonicalizing: `canonicalize`
+    // requires the path to exist to resolve any `..`/symlink components,
+    // and the escape check below runs on the canonical form. Record
+    // whether the leaf already existed so an escape can clean up only a
+    // directory *we* created — never an operator's pre-existing one.
+    let pre_existed = raw.exists();
     std::fs::create_dir_all(&raw).map_err(|e| {
         UserDirectoryError::io(
             format!(
@@ -488,6 +499,13 @@ fn resolve_home(global_root: &Path, canonical_root: &Path, spec: &UserSpec) -> R
         )
     })?;
     if !canonical.starts_with(canonical_root) {
+        // A misconfigured absolute home pointing outside the root just
+        // got an empty dir created at it. Remove that stray leaf if we
+        // created it; `remove_dir` only succeeds on an empty directory,
+        // so a pre-populated path the operator pointed at is left intact.
+        if !pre_existed {
+            let _ = std::fs::remove_dir(&raw);
+        }
         return Err(UserDirectoryError::Config(format!(
             "user {} home {} escapes global root {} (#112)",
             spec.name,
@@ -622,6 +640,16 @@ impl UserDirectory {
                 build_user(spec, home)
             }
             None => {
+                // Implicit anonymous shares the global root and is
+                // built with the same invariant the explicit path
+                // relies on: `read_only()` + `quota_bytes: None`. That
+                // is why we skip the `check_home_overlap` the explicit
+                // branch runs above — the overlap check exists only to
+                // stop two independent quota counters from diverging,
+                // and a read-only, unlimited-quota user has no counter
+                // that can diverge. (If anonymous is ever given write
+                // access or a quota, this branch must gain the overlap
+                // check too.)
                 sweep_stale_partials(&canonical_root);
                 let (used, _) = walk_size(&canonical_root);
                 Arc::new(User {
@@ -841,6 +869,86 @@ mod tests {
         assert_eq!(cfg.users.len(), 1);
         let p = &cfg.users[0].permissions;
         assert!(p.read && p.write && p.delete && p.mkdir && p.rmdir && p.rename && p.chmod);
+    }
+
+    #[test]
+    fn allows_maps_each_op_to_its_own_field() {
+        // Pin the 1:1 Op->field wiring individually. full()/read_only()
+        // only check "all true" / "all false", so a swapped field (e.g.
+        // `Op::Rmdir => self.rename`) would slip past them. Here each
+        // case enables exactly the one field that op names and asserts
+        // `allows(op)` is true for that op and false for every other —
+        // catching a miswire in both directions.
+        let all_ops = [
+            Op::Read,
+            Op::Write,
+            Op::Delete,
+            Op::Mkdir,
+            Op::Rmdir,
+            Op::Rename,
+            Op::Chmod,
+        ];
+        let cases = [
+            (
+                Op::Read,
+                Permissions {
+                    read: true,
+                    ..Permissions::default()
+                },
+            ),
+            (
+                Op::Write,
+                Permissions {
+                    write: true,
+                    ..Permissions::default()
+                },
+            ),
+            (
+                Op::Delete,
+                Permissions {
+                    delete: true,
+                    ..Permissions::default()
+                },
+            ),
+            (
+                Op::Mkdir,
+                Permissions {
+                    mkdir: true,
+                    ..Permissions::default()
+                },
+            ),
+            (
+                Op::Rmdir,
+                Permissions {
+                    rmdir: true,
+                    ..Permissions::default()
+                },
+            ),
+            (
+                Op::Rename,
+                Permissions {
+                    rename: true,
+                    ..Permissions::default()
+                },
+            ),
+            (
+                Op::Chmod,
+                Permissions {
+                    chmod: true,
+                    ..Permissions::default()
+                },
+            ),
+        ];
+        for (target, perms) in cases {
+            for op in all_ops {
+                assert_eq!(
+                    perms.allows(op),
+                    op == target,
+                    "with only {target:?} enabled, allows({op:?}) should be {}",
+                    op == target,
+                );
+            }
+        }
     }
 
     #[test]
@@ -1162,6 +1270,71 @@ mod tests {
         assert!(
             err.to_string().contains("escapes") || err.to_string().contains("#112"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_does_not_leave_stray_dir_for_escaping_absolute_home() {
+        // An absolute home pointing outside the root must be rejected
+        // *and* must not leave behind the empty directory create_dir_all
+        // made before the escape check ran. We point at a fresh path
+        // inside a writable tmp (so create_dir_all succeeds) that lies
+        // outside the configured global root.
+        let root = tempfile::tempdir().unwrap();
+        let outside_parent = tempfile::tempdir().unwrap();
+        let outside = outside_parent.path().join("escapee-home");
+        assert!(!outside.exists());
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![UserSpec {
+                name: "escapee".to_string(),
+                home: Some(outside.clone()),
+                permissions: Permissions::read_only(),
+                quota_bytes: None,
+            }],
+        };
+        let err = UserDirectory::from_config(root.path(), cfg)
+            .err()
+            .expect("expected from_config to reject an escaping absolute home");
+        assert!(
+            err.to_string().contains("escapes") || err.to_string().contains("#112"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !outside.exists(),
+            "the stray home dir created before the escape check must be cleaned up"
+        );
+    }
+
+    #[test]
+    fn from_config_keeps_preexisting_dir_when_absolute_home_escapes() {
+        // If the operator pointed at an *existing* directory outside the
+        // root, rejection must not delete it — the cleanup only removes a
+        // leaf we ourselves created (and `remove_dir` only an empty one).
+        let root = tempfile::tempdir().unwrap();
+        let outside_parent = tempfile::tempdir().unwrap();
+        let outside = outside_parent.path().join("preexisting-home");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"data").unwrap();
+        let cfg = UserConfig {
+            anonymous: None,
+            users: vec![UserSpec {
+                name: "escapee".to_string(),
+                home: Some(outside.clone()),
+                permissions: Permissions::read_only(),
+                quota_bytes: None,
+            }],
+        };
+        let err = UserDirectory::from_config(root.path(), cfg)
+            .err()
+            .expect("expected from_config to reject an escaping absolute home");
+        assert!(
+            err.to_string().contains("escapes") || err.to_string().contains("#112"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            outside.join("keep.txt").exists(),
+            "a pre-existing operator directory must be left intact"
         );
     }
 

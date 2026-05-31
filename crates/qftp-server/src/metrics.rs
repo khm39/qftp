@@ -259,13 +259,46 @@ pub fn spawn(metrics: Arc<Metrics>, bind: &str, shutdown: Arc<AtomicBool>) -> Re
     Ok(())
 }
 
+/// Upper bound on concurrent in-flight metrics connections. Each accepted
+/// connection is handled on its own short-lived thread so a slow client
+/// (e.g. a slow-loris that opens a socket and never sends a request) can't
+/// stall the accept loop for the duration of its read timeout. This cap
+/// keeps an attacker from spawning unbounded threads by holding many such
+/// sockets open at once; past the cap, excess connections are dropped.
+const MAX_INFLIGHT: usize = 32;
+
 fn serve_loop(listener: TcpListener, metrics: Arc<Metrics>, shutdown: Arc<AtomicBool>) {
+    // Counts threads currently handling a connection. Bounded by
+    // MAX_INFLIGHT so a flood of slow connections can't spawn threads
+    // without limit.
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
+                    // Drop the connection without reading: shedding load
+                    // is better than letting slow clients exhaust threads.
+                    drop(stream);
+                    continue;
+                }
+                inflight.fetch_add(1, Ordering::Relaxed);
                 let metrics = Arc::clone(&metrics);
-                if let Err(e) = handle_request(stream, metrics) {
-                    warn!(error = %e, "metrics request failed");
+                let inflight_thread = Arc::clone(&inflight);
+                // A detached thread per connection: the accept loop never
+                // blocks on a single connection's read/write timeout.
+                let spawned = thread::Builder::new()
+                    .name("qftp-metrics-conn".to_string())
+                    .spawn(move || {
+                        if let Err(e) = handle_request(stream, &metrics) {
+                            warn!(error = %e, "metrics request failed");
+                        }
+                        inflight_thread.fetch_sub(1, Ordering::Relaxed);
+                    });
+                if spawned.is_err() {
+                    // Couldn't spawn (resource exhaustion); undo the
+                    // reservation so the counter doesn't leak.
+                    inflight.fetch_sub(1, Ordering::Relaxed);
+                    warn!("failed to spawn metrics connection thread; dropping request");
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -279,25 +312,238 @@ fn serve_loop(listener: TcpListener, metrics: Arc<Metrics>, shutdown: Arc<Atomic
     }
 }
 
-fn handle_request(mut stream: TcpStream, metrics: Arc<Metrics>) -> Result<()> {
+/// Decide the HTTP response for a raw request, independent of any socket.
+/// Split out from `handle_request` so the path routing and the rendered
+/// body can be unit-tested without a live `TcpStream`. Returns the status
+/// line, the `Content-Type`, and the body.
+fn route_request(request: &str, metrics: &Metrics) -> (&'static str, &'static str, String) {
+    let path = request.split_whitespace().nth(1).unwrap_or("/");
+    match path {
+        "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics.render()),
+        "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
+        _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
+    }
+}
+
+/// Format a full HTTP/1.1 response (headers + body) for the routed result.
+fn format_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn handle_request(mut stream: TcpStream, metrics: &Metrics) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf)?;
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let path = request.split_whitespace().nth(1).unwrap_or("/");
 
-    let (status, content_type, body) = match path {
-        "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics.render()),
-        "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
-        _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
-    };
-
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let (status, content_type, body) = route_request(request, metrics);
+    let response = format_response(status, content_type, &body);
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Parse a `render()` body into a name -> (type, value) map plus the
+    /// set of HELP lines seen. Lets the tests assert on the Prometheus
+    /// structure without baking in line order.
+    fn parse_render(body: &str) -> (HashMap<String, (String, u64)>, usize) {
+        let mut types: HashMap<String, String> = HashMap::new();
+        let mut values: HashMap<String, u64> = HashMap::new();
+        let mut help_lines = 0usize;
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                assert!(
+                    rest.split_whitespace().next().is_some(),
+                    "HELP line missing metric name: {line:?}"
+                );
+                help_lines += 1;
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let mut it = rest.split_whitespace();
+                let name = it.next().expect("TYPE name").to_string();
+                let kind = it.next().expect("TYPE kind").to_string();
+                types.insert(name, kind);
+            } else if !line.is_empty() {
+                let mut it = line.split_whitespace();
+                let name = it.next().expect("value name").to_string();
+                let val: u64 = it.next().expect("value").parse().expect("u64 value");
+                values.insert(name, val);
+            }
+        }
+        let mut out = HashMap::new();
+        for (name, kind) in types {
+            let v = *values
+                .get(&name)
+                .unwrap_or_else(|| panic!("metric {name} had a TYPE but no value line"));
+            out.insert(name, (kind, v));
+        }
+        (out, help_lines)
+    }
+
+    #[test]
+    fn render_emits_well_formed_prometheus_with_correct_types() {
+        let m = Metrics::default();
+        // Drive a few counters and the one gauge to distinct values so a
+        // mix-up between fields would be caught.
+        m.inc_connections_open();
+        m.inc_connections_open();
+        m.dec_connections_open(); // gauge ends at 1
+        m.inc_connections_total();
+        m.inc_connections_total();
+        m.inc_connections_total(); // counter at 3
+        m.add_bytes_received(4096);
+        m.inc_requests_rate_limited();
+
+        let body = m.render();
+        let (metrics, help_lines) = parse_render(&body);
+
+        // Every metric line has exactly one matching HELP + TYPE.
+        assert_eq!(
+            help_lines,
+            metrics.len(),
+            "each metric must have exactly one HELP line"
+        );
+
+        // The one quantity that can decrease is a gauge; everything else
+        // is a cumulative counter. Exporting a decreasing value as a
+        // counter would break Prometheus rate()/increase().
+        let (open_kind, open_val) = &metrics["qftp_connections_open"];
+        assert_eq!(open_kind, "gauge");
+        assert_eq!(*open_val, 1);
+
+        let (total_kind, total_val) = &metrics["qftp_connections_total"];
+        assert_eq!(total_kind, "counter");
+        assert_eq!(*total_val, 3);
+
+        assert_eq!(
+            metrics["qftp_bytes_received_total"],
+            ("counter".into(), 4096)
+        );
+        assert_eq!(
+            metrics["qftp_requests_rate_limited_total"],
+            ("counter".into(), 1)
+        );
+
+        // Spot-check that every metric except the gauge is a counter.
+        for (name, (kind, _)) in &metrics {
+            if name == "qftp_connections_open" {
+                continue;
+            }
+            assert_eq!(kind, "counter", "{name} should be a counter");
+        }
+    }
+
+    #[test]
+    fn route_metrics_path_renders_body() {
+        let m = Metrics::default();
+        let (status, content_type, body) = route_request("GET /metrics HTTP/1.1", &m);
+        assert_eq!(status, "200 OK");
+        assert_eq!(content_type, "text/plain; version=0.0.4");
+        assert!(body.contains("qftp_connections_open"));
+        assert!(body.contains("# TYPE qftp_connections_open gauge"));
+    }
+
+    #[test]
+    fn route_healthz_path_is_ok() {
+        let m = Metrics::default();
+        let (status, content_type, body) = route_request("GET /healthz HTTP/1.1", &m);
+        assert_eq!(status, "200 OK");
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(body, "ok\n");
+    }
+
+    #[test]
+    fn route_unknown_path_is_404() {
+        let m = Metrics::default();
+        let (status, _ct, body) = route_request("GET /does-not-exist HTTP/1.1", &m);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body, "not found\n");
+    }
+
+    #[test]
+    fn route_malformed_request_defaults_to_404() {
+        let m = Metrics::default();
+        // No path token at all -> defaults to "/" -> not a known route.
+        let (status, ..) = route_request("garbage", &m);
+        assert_eq!(status, "404 Not Found");
+    }
+
+    #[test]
+    fn format_response_sets_content_length_to_body_len() {
+        let resp = format_response("200 OK", "text/plain", "ok\n");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("Content-Type: text/plain\r\n"));
+        assert!(resp.contains("Content-Length: 3\r\n"));
+        assert!(resp.contains("Connection: close\r\n"));
+        assert!(resp.ends_with("\r\n\r\nok\n"));
+    }
+
+    #[test]
+    fn slow_client_does_not_block_accept_loop() {
+        // Regression for the slow-loris DoS: a client that opens a socket
+        // and never sends a request must not stall /healthz for the whole
+        // read timeout. With the per-connection-thread serve_loop a second
+        // client's GET /healthz returns promptly even while the first
+        // socket sits idle. Pre-fix (sequential handling) this GET would
+        // be delayed by ~5s (the read timeout) behind the silent socket.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpStream;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+
+        let metrics = Arc::new(Metrics::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let loop_shutdown = Arc::clone(&shutdown);
+        let loop_metrics = Arc::clone(&metrics);
+        let server = thread::spawn(move || serve_loop(listener, loop_metrics, loop_shutdown));
+
+        // First client: connect and send nothing. handle_request's 5s read
+        // timeout will keep its thread parked, but it must not park the
+        // accept loop. Hold the stream open for the duration of the test.
+        let _silent = TcpStream::connect(addr).expect("silent connect");
+
+        // Give the accept loop a moment to pick up the silent socket and
+        // (with the fix) hand it to its own thread.
+        thread::sleep(Duration::from_millis(100));
+
+        // Second client: a real GET /healthz. It must complete quickly.
+        let start = Instant::now();
+        let mut client = TcpStream::connect(addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .expect("write request");
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).expect("read response");
+        let elapsed = start.elapsed();
+
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text:?}");
+        assert!(text.ends_with("ok\n"), "unexpected body: {text:?}");
+        // Comfortably under the 5s read timeout the silent socket holds;
+        // a generous bound keeps the test robust on loaded CI while still
+        // failing loudly if the accept loop is serialized behind the
+        // slow client.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "GET /healthz took {elapsed:?}; accept loop appears blocked by the silent client"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        // serve_loop polls shutdown every ~200ms; join with that in mind.
+        let _ = server.join();
+    }
 }

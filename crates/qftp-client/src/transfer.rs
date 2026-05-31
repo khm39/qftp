@@ -61,7 +61,15 @@ pub struct Pacer {
 
 impl Pacer {
     pub fn new() -> Self {
-        let rate = BW_LIMIT_BPS.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        Self::with_rate(BW_LIMIT_BPS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Build a `Pacer` for an explicit byte/second `rate`, bypassing the
+    /// process-wide `BW_LIMIT_BPS`. `new()` is the production entry point
+    /// (reads the `--bwlimit` global); this lets tests construct a pacer
+    /// with a known rate without racing on shared static state.
+    pub fn with_rate(rate: u64) -> Self {
+        let rate = rate as f64;
         Self {
             last: std::time::Instant::now(),
             tokens: rate,
@@ -341,6 +349,47 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
             trailer.extend_from_slice(&carryover[body_take..]);
         }
         carryover.clear();
+    }
+
+    // When the entire body + trailer rode in on `carryover`, the loop
+    // below never runs, so it never confirms the stream actually FIN'd.
+    // Do one *best-effort, non-blocking* drain here to observe the FIN
+    // before trusting the length-complete carryover. This must not
+    // block: for a small file the FIN was usually already consumed --
+    // and the stream evicted -- by the `recv_message` inside
+    // `poll_response_with_buf`, leaving only a flushed ACK and a
+    // `conn.timeout()` of the multi-second idle timer, so a `poll.poll`
+    // here would stall every tiny download. If the FIN simply hasn't
+    // been delivered yet we proceed without erroring: the whole-file
+    // BLAKE3 trailer check is the real backstop -- a truncated body that
+    // merely happens to match the length targets cannot also match the
+    // whole-file hash.
+    if received >= size && trailer.len() >= want_trailer && !stream_finished {
+        handle_ingress(session.conn, session.socket, &mut recv_buf)?;
+        match session.conn.stream_recv(stream_id, &mut tmp) {
+            Ok((len, fin)) => {
+                // Any bytes past the announced body + trailer are
+                // appended just as the main loop does (the trailer check
+                // reads only the first 32 bytes); we only care about the
+                // FIN here.
+                if len > 0 {
+                    trailer.extend_from_slice(&tmp[..len]);
+                }
+                if fin {
+                    stream_finished = true;
+                }
+            }
+            Err(quiche::Error::Done) => {}
+            Err(quiche::Error::InvalidStreamState(_)) => stream_finished = true,
+            Err(e) => bail!("stream_recv: {e}"),
+        }
+        flush_egress(session.conn, session.socket)?;
+        if !stream_finished {
+            tracing::debug!(
+                "carryover satisfied body + trailer lengths but FIN not yet \
+                 observed; relying on trailer hash verification"
+            );
+        }
     }
 
     while received < size || trailer.len() < want_trailer {
@@ -723,6 +772,19 @@ fn is_stale_partial(offset: u64, code: ErrorCode) -> bool {
 /// that is empty or larger than the local file, or a probe error. An
 /// older server (whose partials carried a random suffix) simply
 /// answers `NotFound`, so this degrades cleanly to a fresh upload.
+///
+/// IMPORTANT: this only checks the partial's *length*, never its
+/// *contents*. If the local file's `[0..offset)` prefix was rewritten
+/// since the interrupted upload (same or larger total size), the offset
+/// returned here points past bytes that no longer match. We deliberately
+/// do not re-hash the prefix here -- the partial may be on a remote we
+/// can't cheaply read back. The correctness backstop is the trailer
+/// check in `do_put`: the client folds its (current) local prefix into
+/// the whole-file BLAKE3, the server reconstructs its hash from the
+/// stale partial, the two disagree, the server returns
+/// `ChecksumMismatch`, and `is_stale_partial` retries the whole upload
+/// from `offset == 0`. So a mismatched prefix costs one wasted partial
+/// transfer + a full re-send, never silent corruption.
 pub fn probe_put_resume_offset(session: &mut Session, remote: &str, local_size: u64) -> u64 {
     // Use the single source of truth `qftp_protocol::stream::temp_path_for`
     // so a future change to the partial naming scheme (suffix, layout)
@@ -732,8 +794,21 @@ pub fn probe_put_resume_offset(session: &mut Session, remote: &str, local_size: 
         path: partial.to_string_lossy().into_owned(),
     };
     match session.request_response(&req) {
-        Ok(Response::FileStat(s)) if !s.is_dir() && s.size > 0 && s.size <= local_size => s.size,
+        Ok(Response::FileStat(s)) if !s.is_dir() => acceptable_resume_offset(s.size, local_size),
         _ => 0,
+    }
+}
+
+/// Decide the resume offset from a server-reported partial size.
+/// A partial is only usable when it is non-empty and no larger than the
+/// local file (`0 < partial_size <= local_size`); anything else means a
+/// fresh upload (`0`). Length-only, by design -- see
+/// [`probe_put_resume_offset`] for why prefix contents aren't checked.
+fn acceptable_resume_offset(partial_size: u64, local_size: u64) -> u64 {
+    if partial_size > 0 && partial_size <= local_size {
+        partial_size
+    } else {
+        0
     }
 }
 
@@ -773,18 +848,32 @@ mod tests {
 
     #[test]
     fn pacer_zero_rate_is_noop() {
-        BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let mut p = Pacer::new();
+        // `with_rate` bypasses the shared `BW_LIMIT_BPS` static, so this
+        // test can't race a concurrently-running pacer test that sets a
+        // throttle on the global.
+        let mut p = Pacer::with_rate(0);
         // Unlimited: any size consumes instantly with no required wait.
         assert_eq!(p.consume(1 << 30), Duration::ZERO);
+    }
+
+    #[test]
+    fn pacer_new_reads_global_rate() {
+        // `new()` must keep reading the process-wide `--bwlimit`. This is
+        // race-free even under parallel test execution because, now that
+        // the throttle tests use `Pacer::with_rate`, this is the only
+        // remaining test that touches `BW_LIMIT_BPS` -- nothing else can
+        // leak a non-zero rate in between the store and the load.
+        BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut unlimited = Pacer::new();
+        assert_eq!(unlimited.consume(1 << 30), Duration::ZERO);
     }
 
     #[test]
     fn pacer_throttles_to_rate() {
         // 1 MB/s; the bucket holds 1s of burst. `consume` no longer
         // blocks -- it returns the Duration the caller must wait.
-        BW_LIMIT_BPS.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
-        let mut p = Pacer::new();
+        // `with_rate` keeps this off the shared static entirely.
+        let mut p = Pacer::with_rate(1_000_000);
         // 1 MB inside the burst window -> no wait required.
         let first = p.consume(1_000_000);
         // 200 KB more, bucket now empty -> ~200 ms wait required.
@@ -803,8 +892,6 @@ mod tests {
             second <= Duration::from_millis(600),
             "second consume wait should not exceed 600ms, got {second:?}"
         );
-        // Reset for the next test.
-        BW_LIMIT_BPS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
@@ -820,5 +907,27 @@ mod tests {
         assert!(!is_stale_partial(0, ErrorCode::InvalidRange));
         assert!(!is_stale_partial(100, ErrorCode::NotFound));
         assert!(!is_stale_partial(100, ErrorCode::PermissionDenied));
+    }
+
+    #[test]
+    fn resume_offset_accepts_only_in_range_partials() {
+        // A non-empty partial no larger than the local file resumes from
+        // its length.
+        assert_eq!(acceptable_resume_offset(100, 1000), 100);
+        // Same-size partial: a full prior upload -- still a valid resume
+        // offset by length. (Whether its *contents* still match is not
+        // checked here; the do_put trailer verification + StalePartial
+        // retry covers a rewritten prefix. See probe_put_resume_offset.)
+        assert_eq!(acceptable_resume_offset(1000, 1000), 1000);
+        // Empty partial -> nothing to resume past -> fresh upload.
+        assert_eq!(acceptable_resume_offset(0, 1000), 0);
+        // Partial larger than the local file (local shrank, or a stale
+        // partial from a different file) -> fresh upload, never an
+        // offset past the end of what we have to send.
+        assert_eq!(acceptable_resume_offset(1001, 1000), 0);
+        assert_eq!(acceptable_resume_offset(2000, 1000), 0);
+        // Zero-length local file accepts no resume.
+        assert_eq!(acceptable_resume_offset(0, 0), 0);
+        assert_eq!(acceptable_resume_offset(50, 0), 0);
     }
 }

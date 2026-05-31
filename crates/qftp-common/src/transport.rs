@@ -256,6 +256,29 @@ fn flush_egress_gso(
     Ok(())
 }
 
+/// Split a coalesced GSO batch of `total` bytes back into the
+/// `(offset, len)` ranges of its constituent datagrams, each `seg_size`
+/// bytes except a possibly-shorter final segment. This is the inverse
+/// of what `sendmsg(UDP_SEGMENT)` does in the kernel and is used to
+/// replay a batch per-packet after GSO is disabled mid-flight. Pulled
+/// out as a pure function so the offset arithmetic — where an off-by-one
+/// would corrupt packet boundaries on the wire — is unit-testable
+/// without a socket.
+#[cfg(target_os = "linux")]
+fn gso_replay_ranges(total: usize, seg_size: usize) -> impl Iterator<Item = (usize, usize)> {
+    debug_assert!(seg_size > 0, "seg_size must be non-zero to avoid a stall");
+    let mut off = 0usize;
+    std::iter::from_fn(move || {
+        if off >= total {
+            return None;
+        }
+        let n = seg_size.min(total - off);
+        let start = off;
+        off += n;
+        Some((start, n))
+    })
+}
+
 /// Send a single batch. Uses `sendmsg(UDP_SEGMENT)` when the batch
 /// contains more than one packet; otherwise falls back to `send_to`.
 /// Disables GSO for the rest of the process on the first kernel
@@ -288,13 +311,10 @@ fn send_batch(
             GSO_USABLE.store(false, Ordering::Relaxed);
             // Replay the batch one packet at a time so we don't drop
             // this flight on the floor.
-            let mut off = 0;
-            while off < buf.len() {
-                let n = seg_size.min(buf.len() - off);
+            for (off, n) in gso_replay_ranges(buf.len(), seg_size) {
                 socket
                     .send_to(&buf[off..off + n], dst)
                     .map_err(|e| TransportError::io_ctx(contexts::SEND_FALLBACK, e))?;
-                off += n;
             }
             Ok(())
         }
@@ -505,8 +525,12 @@ pub fn recv_message<T: DeserializeOwned>(
 }
 
 /// Bincode options for the framed control-message decode path. The
-/// `with_limit(MAX_MESSAGE_SIZE)` cap bounds individual `String`/`Vec`
-/// allocations during decode; `with_fixint_encoding` +
+/// `with_limit(MAX_MESSAGE_SIZE)` cap is the *total* decode-byte budget
+/// for the whole frame (a second line of defense alongside the 4-byte
+/// length-prefix cap), **not** a per-field cap: bincode will still
+/// allocate a single 16 MiB `String`/`Vec` field within that budget.
+/// Per-field upper bounds live in `protocol::validate_request` /
+/// `validate_response`, applied after decode. `with_fixint_encoding` +
 /// `allow_trailing_bytes` reproduce the historical wire settings. Only
 /// the decode path uses these -- `encode_framed_message` deliberately
 /// uses bincode's free functions (no decode-side limit at encode time).
@@ -554,11 +578,9 @@ pub fn decode_framed_message<T: DeserializeOwned>(stream_buf: &mut Vec<u8>) -> R
     // pass (`qftp_common::protocol`), it bounds both wire-size and
     // individual-field sizes against a malicious peer. Note: bincode's
     // `with_limit` is the TOTAL decode-byte budget, not a per-field
-    // cap -- the per-field defense lives in `validate_*`.
-    // 4-byte frame length is already bounded by MAX_MESSAGE_SIZE, but
-    // bincode's defaults will happily allocate a 16 MiB `String` for
-    // a single field within that frame. with_limit caps individual
-    // String/Vec allocations during decode at the same MAX_MESSAGE_SIZE.
+    // cap -- bincode will still allocate a single 16 MiB `String`/`Vec`
+    // field within that budget, so the per-field defense lives in
+    // `validate_*`.
     use bincode::Options as _;
     let msg: T = make_bincode_options().deserialize(&stream_buf[4..4 + msg_len])?;
 
@@ -727,4 +749,65 @@ pub fn create_client_config(tls: ClientTlsConfig) -> Result<quiche::Config> {
     apply_common_config(&mut config, tls.verify_peer)?;
 
     Ok(config)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod gso_tests {
+    use super::*;
+
+    fn ranges(total: usize, seg: usize) -> Vec<(usize, usize)> {
+        gso_replay_ranges(total, seg).collect()
+    }
+
+    #[test]
+    fn replay_exact_multiple_of_seg_size() {
+        // 3 full segments, no short tail.
+        assert_eq!(
+            ranges(3000, 1000),
+            vec![(0, 1000), (1000, 1000), (2000, 1000)]
+        );
+    }
+
+    #[test]
+    fn replay_short_tail_not_a_multiple() {
+        // 2 full segments + a 250-byte tail; the tail must not overrun
+        // `total` nor be padded up to seg_size.
+        assert_eq!(
+            ranges(2250, 1000),
+            vec![(0, 1000), (1000, 1000), (2000, 250)]
+        );
+    }
+
+    #[test]
+    fn replay_single_packet_smaller_than_seg() {
+        // A lone short packet (the path that `send_batch` only reaches
+        // for packets > 1, but the arithmetic must still be correct).
+        assert_eq!(ranges(250, 1000), vec![(0, 250)]);
+    }
+
+    #[test]
+    fn replay_single_full_segment() {
+        assert_eq!(ranges(1000, 1000), vec![(0, 1000)]);
+    }
+
+    #[test]
+    fn replay_empty_batch_yields_nothing() {
+        assert_eq!(ranges(0, 1000), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn replay_covers_every_byte_without_overlap() {
+        // Property: ranges tile [0, total) contiguously with no gap or
+        // overlap, so the per-packet replay reproduces the batch exactly.
+        let total = 7 * MAX_DATAGRAM_SIZE - 17;
+        let seg = MAX_DATAGRAM_SIZE;
+        let mut expected = 0usize;
+        for (off, n) in gso_replay_ranges(total, seg) {
+            assert_eq!(off, expected, "non-contiguous range");
+            assert!(n <= seg, "segment exceeds seg_size");
+            assert!(n > 0, "empty segment");
+            expected += n;
+        }
+        assert_eq!(expected, total, "ranges did not cover the whole batch");
+    }
 }
