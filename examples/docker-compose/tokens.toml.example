@@ -1,0 +1,20 @@
+# Sample token map -- COPY THIS FILE to tokens.toml before starting:
+#
+#   cp tokens.toml.example tokens.toml
+#
+# then REPLACE every token below with a fresh high-entropy, URL-safe
+# value. The placeholders here are public; a real tokens.toml is never
+# committed. A token is the only secret gating that user's web access.
+#
+#   openssl rand -hex 32
+#   # or: head -c 24 /dev/urandom | base64 | tr '+/' '-_'
+#
+# Each token maps a browser session to a user defined in users.toml.
+
+[[tokens]]
+token = "REPLACE-WITH-A-RANDOM-TOKEN-FOR-ALICE"
+user  = "alice"
+
+[[tokens]]
+token = "REPLACE-WITH-A-RANDOM-TOKEN-FOR-BOB"
+user  = "bob"
