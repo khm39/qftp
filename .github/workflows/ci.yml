@@ -45,6 +45,15 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
+      # spec/ is the source of truth; test-vectors/ pin the bytes on the
+      # wire. Regenerate them from the reference impl and fail if they
+      # drift, so a wire-format change that forgets to update the vectors
+      # (and thus the spec) cannot land. See test-vectors/README.md.
+      - name: Conformance vectors are in sync
+        run: |
+          cargo run -p qftp-conformance --bin gen-vectors
+          git diff --exit-code test-vectors/
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
