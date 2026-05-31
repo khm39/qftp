@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use qftp_protocol::user::{UserConfig, UserDirectory};
+use qftp_protocol::user::{User, UserConfig, UserDirectory};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use wtransport::endpoint::IncomingSession;
-use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 mod auth;
 mod http;
@@ -42,6 +42,16 @@ const MAX_CONCURRENT_STREAMS: usize = 64;
 /// Acquiring a permit before `accept` leaves further sessions in the
 /// QUIC backlog rather than spawning tasks without limit.
 const MAX_CONCURRENT_SESSIONS: usize = 256;
+
+/// Wall-clock budget for completing a session's authentication phase --
+/// the WebTransport handshake / extended-CONNECT wait (`incoming.await`),
+/// token resolution, and `request.accept()`. A session holds one of the
+/// `MAX_CONCURRENT_SESSIONS` permits for this whole phase, so without a
+/// cap a peer that finishes the QUIC+TLS handshake but never sends the
+/// CONNECT request (and answers only transport keep-alive PINGs) would
+/// pin a permit indefinitely; 256 such connections starve every real
+/// session. This mirrors the SPA HTTP listener's `CONN_TIMEOUT`.
+const SESSION_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -213,9 +223,16 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Authenticate one incoming WebTransport session, then dispatch each
-/// of its bidirectional streams as an independent qftp request.
-async fn handle_session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
+/// Drive the authentication phase of one incoming session: await the
+/// WebTransport handshake / extended-CONNECT request, resolve the bearer
+/// token, and either accept or refuse the session. Returns
+/// `Some((connection, user))` on success and `None` when the session was
+/// refused (unauthenticated). Kept separate from `handle_session` so the
+/// whole phase can be wrapped in a single `timeout`.
+async fn authenticate_session(
+    incoming: IncomingSession,
+    shared: &Arc<Shared>,
+) -> Result<Option<(Connection, Arc<User>)>> {
     let request = incoming.await.context("incoming session failed")?;
 
     let user = match shared.tokens.resolve(request.path(), &shared.users) {
@@ -225,13 +242,42 @@ async fn handle_session(incoming: IncomingSession, shared: Arc<Shared>) -> Resul
             info!(remote = %request.remote_address(),
                 "rejecting unauthenticated WebTransport session");
             request.forbidden().await;
-            return Ok(());
+            return Ok(None);
         }
     };
 
     let connection = request.accept().await.context("failed to accept session")?;
     info!(user = %user.name, remote = %connection.remote_address(),
         "WebTransport session established");
+    Ok(Some((connection, user)))
+}
+
+/// Authenticate one incoming WebTransport session, then dispatch each
+/// of its bidirectional streams as an independent qftp request.
+async fn handle_session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
+    // Bound the authentication phase. The session holds a concurrency
+    // permit for the whole of `incoming.await` + token resolution +
+    // `request.accept()`, none of which has an inherent deadline, so a
+    // peer that completes the QUIC handshake and then stalls could pin
+    // the permit forever. `Some(connection)` means a session was
+    // accepted; `None` means it was refused (unauthenticated) and the
+    // permit is released by returning. A timeout drops everything and
+    // releases the permit too.
+    let (connection, user) = match tokio::time::timeout(
+        SESSION_AUTH_TIMEOUT,
+        authenticate_session(incoming, &shared),
+    )
+    .await
+    {
+        Ok(res) => match res? {
+            Some(accepted) => accepted,
+            None => return Ok(()),
+        },
+        Err(_) => {
+            info!("WebTransport session authentication timed out");
+            return Ok(());
+        }
+    };
 
     // Bound concurrent per-session streams. Acquiring the permit
     // *before* `accept_bi` means a session that has saturated the cap
