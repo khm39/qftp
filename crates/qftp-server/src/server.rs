@@ -367,24 +367,50 @@ fn dispatch_handler_job(
         Err(mpsc::SendError(job)) => {
             // Inline fallback: the pool channel is dead (all workers
             // exited, e.g. mid-shutdown). Run the handler here on the
-            // event-loop thread, with the same catch_unwind + cwd
-            // rollback the worker pool uses, so a handler panic
-            // can't take down every other connection.
-            let (response, new_cwd) = handle_handler_panic(
-                &job.req,
-                job.cwd,
-                &job.user,
-                "dispatch_handler_job inline fallback panicked; \
-                 replying with Internal error",
-            );
-            ctx.cwd = new_cwd;
-            if matches!(response, Response::Err(_)) {
-                metrics.inc_requests_failed();
-            }
-            if let Err(e) = send_message(&mut ctx.conn, stream_id, &response) {
-                warn!(stream_id, error = %e, "failed to send handler response");
+            // event-loop thread, then drain anything already queued for
+            // this connection inline too. `pending_handler_jobs` is only
+            // ever drained by `apply_handler_result`, which never fires
+            // when the pool is dead (no worker produces a result), so
+            // without this drain those queued requests would sit behind a
+            // stuck `handler_in_flight` and never get a response.
+            run_handler_inline(ctx, metrics, job.stream_id, &job.req, job.cwd, &job.user);
+            // The current request completed synchronously, so nothing is
+            // in flight; flush the backlog FIFO on the same thread.
+            ctx.handler_in_flight = false;
+            while let Some((queued_id, queued_req)) = ctx.pending_handler_jobs.pop_front() {
+                let cwd = ctx.cwd.clone();
+                let user = Arc::clone(&ctx.user);
+                run_handler_inline(ctx, metrics, queued_id, &queued_req, cwd, &user);
             }
         }
+    }
+}
+
+/// Run one handler request on the event-loop thread (the dead-pool
+/// fallback path), commit its `cwd`, and send the response. Uses the same
+/// `catch_unwind` + `cwd` rollback as the worker pool so a handler panic
+/// can't take down the loop.
+fn run_handler_inline(
+    ctx: &mut ConnectionContext,
+    metrics: &Metrics,
+    stream_id: u64,
+    req: &Request,
+    cwd: PathBuf,
+    user: &Arc<User>,
+) {
+    let (response, new_cwd) = handle_handler_panic(
+        req,
+        cwd,
+        user,
+        "dispatch_handler_job inline fallback panicked; \
+         replying with Internal error",
+    );
+    ctx.cwd = new_cwd;
+    if matches!(response, Response::Err(_)) {
+        metrics.inc_requests_failed();
+    }
+    if let Err(e) = send_message(&mut ctx.conn, stream_id, &response) {
+        warn!(stream_id, error = %e, "failed to send handler response");
     }
 }
 
@@ -412,27 +438,64 @@ fn apply_handler_result(
         );
         return;
     }
-    // Commit the cwd only if the connection still belongs to the same
-    // user. A handshake completing mid-flight can upgrade the user (and
-    // reset cwd to the authenticated home); a stale anonymous cwd must
-    // not overwrite that.
-    if Arc::ptr_eq(&ctx.user, &result.user) {
+    // A handshake completing mid-flight can upgrade the user from
+    // anonymous to the authenticated identity (and reset cwd to that
+    // user's home). The early-data phase serves replay-safe reads
+    // (Ls/Stat/Pwd) as the *anonymous* user, whose home — under the
+    // common `--users` config without an explicit `[anonymous]` — is the
+    // canonical server root. If such a job was dispatched anonymously but
+    // only finishes after the upgrade, its response was computed against
+    // the server root and must NOT be sent: it would leak directory
+    // contents outside the authenticated user's subtree. Both the stale
+    // `cwd` write and the response send are gated on the user still
+    // matching; on mismatch we suppress the stale response and instead
+    // send the standard "requires 1-RTT" reject so the client transparently
+    // retries under its now-established identity (see the
+    // `qftp_zero_rtt_rejected_total` contract). This reuses the existing
+    // `Response::Err` variant, so it stays within the frozen wire format.
+    let response = if handler_result_user_matches(&ctx.user, &result.user) {
         ctx.cwd = result.new_cwd;
-    }
-    if matches!(result.response, Response::Err(_)) {
+        result.response
+    } else {
+        debug!(
+            stream_id = result.stream_id,
+            "suppressing 0-RTT handler response after mid-flight auth upgrade; \
+             asking client to retry under 1-RTT"
+        );
+        metrics.inc_zero_rtt_rejected();
+        err(ErrorCode::Unsupported, "Operation requires 1-RTT data")
+    };
+    if matches!(response, Response::Err(_)) {
         metrics.inc_requests_failed();
     }
-    if let Err(e) = send_message(&mut ctx.conn, result.stream_id, &result.response) {
+    if let Err(e) = send_message(&mut ctx.conn, result.stream_id, &response) {
         warn!(
             stream_id = result.stream_id,
             error = %e,
             "failed to send handler response"
         );
     }
+    // Must run on both branches: this is the same live connection (not a
+    // resurrected SCID, which we already `return`ed for above), so leaving
+    // `handler_in_flight` set or skipping the drain would permanently
+    // stall every queued request on it.
     ctx.handler_in_flight = false;
     if let Some((stream_id, req)) = ctx.pending_handler_jobs.pop_front() {
         dispatch_handler_job(pool, ctx, metrics, stream_id, req);
     }
+}
+
+/// True when a completed handler result still belongs to the same `User`
+/// the live connection holds. A `false` here means the QUIC handshake
+/// finished while the (anonymous, early-data) job was running and upgraded
+/// the connection to an authenticated identity; the in-flight response was
+/// computed against the anonymous home and must not be delivered. Pointer
+/// identity is sufficient and intentional: the upgrade swaps in a *new*
+/// `Arc<User>` for the same connection (see `upgrade_user_from_cert`), so
+/// `Arc::ptr_eq` distinguishes pre- and post-upgrade jobs without comparing
+/// fields.
+fn handler_result_user_matches(ctx_user: &Arc<User>, result_user: &Arc<User>) -> bool {
+    Arc::ptr_eq(ctx_user, result_user)
 }
 
 pub fn run(
@@ -1547,6 +1610,27 @@ mod tests {
         assert!(!handler_result_is_stale(7, 7));
         assert!(handler_result_is_stale(8, 7));
         assert!(handler_result_is_stale(7, 8));
+    }
+
+    #[test]
+    fn handler_result_user_match_gates_zero_rtt_response() {
+        // The 0-RTT leak guard: a handler result is only delivered if the
+        // connection still holds the same `Arc<User>` it dispatched the
+        // job with. The same Arc (no mid-flight upgrade) matches and is
+        // sent; a different Arc (handshake upgraded anonymous ->
+        // authenticated) does not match, so the stale anonymous-root
+        // response is suppressed.
+        let tmp_a = tempfile::tempdir().expect("tempdir a");
+        let tmp_b = tempfile::tempdir().expect("tempdir b");
+        let dir_a = UserDirectory::default_anonymous(tmp_a.path());
+        let dir_b = UserDirectory::default_anonymous(tmp_b.path());
+        let anon = dir_a.anonymous();
+        // Same Arc: no upgrade happened, response is delivered.
+        assert!(handler_result_user_matches(&anon, &Arc::clone(&anon)));
+        // Distinct Arc with the same logical fields still does NOT match:
+        // identity, not field equality, is what marks a mid-flight upgrade.
+        let other = dir_b.anonymous();
+        assert!(!handler_result_user_matches(&anon, &other));
     }
 
     #[test]
