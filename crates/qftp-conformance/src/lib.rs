@@ -224,6 +224,27 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
             )),
         ),
         (
+            "err_details_upload",
+            "Structured error reply carrying ErrorDetails::Upload.",
+            Response::Err(ErrorResponse::with_details(
+                ErrorCode::UploadOverflow,
+                "received more bytes than declared",
+                ErrorDetails::Upload {
+                    received: 8192,
+                    declared: 4096,
+                },
+            )),
+        ),
+        (
+            "err_details_retry_after",
+            "Structured error reply carrying ErrorDetails::RetryAfter.",
+            Response::Err(ErrorResponse::with_details(
+                ErrorCode::RateLimited,
+                "too many requests",
+                ErrorDetails::RetryAfter { millis: 1000 },
+            )),
+        ),
+        (
             "dir_listing",
             "Directory listing with a file and a subdirectory.",
             Response::DirListing {

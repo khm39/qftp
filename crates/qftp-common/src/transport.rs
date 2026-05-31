@@ -175,6 +175,52 @@ fn flush_egress_linux(conn: &mut quiche::Connection, socket: &mio::net::UdpSocke
     GSO_BUF.with(|cell| flush_egress_gso(conn, socket, cell.borrow_mut().as_mut_slice()))
 }
 
+/// Outcome of feeding one freshly-written datagram into an in-progress
+/// GSO batch. This is the I/O-independent half of the `flush_egress_gso`
+/// state machine, factored out so the batching boundaries — which decide
+/// what lands on the wire and where packet boundaries fall — are
+/// unit-testable without a `quiche::Connection` or a real socket. The
+/// actual `sendmsg`/`send_to` syscalls (and the `GSO_USABLE` fallback)
+/// live in [`send_batch`] / [`sendmsg_udp_segment`] and are exercised
+/// only on Linux/CI; they are not reachable from a host unit test.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GsoStep {
+    /// Append this packet to the open batch; the batch stays open.
+    Append,
+    /// Append this packet as the final (short-tail) segment, then flush
+    /// the batch. A UDP_SEGMENT burst may only have a shorter segment as
+    /// its last one.
+    AppendThenFlush,
+    /// This packet cannot extend the open batch (different destination,
+    /// or larger than the committed `seg_size`). Flush the open batch
+    /// first (if any), then send this packet on its own.
+    FlushThenSendAlone,
+}
+
+/// Pure per-packet decision for the GSO coalescing loop. `seg_size` is
+/// the segment size committed by the first packet of the open batch
+/// (`0` when the batch is empty), `same_dst` is whether the new packet's
+/// destination matches the batch's, and `write` is the new packet's
+/// length. Mirrors exactly the branch order in [`flush_egress_gso`]:
+/// path-swap is checked before the oversize comparison, so a different
+/// destination always sends the packet alone regardless of its size.
+#[cfg(target_os = "linux")]
+fn gso_step(seg_size: usize, same_dst: bool, write: usize) -> GsoStep {
+    if seg_size == 0 {
+        // First packet of a batch: it establishes `seg_size`, so it is
+        // never a path swap or oversize relative to itself.
+        return GsoStep::Append;
+    }
+    if !same_dst || write > seg_size {
+        return GsoStep::FlushThenSendAlone;
+    }
+    if write < seg_size {
+        return GsoStep::AppendThenFlush;
+    }
+    GsoStep::Append
+}
+
 /// GSO-coalescing flush loop. `buf` is caller-provided reusable scratch
 /// (`GSO_BUF`), at least `MAX_DATAGRAM_SIZE * GSO_BURST_PACKETS` bytes.
 #[cfg(target_os = "linux")]
@@ -208,41 +254,41 @@ fn flush_egress_gso(
             // From here on we only need disjoint subslices of `buf`;
             // no named borrow of `buf` outlives the match arms.
 
-            if let Some(prev) = dst {
-                if prev != send_info.to {
-                    // Path swap mid-burst: commit what we have, send
-                    // the just-written packet on its own, then restart.
+            let same_dst = dst.map(|prev| prev == send_info.to).unwrap_or(true);
+            match gso_step(seg_size, same_dst, write) {
+                GsoStep::FlushThenSendAlone => {
+                    // Path swap or oversize mid-burst: commit what we
+                    // have, send the just-written packet on its own,
+                    // then restart. `dst` is `Some` here because an
+                    // empty batch (`seg_size == 0`) always yields
+                    // `Append`.
                     if total > 0 {
-                        send_batch(socket, &buf[..total], prev, seg_size, packets)?;
+                        send_batch(socket, &buf[..total], dst.unwrap(), seg_size, packets)?;
                     }
+                    let ctx = if same_dst {
+                        contexts::SEND_OVERSIZE
+                    } else {
+                        contexts::SEND_PATH_SWAP
+                    };
                     socket
                         .send_to(&buf[total..total + write], send_info.to)
-                        .map_err(|e| TransportError::io_ctx(contexts::SEND_PATH_SWAP, e))?;
+                        .map_err(|e| TransportError::io_ctx(ctx, e))?;
                     continue 'outer;
                 }
-            } else {
-                dst = Some(send_info.to);
-                seg_size = write;
-            }
-
-            if write > seg_size {
-                // Larger than the segment size we already committed
-                // to: cannot extend this burst.
-                if total > 0 {
-                    send_batch(socket, &buf[..total], dst.unwrap(), seg_size, packets)?;
+                GsoStep::Append => {
+                    if seg_size == 0 {
+                        dst = Some(send_info.to);
+                        seg_size = write;
+                    }
+                    total += write;
+                    packets += 1;
                 }
-                socket
-                    .send_to(&buf[total..total + write], send_info.to)
-                    .map_err(|e| TransportError::io_ctx(contexts::SEND_OVERSIZE, e))?;
-                continue 'outer;
-            }
-
-            let short_tail = write < seg_size;
-            total += write;
-            packets += 1;
-            if short_tail {
-                // Must be the last segment in a UDP_SEGMENT burst.
-                break;
+                GsoStep::AppendThenFlush => {
+                    total += write;
+                    packets += 1;
+                    // Short tail: must be the last segment in this burst.
+                    break;
+                }
             }
         }
 
@@ -809,5 +855,296 @@ mod gso_tests {
             expected += n;
         }
         assert_eq!(expected, total, "ranges did not cover the whole batch");
+    }
+
+    // --- gso_step / batch-planning coverage (C4) ---
+    //
+    // These exercise the I/O-independent half of `flush_egress_gso`: the
+    // four batching boundaries called out in the review — (1) the first
+    // write fixing `seg_size`, (2) a short-tail write ending the batch,
+    // (3) an oversize write falling back to a single send, (4) the
+    // GSO_BURST_PACKETS cap. The `sendmsg(UDP_SEGMENT)` syscall and the
+    // `GSO_USABLE` runtime fallback are NOT covered here (they need a
+    // real socket / kernel) and run only under Linux/CI.
+
+    #[test]
+    fn step_first_packet_always_appends() {
+        // seg_size == 0 means an empty batch: the first packet fixes the
+        // segment size and can never be a path swap or oversize.
+        assert_eq!(gso_step(0, true, 1350), GsoStep::Append);
+        assert_eq!(gso_step(0, false, 1), GsoStep::Append);
+        assert_eq!(gso_step(0, true, 0), GsoStep::Append);
+    }
+
+    #[test]
+    fn step_equal_size_same_dst_appends() {
+        assert_eq!(gso_step(1350, true, 1350), GsoStep::Append);
+    }
+
+    #[test]
+    fn step_short_tail_appends_then_flushes() {
+        assert_eq!(gso_step(1350, true, 1349), GsoStep::AppendThenFlush);
+        assert_eq!(gso_step(1350, true, 1), GsoStep::AppendThenFlush);
+    }
+
+    #[test]
+    fn step_oversize_same_dst_sends_alone() {
+        assert_eq!(gso_step(1200, true, 1350), GsoStep::FlushThenSendAlone);
+    }
+
+    #[test]
+    fn step_path_swap_sends_alone_regardless_of_size() {
+        // Branch order matters: a different destination short-circuits
+        // before the oversize comparison, so even an equal- or
+        // smaller-sized packet to a new dst is sent on its own.
+        assert_eq!(gso_step(1350, false, 1350), GsoStep::FlushThenSendAlone);
+        assert_eq!(gso_step(1350, false, 800), GsoStep::FlushThenSendAlone);
+        assert_eq!(gso_step(1350, false, 1500), GsoStep::FlushThenSendAlone);
+    }
+
+    /// One emitted unit of the GSO plan. `Batch` carries the segment size
+    /// and how many packets coalesce into the `sendmsg(UDP_SEGMENT)` (or
+    /// a lone `send_to` when `packets == 1`); `Single` is a packet sent
+    /// on its own off the path-swap / oversize fallback.
+    #[derive(Debug, PartialEq, Eq)]
+    enum PlanItem {
+        Batch { seg_size: usize, packets: usize },
+        Single { size: usize },
+    }
+
+    /// Test-only re-implementation of the `flush_egress_gso` batching
+    /// state machine over a fixed sequence of writes, sharing the exact
+    /// `gso_step` decision the production loop uses. Each input is
+    /// `(write, same_dst)` where `same_dst` is whether this write's
+    /// destination matches the open batch's. `burst` is the per-batch
+    /// packet cap (the production constant is `GSO_BURST_PACKETS`).
+    ///
+    /// This drives the same arithmetic that decides what coalesces vs.
+    /// what falls out as a single send, without a `quiche::Connection`
+    /// or a socket. It does NOT model the kernel `sendmsg` / `GSO_USABLE`
+    /// fallback (Linux/CI only).
+    fn plan(writes: &[(usize, bool)], burst: usize) -> Vec<PlanItem> {
+        fn flush_open(out: &mut Vec<PlanItem>, seg: &mut usize, pk: &mut usize) {
+            if *pk > 0 {
+                out.push(PlanItem::Batch {
+                    seg_size: *seg,
+                    packets: *pk,
+                });
+            }
+            *seg = 0;
+            *pk = 0;
+        }
+
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < writes.len() {
+            // Restart of the `'outer` loop: a fresh batch fills until the
+            // burst cap, a short tail, or a fallback breaks it.
+            let mut seg_size = 0usize;
+            let mut packets = 0usize;
+            while i < writes.len() && packets < burst {
+                let (write, same_dst) = writes[i];
+                match gso_step(seg_size, same_dst, write) {
+                    GsoStep::FlushThenSendAlone => {
+                        flush_open(&mut out, &mut seg_size, &mut packets);
+                        out.push(PlanItem::Single { size: write });
+                        i += 1;
+                        break;
+                    }
+                    GsoStep::Append => {
+                        if seg_size == 0 {
+                            seg_size = write;
+                        }
+                        packets += 1;
+                        i += 1;
+                    }
+                    GsoStep::AppendThenFlush => {
+                        packets += 1;
+                        i += 1;
+                        flush_open(&mut out, &mut seg_size, &mut packets);
+                        break;
+                    }
+                }
+            }
+            // Burst cap or input exhausted with an open batch: commit it.
+            flush_open(&mut out, &mut seg_size, &mut packets);
+        }
+        out
+    }
+
+    #[test]
+    fn plan_uniform_equal_writes_coalesce_into_one_batch() {
+        let writes = vec![(1350, true); 5];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![PlanItem::Batch {
+                seg_size: 1350,
+                packets: 5
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_short_tail_closes_the_batch() {
+        // 3 full segments then a short tail ends the burst; anything
+        // after the tail (here nothing) would begin a new batch.
+        let writes = vec![(1350, true), (1350, true), (1350, true), (900, true)];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![PlanItem::Batch {
+                seg_size: 1350,
+                packets: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_short_tail_then_more_starts_new_batch() {
+        let writes = vec![(1350, true), (900, true), (1350, true), (1350, true)];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![
+                PlanItem::Batch {
+                    seg_size: 1350,
+                    packets: 2,
+                },
+                PlanItem::Batch {
+                    seg_size: 1350,
+                    packets: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_oversize_falls_out_as_single_then_resumes() {
+        // First write fixes seg_size = 1200. The 1350 cannot extend it,
+        // so the 2-packet batch is committed and the 1350 is sent alone;
+        // the trailing 1200 opens a fresh batch.
+        let writes = vec![(1200, true), (1200, true), (1350, true), (1200, true)];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![
+                PlanItem::Batch {
+                    seg_size: 1200,
+                    packets: 2,
+                },
+                PlanItem::Single { size: 1350 },
+                PlanItem::Batch {
+                    seg_size: 1200,
+                    packets: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_path_swap_commits_then_sends_alone() {
+        // Two packets to dst A coalesce; the third is to a different dst
+        // and is sent on its own even though it is the same size.
+        let writes = vec![(1350, true), (1350, true), (1350, false)];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![
+                PlanItem::Batch {
+                    seg_size: 1350,
+                    packets: 2,
+                },
+                PlanItem::Single { size: 1350 },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_oversize_as_first_write_after_swap_is_just_a_single_open() {
+        // A standalone oversize write that begins an empty batch is not
+        // "oversize relative to itself": it opens a new batch as the
+        // first packet (seg_size == 0 path), then closing flushes it as
+        // a 1-packet batch.
+        let writes = vec![(1500, true)];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![PlanItem::Batch {
+                seg_size: 1500,
+                packets: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_exactly_burst_packets_is_one_batch() {
+        let writes = vec![(1350, true); GSO_BURST_PACKETS];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![PlanItem::Batch {
+                seg_size: 1350,
+                packets: GSO_BURST_PACKETS,
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_burst_plus_one_splits_into_two_batches() {
+        let writes = vec![(1350, true); GSO_BURST_PACKETS + 1];
+        assert_eq!(
+            plan(&writes, GSO_BURST_PACKETS),
+            vec![
+                PlanItem::Batch {
+                    seg_size: 1350,
+                    packets: GSO_BURST_PACKETS,
+                },
+                PlanItem::Batch {
+                    seg_size: 1350,
+                    packets: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_small_burst_cap_boundary() {
+        // Burst cap of 2: 5 equal writes split 2 + 2 + 1.
+        let writes = vec![(1000, true); 5];
+        assert_eq!(
+            plan(&writes, 2),
+            vec![
+                PlanItem::Batch {
+                    seg_size: 1000,
+                    packets: 2,
+                },
+                PlanItem::Batch {
+                    seg_size: 1000,
+                    packets: 2,
+                },
+                PlanItem::Batch {
+                    seg_size: 1000,
+                    packets: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_total_packet_count_is_conserved() {
+        // Property: every input write lands on the wire exactly once,
+        // whether coalesced into a batch or sent on its own.
+        let writes = vec![
+            (1350, true),
+            (1350, true),
+            (1350, false),
+            (1200, true),
+            (900, true),
+            (1500, true),
+            (1350, true),
+        ];
+        let items = plan(&writes, GSO_BURST_PACKETS);
+        let counted: usize = items
+            .iter()
+            .map(|it| match it {
+                PlanItem::Batch { packets, .. } => *packets,
+                PlanItem::Single { .. } => 1,
+            })
+            .sum();
+        assert_eq!(counted, writes.len());
     }
 }

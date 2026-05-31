@@ -294,15 +294,22 @@ impl ServerFixture {
             ));
         }
         // The REPL exits 0 even when an individual command fails (it
-        // prints "put X failed: …" and moves on). Treat any stdout
-        // line containing `failed:` as a transfer error so the bench
-        // doesn't silently measure error paths.
+        // prints "put X failed: …" and moves on). Treat any line
+        // containing `failed:` as a transfer error so the bench doesn't
+        // silently measure error paths. The REPL splits its diagnostics
+        // across both streams -- `ls`/`mget`/`stat` failures land on
+        // stdout, but `put`/`get` failures are emitted via `eprintln!`
+        // on stderr -- so scan both. Only the client's own output is on
+        // this stderr; the server's is forwarded by a separate thread,
+        // so a server-side `failed:` line can't be misattributed here.
         let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stdout.lines().chain(stderr.lines()) {
             if line.contains(" failed:") {
                 return Err(anyhow!(
                     "qftp-client -e {script:?} reported error: {line}\n\
-                     --- full stdout ---\n{stdout}"
+                     --- full stdout ---\n{stdout}\n\
+                     --- full stderr ---\n{stderr}"
                 ));
             }
         }
