@@ -117,6 +117,8 @@ pub(crate) fn start_get(
             total_size: meta.len(),
             checksum_follows: true,
             hash_algorithm: HashAlgorithm::Blake3,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         },
     )?;
     // The reader stays at position 0 even for a resumed Get: the

@@ -77,7 +77,7 @@ padding, alignment, field tags, or separators**. The primitives are:
 | `[u8; N]` (fixed array) | exactly `N` raw bytes, with **no** length prefix. |
 | struct | the encodings of its fields concatenated in declaration order. |
 | positional enum value | the variant discriminant (`u32` LE), then the encodings of that variant's fields (if any) in declaration order. Discriminants are numbered from `0` in declaration order. Used by [`Request`](#request), [`Response`](#response), and [`ErrorDetails`](#errordetails). |
-| numeric enum value | a single `u32` LE **value** (not a positional index). Used by [`ErrorCode`](#errorresponse), [`FileType`](#filetype), and [`HashAlgorithm`](#hashalgorithm); each carries an explicitly assigned numeric code, and a value a decoder does not recognise is preserved rather than rejected (see those sections and [versioning.md](versioning.md)). |
+| numeric enum value | a single `u32` LE **value** (not a positional index). Used by [`ErrorCode`](#errorresponse), [`FileType`](#filetype), [`HashAlgorithm`](#hashalgorithm), and [`Encoding`](#encoding); each carries an explicitly assigned numeric code, and a value a decoder does not recognise is preserved rather than rejected (see those sections and [versioning.md](versioning.md)). |
 
 The rules **compose recursively**, with no extra tag, separator, or
 padding between or around a nested value: a field that is itself a
@@ -111,8 +111,8 @@ little-endian discriminant.
 | `0` | `Ls` | `path: string`, `cursor: Option<string>` |
 | `1` | `Cd` | `path: string` |
 | `2` | `Pwd` | *(none)* |
-| `3` | `Get` | `path: string`, `offset: u64`, `length: Option<u64>` |
-| `4` | `Put` | `path: string`, `size: u64`, `mode: u32`, `offset: u64`, `hash_algorithm: HashAlgorithm` (`u32`), `checksum: Option<seq<u8>>`, `no_clobber: bool`, `checksum_trailer: bool` |
+| `3` | `Get` | `path: string`, `offset: u64`, `length: Option<u64>`, `accept_encoding: seq<Encoding>` |
+| `4` | `Put` | `path: string`, `size: u64`, `mode: u32`, `offset: u64`, `hash_algorithm: HashAlgorithm` (`u32`), `checksum: Option<seq<u8>>`, `no_clobber: bool`, `checksum_trailer: bool`, `encoding: Encoding` (`u32`), `plaintext_size: u64` |
 | `5` | `Mkdir` | `path: string` |
 | `6` | `Rmdir` | `path: string` |
 | `7` | `Rm` | `path: string` |
@@ -136,7 +136,7 @@ discriminant.
 | `2` | `DirListing` | `entries: seq<DirEntry>` (see [`DirEntry`](#direntry)), `next_cursor: Option<string>` |
 | `3` | `Path` | `string` |
 | `4` | `FileStat` | one [`FileStat`](#filestat) |
-| `5` | `FileReady` | `size: u64`, `total_size: u64`, `checksum_follows: bool`, `hash_algorithm: HashAlgorithm` (`u32`) |
+| `5` | `FileReady` | `size: u64`, `total_size: u64`, `checksum_follows: bool`, `hash_algorithm: HashAlgorithm` (`u32`), `encoding: Encoding` (`u32`), `plaintext_size: u64` |
 | `6` | `QuotaInfo` | `used_bytes: u64`, `file_count: u64`, `limit_bytes: Option<u64>` |
 
 ### ErrorResponse
@@ -186,6 +186,26 @@ digest length ([§ Body streaming](#body-streaming)). A value a decoder
 does not recognise is preserved rather than rejected
 ([versioning.md](versioning.md)); a peer that receives an algorithm it
 cannot compute **SHOULD** refuse the transfer with
+[`Unsupported`](error-codes.md).
+
+### Encoding
+
+A numeric enum naming the transfer encoding (compression codec) applied
+to a file body, encoded as a single `u32` LE **value**:
+
+| Value | Variant |
+|---|---|
+| `0` | `Identity` |
+| `1` | `Zstd` |
+
+`Identity` is the default and means no compression: the body bytes are
+plaintext. `Zstd` means one self-contained zstd frame per transfer. A
+qftp/1 zstd encoder **MUST** cap the frame window at
+`window_log = 23` (8 MiB), and a decoder **MUST** reject a zstd frame
+whose window exceeds that value with
+[`DecodeError`](error-codes.md). A value a decoder does not recognise
+is preserved as `Unknown(n)` rather than rejected; a peer that cannot
+handle the selected encoding **SHOULD** refuse the transfer with
 [`Unsupported`](error-codes.md).
 
 ### ErrorDetails
@@ -268,11 +288,18 @@ limit, refusing larger directories with `ErrorCode::Internal`.
 
 ## Body streaming
 
-`Get` and `Put` carry raw file bytes on the **same** QUIC stream as
+`Get` and `Put` carry file body bytes on the **same** QUIC stream as
 the control messages, immediately after the relevant framed message.
 These body bytes are **not** length-prefixed or otherwise framed — the
 byte count is carried in the control message, and the QUIC stream FIN
 marks the end.
+
+When `encoding == Identity`, `size` is the plaintext length and
+`plaintext_size` is ignored; receivers use `size`. When the body is
+compressed, `size` is the number of encoded wire bytes and
+`plaintext_size` is the decoded plaintext length. The `offset` field
+and the BLAKE3 trailer always operate on plaintext, independent of
+`encoding`.
 
 The trailer, when present, is exactly **the negotiated
 [`HashAlgorithm`](#hashalgorithm)'s digest length** (BLAKE3 → 32 bytes).
@@ -282,22 +309,24 @@ length prefix.
 ### Get
 
 ```
-client -> server : frame( Request::Get { path, offset, length } )
-server -> client : frame( Response::FileReady { size, total_size, checksum_follows, hash_algorithm } )
-server -> client : <size> raw body bytes
+client -> server : frame( Request::Get { path, offset, length, accept_encoding } )
+server -> client : frame( Response::FileReady { size, total_size, checksum_follows, hash_algorithm, encoding, plaintext_size } )
+server -> client : <size> body bytes
 server -> client : <digest-length trailer>       (only if checksum_follows == true)
                    QUIC stream FIN on the last byte
 ```
 
-- The server streams exactly `size` body bytes (the post-`offset`,
-  post-`length` slice).
+- The server streams exactly `size` body bytes. For `Identity` this is
+  the post-`offset`, post-`length` plaintext slice; for compressed
+  bodies it is the encoded representation of that plaintext slice.
 - When `size == 0` the body phase is skipped: no body bytes are sent.
   A trailer (if `checksum_follows`) still follows, covering the empty
   body.
 - When `checksum_follows` is `true`, a trailer of the
-  `hash_algorithm` digest length follows the body: the hash of those
-  `size` body bytes (not the whole file). The client **MUST** verify it
-  and discard the data on mismatch.
+  `hash_algorithm` digest length follows the body: the hash of the
+  streamed plaintext (not the encoded bytes, and not necessarily the
+  whole file). The client **MUST** verify it and discard the data on
+  mismatch.
 - The QUIC stream **FIN** is set on the last trailer byte when a
   trailer follows, otherwise on the last body byte (or, for `size == 0`
   with no trailer, on the empty stream).
@@ -307,15 +336,17 @@ server -> client : <digest-length trailer>       (only if checksum_follows == tr
 ### Put
 
 ```
-client -> server : frame( Request::Put { path, size, mode, offset, hash_algorithm, checksum, no_clobber, checksum_trailer } )
-client -> server : <size> raw body bytes
+client -> server : frame( Request::Put { path, size, mode, offset, hash_algorithm, checksum, no_clobber, checksum_trailer, encoding, plaintext_size } )
+client -> server : <size> body bytes
 client -> server : <digest-length trailer>       (only if checksum_trailer == true)
                    QUIC stream FIN on the last byte
 server -> client : frame( Response::Ok ) | frame( Response::Err( ErrorResponse ) )
 ```
 
-- The client streams exactly `size` body bytes. When `size == 0` the
-  body phase is skipped.
+- The client streams exactly `size` body bytes. For `Identity`, these
+  bytes are plaintext; for compressed bodies they are encoded bytes and
+  `plaintext_size` declares the decoded byte count. When `size == 0`
+  the body phase is skipped.
 - The QUIC stream **FIN** is set on the last trailer byte when a
   trailer follows, otherwise on the last body byte.
 - When `checksum_trailer` is `true`, a trailer of the `hash_algorithm`
@@ -325,7 +356,7 @@ server -> client : frame( Response::Ok ) | frame( Response::Err( ErrorResponse )
   silent fallback to the header `checksum` but an error,
   [`UploadTruncated`](error-codes.md). When present and complete, the
   trailer takes precedence over the header `checksum` field.
-  Checksum-resolution semantics are in
+  The digest covers plaintext. Checksum-resolution semantics are in
   [qftp-protocol.md](qftp-protocol.md).
 
 ## Worked example

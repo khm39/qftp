@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use qftp_common::protocol::{
-    validate_request, ErrorCode, ErrorDetails, ErrorResponse, HashAlgorithm, Request, Response,
+    validate_request, Encoding, ErrorCode, ErrorDetails, ErrorResponse, HashAlgorithm, Request,
+    Response,
 };
 use qftp_common::transport::{decode_framed_message, MAX_MESSAGE_SIZE};
 use qftp_protocol::handler;
@@ -78,6 +79,7 @@ async fn dispatch_request(
             path,
             offset,
             length,
+            ..
         } => do_get(send, user, &path, offset, length).await,
 
         Request::Put {
@@ -89,6 +91,7 @@ async fn dispatch_request(
             checksum,
             no_clobber,
             checksum_trailer,
+            ..
         } => {
             // qftp/1 negotiates BLAKE3 only.
             if hash_algorithm != HashAlgorithm::Blake3 {
@@ -305,6 +308,8 @@ async fn do_get(
             total_size: meta.len(),
             checksum_follows: true,
             hash_algorithm: HashAlgorithm::Blake3,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         },
     )
     .await?;

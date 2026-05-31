@@ -1408,6 +1408,7 @@ fn plan_actions(
                             path,
                             offset,
                             length,
+                            ..
                         } => {
                             actions.push(PendingAction::StartGet {
                                 stream_id,
@@ -1426,6 +1427,7 @@ fn plan_actions(
                             checksum,
                             no_clobber,
                             checksum_trailer,
+                            ..
                         } => {
                             // qftp/1 negotiates BLAKE3 only; anything else is
                             // refused rather than silently treated as BLAKE3.
@@ -1679,6 +1681,7 @@ mod tests {
             path: "x".into(),
             offset: 0,
             length: None,
+            accept_encoding: Vec::new(),
         }));
     }
 
@@ -1693,6 +1696,8 @@ mod tests {
             checksum: Some(vec![0u8; 32]),
             no_clobber: false,
             checksum_trailer: false,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         }));
         assert!(!request_is_replay_safe(&Request::Rm { path: "x".into() }));
         assert!(!request_is_replay_safe(&Request::Mkdir {

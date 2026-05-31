@@ -108,6 +108,19 @@
       "wire_hex": "0000001101000000a8010000000000000000000000"
     },
     {
+      "name": "err_DecodeError",
+      "description": "Response::Err carrying ErrorCode::DecodeError (empty message).",
+      "value": {
+        "Err": {
+          "code": 431,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000af010000000000000000000000",
+      "wire_hex": "0000001101000000af010000000000000000000000"
+    },
+    {
       "name": "err_ChecksumMismatch",
       "description": "Response::Err carrying ErrorCode::ChecksumMismatch (empty message).",
       "value": {

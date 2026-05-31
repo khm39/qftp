@@ -235,6 +235,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         path: remote.to_string(),
         offset: resume_offset,
         length: None,
+        accept_encoding: Vec::new(),
     };
     send_message(session.conn, stream_id, &req)?;
     stream_send_all(session.conn, stream_id, &[], true)?;
@@ -580,6 +581,8 @@ fn do_put_inner(
         checksum: None,
         no_clobber,
         checksum_trailer: true,
+        encoding: Encoding::Identity,
+        plaintext_size: 0,
     };
     send_message(session.conn, stream_id, &req)?;
     flush_egress(session.conn, session.socket)?;

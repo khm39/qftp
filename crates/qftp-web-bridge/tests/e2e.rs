@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use qftp_common::protocol::{ErrorCode, Request, Response};
+use qftp_common::protocol::{Encoding, ErrorCode, Request, Response};
 use qftp_common::transport::{decode_framed_message, encode_framed_message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wtransport::endpoint::endpoint_side::Client;
@@ -100,6 +100,8 @@ async fn put(conn: &Connection, path: &str, body: &[u8], checksum: Option<[u8; 3
         checksum: checksum.map(|c| c.to_vec()),
         no_clobber: false,
         checksum_trailer: false,
+        encoding: Encoding::Identity,
+        plaintext_size: 0,
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
@@ -129,6 +131,8 @@ async fn put_with_trailer(
         checksum: None,
         no_clobber: false,
         checksum_trailer: true,
+        encoding: Encoding::Identity,
+        plaintext_size: 0,
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
@@ -148,6 +152,7 @@ async fn get(conn: &Connection, path: &str) -> (Response, Vec<u8>) {
         path: path.to_string(),
         offset: 0,
         length: None,
+        accept_encoding: Vec::new(),
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
@@ -166,6 +171,7 @@ async fn get_at(conn: &Connection, path: &str, offset: u64) -> (Response, Vec<u8
         path: path.to_string(),
         offset,
         length: None,
+        accept_encoding: Vec::new(),
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await

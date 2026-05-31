@@ -42,7 +42,7 @@ minor revision may change:
    frame as `ErrorCode::Malformed` (`400`), an unknown `ErrorDetails`
    discriminant likewise.
 2. **An unknown *numeric* enum value decodes.** `ErrorCode`,
-   `FileType`, and `HashAlgorithm` are numeric enums: each is a single
+   `FileType`, `HashAlgorithm`, and `Encoding` are numeric enums: each is a single
    self-contained `u32` *value* with no variant-dependent payload
    ([wire-format.md](wire-format.md#primitive-encodings)). A value a
    decoder has no named variant for is preserved as `Unknown(n)` rather
@@ -84,13 +84,22 @@ implementation **MUST NOT** emit such a variant to a peer that may not
 understand it, and a revision that needs older peers to keep
 interoperating after introducing one bumps the major version.
 
-Adding a new **numeric value** to `ErrorCode`, `FileType`, or
-`HashAlgorithm` is different (consequence 2): an older peer decodes the
-unknown value as `Unknown(n)` and keeps going, so the addition is
-**forward-compatible** and does **not** require a major-version bump.
-A peer still **SHOULD NOT** emit a value it knows the receiver cannot
-act on (e.g. a `HashAlgorithm` the peer cannot compute), but doing so
-fails gracefully (`Unsupported`) rather than breaking the frame.
+Adding a new **numeric value** to `ErrorCode`, `FileType`,
+`HashAlgorithm`, or `Encoding` is different (consequence 2): an older
+peer decodes the unknown value as `Unknown(n)` and keeps going, so the
+addition is **forward-compatible** and does **not** require a
+major-version bump. A peer still **SHOULD NOT** emit a value it knows
+the receiver cannot act on (e.g. a `HashAlgorithm` the peer cannot
+compute or an `Encoding` it cannot decode), but doing so fails
+gracefully (`Unsupported`) rather than breaking the frame.
+
+The qftp/1 pre-release compression schema is an example of an
+append-only, forward-compatible addition within the major version:
+`Request::Get` appends `accept_encoding`, `Request::Put` and
+`Response::FileReady` append `encoding` and `plaintext_size`, and the
+numeric enums gain `Encoding::{Identity=0,Zstd=1}` plus
+`ErrorCode::DecodeError = 431`. Existing fields keep their order, type,
+and byte width.
 
 Either kind of addition is a documented wire change: each **MUST** be
 recorded in [PROTOCOL-CHANGELOG.md](../PROTOCOL-CHANGELOG.md) with new

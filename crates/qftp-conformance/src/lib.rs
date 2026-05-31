@@ -10,8 +10,8 @@
 //! isn't reflected in `test-vectors/` fails CI.
 
 use qftp_common::protocol::{
-    DirEntry, ErrorCode, ErrorDetails, ErrorResponse, FileStat, FileType, HashAlgorithm, Request,
-    Response,
+    DirEntry, Encoding, ErrorCode, ErrorDetails, ErrorResponse, FileStat, FileType, HashAlgorithm,
+    Request, Response,
 };
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,7 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 path: "report.pdf".into(),
                 offset: 0,
                 length: None,
+                accept_encoding: Vec::new(),
             },
         ),
         (
@@ -105,6 +106,17 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 path: "big.iso".into(),
                 offset: 1_048_576,
                 length: Some(8_388_608),
+                accept_encoding: Vec::new(),
+            },
+        ),
+        (
+            "get_accept_zstd",
+            "Download request advertising zstd body decoding support.",
+            Request::Get {
+                path: "logs/app.log".into(),
+                offset: 0,
+                length: None,
+                accept_encoding: vec![Encoding::Zstd],
             },
         ),
         (
@@ -119,6 +131,8 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 checksum: None,
                 no_clobber: false,
                 checksum_trailer: false,
+                encoding: Encoding::Identity,
+                plaintext_size: 0,
             },
         ),
         (
@@ -133,6 +147,8 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 checksum: Some(vec![0x11; 32]),
                 no_clobber: true,
                 checksum_trailer: false,
+                encoding: Encoding::Identity,
+                plaintext_size: 0,
             },
         ),
         (
@@ -147,6 +163,24 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
                 checksum: None,
                 no_clobber: false,
                 checksum_trailer: true,
+                encoding: Encoding::Identity,
+                plaintext_size: 0,
+            },
+        ),
+        (
+            "put_zstd",
+            "Upload whose body is zstd-compressed on the wire.",
+            Request::Put {
+                path: "up/logs.zst".into(),
+                size: 12_345,
+                mode: 0o644,
+                offset: 0,
+                hash_algorithm: HashAlgorithm::Blake3,
+                checksum: None,
+                no_clobber: false,
+                checksum_trailer: true,
+                encoding: Encoding::Zstd,
+                plaintext_size: 65_536,
             },
         ),
         (
@@ -307,6 +341,8 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
                 total_size: 10_000_000,
                 checksum_follows: true,
                 hash_algorithm: HashAlgorithm::Blake3,
+                encoding: Encoding::Identity,
+                plaintext_size: 0,
             },
         ),
         (
@@ -317,6 +353,20 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
                 total_size: 0,
                 checksum_follows: false,
                 hash_algorithm: HashAlgorithm::Blake3,
+                encoding: Encoding::Identity,
+                plaintext_size: 0,
+            },
+        ),
+        (
+            "file_ready_zstd",
+            "Get header for a zstd-compressed response body.",
+            Response::FileReady {
+                size: 12_345,
+                total_size: 65_536,
+                checksum_follows: true,
+                hash_algorithm: HashAlgorithm::Blake3,
+                encoding: Encoding::Zstd,
+                plaintext_size: 65_536,
             },
         ),
         (
@@ -356,6 +406,7 @@ pub fn error_code_samples() -> Vec<(&'static str, ErrorCode)> {
         ("FileTooLarge", FileTooLarge),
         ("UploadOverflow", UploadOverflow),
         ("UploadTruncated", UploadTruncated),
+        ("DecodeError", DecodeError),
         ("ChecksumMismatch", ChecksumMismatch),
         ("RateLimited", RateLimited),
         ("Malformed", Malformed),
