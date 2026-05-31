@@ -259,6 +259,13 @@ cap applies to a single `DirListing` page, not to the whole listing; a
 server **SHOULD** additionally split a page that would otherwise exceed
 a soft byte budget (the reference server uses ~1 MiB).
 
+Note that pagination is **reserved but unimplemented** in the reference
+server (see "Ls pagination" in [qftp-protocol.md](qftp-protocol.md)): the
+`Request::Ls.cursor` and `Response::DirListing.next_cursor` fields are
+fixed in the qftp/1.0 wire, but the reference server always emits
+`next_cursor = None` and treats the 100000-entry cap as an absolute
+limit, refusing larger directories with `ErrorCode::Internal`.
+
 ## Body streaming
 
 `Get` and `Put` carry raw file bytes on the **same** QUIC stream as

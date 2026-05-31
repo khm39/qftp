@@ -79,6 +79,19 @@ an unbounded `DirListing` frame:
   applies per page, and a server **SHOULD** also split a page that would
   exceed a soft byte budget (~1 MiB in the reference server).
 
+**Reference implementation status (qftp/1.0): pagination is reserved but
+not yet implemented.** The `cursor` and `next_cursor` fields are part of
+the frozen wire format and the protocol contract above is normative for
+future servers, but the reference server in this repository does **not**
+split listings: it always replies with `next_cursor = None` and ignores
+any `cursor` a client sends. Its single-page cap is therefore an absolute
+limit — a directory with more than 100000 listable entries is **refused**
+with an `Internal` error (`ErrorCode::Internal`) rather than silently
+truncated, and is currently unlistable until a client/server that
+implements the loop above is shipped. Clients should still implement the
+`next_cursor` loop for forward compatibility; against this server the loop
+simply terminates after the first page.
+
 #### Directory and file metadata
 
 `DirEntry` (in `DirListing`) and `FileStat` (from `Stat`) carry the same
