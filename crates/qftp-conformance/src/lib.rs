@@ -319,10 +319,11 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
     ]
 }
 
-/// All `ErrorCode` variants in declaration order. The index in this
-/// list is the on-wire discriminant; the generator emits one
-/// `Response::Err` per code so the registry in `spec/error-codes.md`
-/// is backed by measured bytes.
+/// All `ErrorCode` variants in declaration order. The generator emits
+/// one `Response::Err` per code so the registry in `spec/error-codes.md`
+/// is backed by measured bytes. The on-wire value of each code is its
+/// numeric status (`ErrorCode::to_u32`, e.g. 404/500), not this list
+/// index.
 pub fn error_code_samples() -> Vec<(&'static str, ErrorCode)> {
     use ErrorCode::*;
     vec![
