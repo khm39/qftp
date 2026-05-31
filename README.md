@@ -259,4 +259,4 @@ steps, bearer-token auth model, and certificate handling are in
 
 ## License
 
-Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT)).
+Licensed under the MIT license ([LICENSE.md](LICENSE.md)).

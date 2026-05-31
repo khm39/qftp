@@ -49,5 +49,5 @@ priority = "optional"
 assets = [
     ["target/release/qftp-client", "/usr/bin/", "755"],
     ["../../README.md", "/usr/share/doc/qftp-client/README.md", "644"],
-    ["../../LICENSE-MIT", "/usr/share/doc/qftp-client/LICENSE-MIT", "644"],
+    ["../../LICENSE.md", "/usr/share/doc/qftp-client/LICENSE.md", "644"],
 ]

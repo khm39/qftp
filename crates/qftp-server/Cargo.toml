@@ -50,5 +50,5 @@ assets = [
     ["target/release/qftp-server", "/usr/bin/", "755"],
     ["../../examples/systemd/qftp-server.service", "/lib/systemd/system/", "644"],
     ["../../README.md", "/usr/share/doc/qftp-server/README.md", "644"],
-    ["../../LICENSE-MIT", "/usr/share/doc/qftp-server/LICENSE-MIT", "644"],
+    ["../../LICENSE.md", "/usr/share/doc/qftp-server/LICENSE.md", "644"],
 ]
