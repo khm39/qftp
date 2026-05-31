@@ -82,7 +82,7 @@ this file tracks the reference implementation.
   exits. Piping commands on stdin runs them in batch.
 - **Documentation.** Top-level README, the protocol specification in
   [spec/](spec/), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md),
-  and dual MIT/Apache-2.0 licensing.
+  and MIT licensing.
 - **Packaging.** Multi-stage Dockerfile, systemd unit example,
   cargo-dist release workflow, and `repository`/`license`/`rust-version`
   metadata on every crate.

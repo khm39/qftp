@@ -72,7 +72,7 @@ jobs:
           mkdir -p "$dir"
           cp target/${{ matrix.target }}/release/qftp-server "$dir/"
           cp target/${{ matrix.target }}/release/qftp-client "$dir/"
-          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$dir/"
+          cp README.md CHANGELOG.md LICENSE-MIT "$dir/"
           tar czf "$dir.tar.gz" "$dir"
           # macOS ships shasum but not coreutils' sha256sum; the Linux
           # runners are the other way round. Pick whichever is present
