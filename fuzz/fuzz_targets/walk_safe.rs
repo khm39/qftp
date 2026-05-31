@@ -28,6 +28,14 @@ fn roots() -> &'static Roots {
         let root = dir.path().to_path_buf();
         let cwd = root.join("sub");
         std::fs::create_dir_all(&cwd).expect("fuzz cwd");
+        // Populate the tree so fuzz inputs can reach branches that
+        // need an existing on-disk component: a regular file (the
+        // `Normal` -> existing-non-symlink `Ok(_)` path) and symlinks
+        // pointing inside and outside `root` (the symlink-rejection
+        // branch). Without these, those arms are unreachable.
+        std::fs::File::create(cwd.join("file")).expect("fuzz file");
+        std::os::unix::fs::symlink("sub", root.join("link_in")).expect("fuzz link_in");
+        std::os::unix::fs::symlink("/tmp", root.join("link_out")).expect("fuzz link_out");
         Roots {
             root,
             cwd,

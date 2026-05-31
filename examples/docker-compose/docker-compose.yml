@@ -14,7 +14,9 @@
 #   ./certs/cert.pem ./certs/key.pem   TLS certificate + private key
 #   ./data/                            the served filesystem (writable
 #                                      by the container user, uid 65532)
-# users.toml and tokens.toml in this folder are sample configs.
+#   ./tokens.toml                      copy tokens.toml.example, then
+#                                      replace every placeholder token
+# users.toml in this folder is a sample config.
 
 services:
   qftp-server:

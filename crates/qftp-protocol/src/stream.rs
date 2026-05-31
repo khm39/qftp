@@ -323,6 +323,11 @@ pub enum StreamState {
         remaining: u64,
         mode: u32,
         completed: bool,
+        /// `no_clobber` from the originating `Put`. Carried here so the
+        /// commit step re-checks the destination right before the
+        /// rename: a file can appear at `final_path` *during* the
+        /// transfer, and an unconditional rename would overwrite it.
+        no_clobber: bool,
         hasher: blake3::Hasher,
         expected_checksum: Option<Vec<u8>>,
         /// When set, the client will send a 32-byte BLAKE3 trailer on
@@ -493,6 +498,7 @@ mod tests {
             remaining,
             mode: 0o644,
             completed,
+            no_clobber: false,
             hasher: blake3::Hasher::new(),
             expected_checksum: None,
             trailer_buf: None,

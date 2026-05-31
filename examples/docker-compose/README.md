@@ -23,7 +23,18 @@ is HTTP/3 over UDP and is **not** proxied -- the browser reaches
 
 Run these from this directory.
 
-1. **TLS certificate.** For a real deployment use a browser-trusted
+1. **Tokens (required first).** No `tokens.toml` ships with the repo --
+   the bridge will not start without one, by design. Copy the example
+   and replace **every** placeholder with a fresh random value (a token
+   is the only secret gating that user's web access):
+
+   ```sh
+   cp tokens.toml.example tokens.toml
+   # then edit tokens.toml; for each token use a high-entropy value:
+   openssl rand -hex 32
+   ```
+
+2. **TLS certificate.** For a real deployment use a browser-trusted
    certificate. For a LAN / dev box, a self-signed one works if the
    SPA pins it (WebTransport `serverCertificateHashes`), which needs an
    ECDSA P-256 key and a short validity:
@@ -35,9 +46,6 @@ Run these from this directory.
      -subj "/CN=localhost" \
      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
    ```
-
-2. **Tokens.** Edit `tokens.toml` and replace the placeholder tokens
-   with high-entropy random values.
 
 3. **Data directory.** The containers run as the distroless `nonroot`
    user (uid 65532), so the served filesystem must be writable by it:

@@ -215,7 +215,7 @@ fn try_connect(
                     error = ?e,
                     "stale session ticket; falling back to 1-RTT"
                 );
-                let _ = session_store::forget(&dir, &spec.host);
+                forget_stale_ticket(&dir, &spec.host);
             }
         }
     }
@@ -308,6 +308,21 @@ fn resume_ticket(opts: &EstablishOpts, host: &str) -> Option<(PathBuf, Vec<u8>)>
         .or_else(session_store::default_dir)?;
     let ticket = session_store::load(&dir, host, opts.expected_cert_fingerprint.as_ref())?;
     Some((dir, ticket))
+}
+
+/// Drop the stored ticket for `host` after quiche rejected it in
+/// `set_session`, so the next connect doesn't replay a blob the server
+/// won't accept. A removal error is swallowed: the 1-RTT fallback the
+/// caller is already taking does not depend on the file being gone.
+///
+/// Factored out of `try_connect`'s `set_session` error arm so the
+/// "forget on rejection" behaviour is a callable seam: quiche's
+/// `set_session` can't be driven to fail in a unit test, but this helper
+/// — the exact code that arm runs — can. The full path that actually
+/// reaches a real `set_session` rejection is exercised only against a
+/// live server in CI / e2e.
+fn forget_stale_ticket(dir: &std::path::Path, host: &str) {
+    let _ = session_store::forget(dir, host);
 }
 
 /// Check whether the DER-encoded leaf certificate identifies `host`.
@@ -696,17 +711,29 @@ mod tests {
 
     #[test]
     fn forget_clears_ticket_on_set_session_error_path() {
-        // Mirrors the do-on-set_session-error branch: when quiche rejects
-        // the ticket, the stored blob is forgotten so the next connect
-        // doesn't replay it. We can't drive quiche's set_session to fail
-        // in a unit test, so assert the forget() the error arm calls
-        // actually removes the ticket the resume_ticket seam returned.
+        // Drives the *exact* code try_connect's set_session error arm
+        // runs: `forget_stale_ticket(&dir, host)`. quiche's set_session
+        // can't be made to fail in a unit test, so this exercises the
+        // arm's body — not a hand-mirrored copy — against the dir the
+        // resume_ticket seam handed back. The full path through a real
+        // set_session rejection is covered only in CI / e2e.
         let tmp = tempfile::TempDir::new().unwrap();
         session_store::save(tmp.path(), "host:4433", Some(b"opaque"), &[0u8; 32]).unwrap();
         let (dir, _ticket) =
             resume_ticket(&opts_with(true, tmp.path(), None), "host:4433").unwrap();
-        session_store::forget(&dir, "host:4433").unwrap();
+        forget_stale_ticket(&dir, "host:4433");
         assert!(!session_store::ticket_path(tmp.path(), "host:4433").exists());
         assert!(resume_ticket(&opts_with(true, tmp.path(), None), "host:4433").is_none());
+    }
+
+    #[test]
+    fn forget_stale_ticket_tolerates_missing_file() {
+        // The error arm must not propagate a removal failure: a 1-RTT
+        // fallback proceeds even if there is nothing to forget (e.g. a
+        // concurrent connect already purged the ticket). forget_stale_ticket
+        // returns (), so this just asserts it doesn't panic on a missing file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        forget_stale_ticket(tmp.path(), "host:4433");
+        assert!(!session_store::ticket_path(tmp.path(), "host:4433").exists());
     }
 }

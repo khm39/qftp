@@ -42,6 +42,41 @@
       "wire_hex": "0000003c01000000a001000017000000000000006f6666736574207061737420656e64206f662066696c65010000000000100000000000000004000000000000"
     },
     {
+      "name": "err_details_upload",
+      "description": "Structured error reply carrying ErrorDetails::Upload.",
+      "value": {
+        "Err": {
+          "code": 423,
+          "details": {
+            "Upload": {
+              "declared": 4096,
+              "received": 8192
+            }
+          },
+          "message": "received more bytes than declared"
+        }
+      },
+      "payload_hex": "01000000a701000021000000000000007265636569766564206d6f7265206279746573207468616e206465636c61726564010100000000200000000000000010000000000000",
+      "wire_hex": "0000004601000000a701000021000000000000007265636569766564206d6f7265206279746573207468616e206465636c61726564010100000000200000000000000010000000000000"
+    },
+    {
+      "name": "err_details_retry_after",
+      "description": "Structured error reply carrying ErrorDetails::RetryAfter.",
+      "value": {
+        "Err": {
+          "code": 429,
+          "details": {
+            "RetryAfter": {
+              "millis": 1000
+            }
+          },
+          "message": "too many requests"
+        }
+      },
+      "payload_hex": "01000000ad0100001100000000000000746f6f206d616e792072657175657374730102000000e8030000",
+      "wire_hex": "0000002a01000000ad0100001100000000000000746f6f206d616e792072657175657374730102000000e8030000"
+    },
+    {
       "name": "dir_listing",
       "description": "Directory listing with a file and a subdirectory.",
       "value": {
