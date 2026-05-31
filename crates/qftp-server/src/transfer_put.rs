@@ -323,6 +323,7 @@ pub(crate) fn start_put(
         remaining: size,
         mode,
         completed: false,
+        no_clobber,
         hasher,
         expected_checksum,
         trailer_buf: if checksum_trailer {
@@ -421,6 +422,7 @@ pub(crate) fn drive_put(
         remaining,
         mode,
         completed,
+        no_clobber,
         hasher,
         expected_checksum,
         trailer_buf,
@@ -664,6 +666,22 @@ pub(crate) fn drive_put(
         if let Err(e) = handler::recheck_ancestors_no_symlinks(final_path, &owner.home) {
             return Ok(Some(Response::Err(e)));
         }
+        // Re-check `no_clobber` immediately before the rename. `start_put`
+        // evaluated it once at entry, but a co-tenant (or the client over
+        // a second connection) could create `final_path` *during* the
+        // transfer; the unconditional rename would then silently overwrite
+        // it. On a hit the guard skips the rename and settles accounting.
+        if let Some(resp) = no_clobber_commit_guard(
+            *no_clobber,
+            final_path,
+            temp_path,
+            owner,
+            *reserved_bytes,
+            *prior_bytes,
+            completed,
+        ) {
+            return Ok(Some(resp));
+        }
         if let Err(e) = fs::rename(temp_path, &final_path) {
             return Ok(Some(err(
                 ErrorCode::Internal,
@@ -714,6 +732,49 @@ pub(crate) fn open_temp(path: &Path, resume: bool) -> std::io::Result<File> {
     opts.open(path)
 }
 
+/// Commit-time `no_clobber` gate, run immediately before the rename.
+///
+/// When the upload requested `no_clobber` and a file (or symlink --
+/// lstat, not stat, so a planted dangling link still counts) now exists
+/// at `final_path`, refuse to overwrite it: the rename is skipped and
+/// the partial is cleaned up exactly as the checksum-mismatch path does
+/// -- delete the temp, release the in-flight reservation, refund any
+/// resume-prefix bytes from `used_bytes`, and mark the stream
+/// `completed` so `StreamState`'s Drop does not also account for it.
+///
+/// Returns `Some(Response::Err(AlreadyExists))` on a refusal (the caller
+/// must not rename), `None` when the commit may proceed.
+fn no_clobber_commit_guard(
+    commit_no_clobber: bool,
+    final_path: &Path,
+    temp_path: &Path,
+    owner: &Arc<qftp_protocol::user::User>,
+    reserved_bytes: u64,
+    prior_bytes: u64,
+    completed: &mut bool,
+) -> Option<Response> {
+    if !(commit_no_clobber && std::fs::symlink_metadata(final_path).is_ok()) {
+        return None;
+    }
+    let _ = fs::remove_file(temp_path);
+    owner
+        .in_flight_bytes
+        .fetch_sub(reserved_bytes, Ordering::Relaxed);
+    if prior_bytes > 0 {
+        owner
+            .used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                Some(u.saturating_sub(prior_bytes))
+            })
+            .ok();
+    }
+    *completed = true;
+    Some(err(
+        ErrorCode::AlreadyExists,
+        format!("path already exists (no_clobber): {}", final_path.display()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +814,100 @@ mod tests {
         // A fresh open creates it; a following resume open then works.
         drop(open_temp(&path, false).expect("fresh open"));
         assert!(open_temp(&path, true).is_ok());
+    }
+
+    use qftp_protocol::user::{Permissions, User};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex;
+
+    fn test_user(home: PathBuf) -> Arc<User> {
+        Arc::new(User {
+            name: "t".to_string(),
+            home,
+            permissions: Permissions::full(),
+            quota_bytes: Some(1_000_000),
+            used_bytes: AtomicU64::new(0),
+            in_flight_bytes: AtomicU64::new(0),
+            active_uploads: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// no_clobber + a file that appeared at the destination during the
+    /// transfer: the guard refuses, the temp is removed, the stream is
+    /// marked completed, and the reservation/prefix accounting is
+    /// settled back to zero.
+    #[test]
+    fn commit_no_clobber_refuses_when_destination_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user(dir.path().to_path_buf());
+        let temp = dir.path().join("doc.bin.qftp.partial");
+        let final_path = dir.path().join("doc.bin");
+        fs::write(&temp, b"new-body").unwrap();
+        // A racing writer planted the destination after start_put.
+        fs::write(&final_path, b"existing").unwrap();
+
+        let reserved = 8u64;
+        let prior = 3u64;
+        user.in_flight_bytes.fetch_add(reserved, Ordering::Relaxed);
+        user.used_bytes.fetch_add(prior, Ordering::Relaxed);
+        let mut completed = false;
+
+        let resp = no_clobber_commit_guard(
+            true,
+            &final_path,
+            &temp,
+            &user,
+            reserved,
+            prior,
+            &mut completed,
+        )
+        .expect("guard must refuse");
+        match resp {
+            Response::Err(e) => assert_eq!(e.code, ErrorCode::AlreadyExists),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+        assert!(completed, "stream must be marked completed");
+        assert!(!temp.exists(), "temp must be removed on refusal");
+        // The destination the client refused to clobber is untouched.
+        assert_eq!(fs::read(&final_path).unwrap(), b"existing");
+        assert_eq!(user.in_flight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(user.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    /// no_clobber == false: the guard never refuses, even when the
+    /// destination exists, so the commit proceeds to overwrite it.
+    #[test]
+    fn commit_proceeds_without_no_clobber_even_if_destination_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user(dir.path().to_path_buf());
+        let temp = dir.path().join("doc.bin.qftp.partial");
+        let final_path = dir.path().join("doc.bin");
+        fs::write(&temp, b"new-body").unwrap();
+        fs::write(&final_path, b"existing").unwrap();
+
+        let mut completed = false;
+        let resp = no_clobber_commit_guard(false, &final_path, &temp, &user, 8, 0, &mut completed);
+        assert!(resp.is_none(), "non-no_clobber must not refuse");
+        assert!(!completed, "guard must not touch accounting when passing");
+        assert!(temp.exists(), "temp must survive for the rename");
+    }
+
+    /// no_clobber == true but the destination does not exist at commit:
+    /// nothing appeared during the transfer, so the commit proceeds.
+    #[test]
+    fn commit_proceeds_with_no_clobber_when_destination_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user(dir.path().to_path_buf());
+        let temp = dir.path().join("doc.bin.qftp.partial");
+        let final_path = dir.path().join("doc.bin");
+        fs::write(&temp, b"new-body").unwrap();
+
+        let mut completed = false;
+        let resp = no_clobber_commit_guard(true, &final_path, &temp, &user, 8, 0, &mut completed);
+        assert!(resp.is_none(), "absent destination must not refuse");
+        assert!(!completed);
+        assert!(temp.exists());
     }
 }
