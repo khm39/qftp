@@ -20,8 +20,8 @@ toml = "0.8"
 toml_edit = "0.22"
 
 [package.metadata.deb]
-maintainer = "qftp contributors"
-copyright = "MIT OR Apache-2.0"
+maintainer = "khm39 <khm39@kuraft.com>"
+copyright = "2026 khm39 <khm39@kuraft.com>"
 extended-description = """\
 Ops-side CLI for editing qftp-server's users.toml."""
 section = "net"

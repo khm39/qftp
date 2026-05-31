@@ -38,8 +38,8 @@ quiche = "0.24"
 qftp-common = { path = "../qftp-common" }
 
 [package.metadata.deb]
-maintainer = "qftp contributors"
-copyright = "MIT OR Apache-2.0"
+maintainer = "khm39 <khm39@kuraft.com>"
+copyright = "2026 khm39 <khm39@kuraft.com>"
 extended-description = """\
 Modern, secure file-transfer server built on QUIC + TLS 1.3.
 mTLS authentication, per-user ACLs, BLAKE3 integrity, 0-RTT
@@ -50,6 +50,5 @@ assets = [
     ["target/release/qftp-server", "/usr/bin/", "755"],
     ["../../examples/systemd/qftp-server.service", "/lib/systemd/system/", "644"],
     ["../../README.md", "/usr/share/doc/qftp-server/README.md", "644"],
-    ["../../LICENSE-MIT", "/usr/share/doc/qftp-server/LICENSE-MIT", "644"],
-    ["../../LICENSE-APACHE", "/usr/share/doc/qftp-server/LICENSE-APACHE", "644"],
+    ["../../LICENSE.md", "/usr/share/doc/qftp-server/LICENSE.md", "644"],
 ]
