@@ -608,7 +608,9 @@ pub enum Request {
         /// For compressed bodies, `size` remains the logical/plaintext
         /// byte count; codec framing determines how the compressed wire
         /// body is delimited, and the server verifies the BLAKE3 trailer
-        /// over the decoded plaintext.
+        /// over the decoded plaintext. The reference implementation
+        /// currently supports compressed Put only for fresh uploads
+        /// (`offset == 0`); compressed resume is a future extension.
         #[serde(default)]
         encoding: Encoding,
         /// Plaintext (post-decode) byte count. Ignored when

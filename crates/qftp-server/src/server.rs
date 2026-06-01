@@ -1207,6 +1207,8 @@ enum PendingAction {
         expected_checksum: Option<Vec<u8>>,
         no_clobber: bool,
         checksum_trailer: bool,
+        encoding: Encoding,
+        plaintext_size: u64,
         leftover: Vec<u8>,
     },
     HandleSimple {
@@ -1429,7 +1431,8 @@ fn plan_actions(
                             checksum,
                             no_clobber,
                             checksum_trailer,
-                            ..
+                            encoding,
+                            plaintext_size,
                         } => {
                             // qftp/1 negotiates BLAKE3 only; anything else is
                             // refused rather than silently treated as BLAKE3.
@@ -1454,6 +1457,8 @@ fn plan_actions(
                                 expected_checksum: checksum,
                                 no_clobber,
                                 checksum_trailer,
+                                encoding,
+                                plaintext_size,
                                 leftover,
                             });
                             *state = StreamState::Done;
@@ -1538,6 +1543,8 @@ fn execute_pending_actions(
                 expected_checksum,
                 no_clobber,
                 checksum_trailer,
+                encoding,
+                plaintext_size,
                 leftover,
             } => {
                 crate::transfer_put::start_put(
@@ -1551,6 +1558,8 @@ fn execute_pending_actions(
                         expected_checksum,
                         no_clobber,
                         checksum_trailer,
+                        encoding,
+                        plaintext_size,
                         leftover,
                     },
                     tmp,

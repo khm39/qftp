@@ -113,7 +113,7 @@ metadata, byte layout in [wire-format.md](wire-format.md):
 ```
 client -> server : Request::Get { path, offset, length, accept_encoding }
 server -> client : Response::FileReady { size, total_size, checksum_follows, hash_algorithm, encoding, plaintext_size }
-server -> client : <size bytes of file body>
+server -> client : body bytes
 server -> client : <digest-length trailer, if checksum_follows>
                    <FIN on the last byte>
 ```
@@ -122,13 +122,13 @@ server -> client : <digest-length trailer, if checksum_follows>
   seeks to it before reading.
 - `length` clips the response to at most that many body bytes; `None`
   means "to EOF".
-- `size` is the number of body bytes the server is about to stream:
-  plaintext bytes for `encoding == Identity`, encoded wire bytes for a
-  compressed response. `total_size` is the file's full on-disk
-  plaintext size, so the client can detect truncation across resumed
-  sessions. A shrink mid-resume (`total_size` below the client's
-  `offset`) is `ErrorCode::InvalidRange`. When `size == 0` the body
-  phase is skipped entirely (a trailer, if any, still follows).
+- `size` is the logical/plaintext byte count the client will receive.
+  For `encoding == Identity` it is also the wire body length. For a
+  compressed response, `size == plaintext_size` and the compressed wire
+  body is delimited by the self-contained codec frame. `total_size` is
+  the file's full on-disk plaintext size, so the client can detect
+  truncation across resumed sessions. A shrink mid-resume (`total_size`
+  below the client's `offset`) is `ErrorCode::InvalidRange`.
 - `hash_algorithm` names the digest the trailer uses; it is BLAKE3 in
   `qftp/1` (see [`HashAlgorithm`](wire-format.md#hashalgorithm)).
 - When `checksum_follows` is true, the body is immediately followed by a
@@ -153,8 +153,8 @@ The transfer domain is always plaintext: `Get.offset`, `Put.offset`,
 the server-side `.partial` file, quota accounting, and the BLAKE3
 trailer all refer to decoded plaintext bytes. When `encoding ==
 Identity`, `plaintext_size` is ignored and receivers use `size`. When
-compressed, `size` is the encoded byte count on the QUIC stream and
-`plaintext_size` is the decoded byte count.
+compressed, `size == plaintext_size` and the compressed wire body is
+delimited by the single self-contained codec frame, not by `size`.
 
 Receivers MUST defend against decompression bombs by bounding decoded
 output to `plaintext_size` and `MAX_FILE_SIZE`; exceeding that bound is
@@ -170,17 +170,21 @@ appropriate `ErrorCode` and ends the stream.
 
 ```
 client -> server : Request::Put { path, size, mode, offset, hash_algorithm, checksum, no_clobber, checksum_trailer, encoding, plaintext_size }
-client -> server : <size bytes of body>
+client -> server : body bytes
 client -> server : <digest-length trailer, if checksum_trailer>
                    <FIN on the last byte>
 server -> client : Response::Ok | Response::Err(...)
 ```
 
-- `size` is the number of body bytes the client is about to send
-  (post-`offset`): plaintext bytes for `encoding == Identity`, encoded
-  wire bytes for a compressed upload. When compressed,
-  `plaintext_size` is the decoded byte count. When `size == 0` the
-  body phase is skipped.
+- `size` is the logical/plaintext byte count the client is about to send
+  (post-`offset`). For `encoding == Identity` it is also the wire body
+  length. For `encoding == Zstd`, the body is one self-contained zstd
+  frame whose decoded output is exactly `plaintext_size` bytes, and
+  `size == plaintext_size`; the frame end, not `size`, delimits the
+  compressed wire body. The reference implementation supports
+  compressed Put only for fresh uploads (`offset == 0`); compressed
+  resume is a future extension and is refused with
+  `ErrorCode::Unsupported`.
 - `hash_algorithm` names the digest used for both `checksum` and the
   trailer; it is BLAKE3 in `qftp/1`
   (see [`HashAlgorithm`](wire-format.md#hashalgorithm)). A server that

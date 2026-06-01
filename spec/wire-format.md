@@ -296,9 +296,9 @@ FIN marks the end. A compressed Get body is codec-framed as described
 below.
 
 When `encoding == Identity`, `size` is the plaintext length and
-`plaintext_size` is ignored; receivers use `size`. For a compressed Get,
-`size` remains the logical/plaintext byte count and is set equal to
-`plaintext_size`; it is **not** a wire delimiter. The compressed wire
+`plaintext_size` is ignored; receivers use `size`. For a compressed
+body, `size` remains the logical/plaintext byte count and is set equal
+to `plaintext_size`; it is **not** a wire delimiter. The compressed wire
 body is a single self-terminating codec frame. The `offset` field and
 the BLAKE3 trailer always operate on plaintext, independent of
 `encoding`.
@@ -347,18 +347,28 @@ server -> client : <digest-length trailer>       (only if checksum_follows == tr
 
 ```
 client -> server : frame( Request::Put { path, size, mode, offset, hash_algorithm, checksum, no_clobber, checksum_trailer, encoding, plaintext_size } )
-client -> server : <size> body bytes
+client -> server : body bytes
 client -> server : <digest-length trailer>       (only if checksum_trailer == true)
                    QUIC stream FIN on the last byte
 server -> client : frame( Response::Ok ) | frame( Response::Err( ErrorResponse ) )
 ```
 
 - The client streams exactly `size` body bytes. For `Identity`, these
-  bytes are plaintext. Compressed Put is reserved for a later phase; its
-  compressed wire framing will be specified with the same plaintext
-  domain invariants (`offset`, `size`, `plaintext_size`, quota, and
-  digest all refer to decoded bytes). When `size == 0` the body phase is
-  skipped.
+  bytes are plaintext.
+- For `Zstd`, the client streams one self-contained zstd frame whose
+  decoded output is exactly `plaintext_size` bytes, and
+  `size == plaintext_size`. The frame end, not `size`, delimits the
+  compressed wire body. The server feeds bytes to the zstd decoder until
+  the decoder reports frame completion and the exact number of input
+  bytes consumed; bytes after that boundary are the trailer and MUST NOT
+  be consumed by the decoder. The reference implementation supports
+  compressed Put only for fresh uploads (`offset == 0`); compressed
+  resume is a future extension and is refused with
+  [`Unsupported`](error-codes.md).
+- For `Identity` with `size == 0`, the body phase is skipped. For
+  `Zstd` with `size == plaintext_size == 0`, the body is still an empty
+  zstd frame so the receiver can observe the frame boundary before the
+  trailer.
 - The QUIC stream **FIN** is set on the last trailer byte when a
   trailer follows, otherwise on the last body byte.
 - When `checksum_trailer` is `true`, a trailer of the `hash_algorithm`

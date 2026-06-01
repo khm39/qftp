@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::compress::ZstdEncoder;
+use crate::compress::{ZstdDecoder, ZstdEncoder};
 use crate::user::User;
 
 /// Compute the deterministic `.qftp.partial` temp path for a final
@@ -186,6 +186,12 @@ pub enum SendEncoding {
     },
 }
 
+/// Transfer codec state for an in-progress Put receive.
+pub enum RecvEncoding {
+    Identity,
+    Zstd { decoder: ZstdDecoder },
+}
+
 /// How a single received Put chunk should be split between the file
 /// body and the streaming-checksum trailer. The pure policy is shared
 /// by the native server (`start_put`/`drive_put`) and the WebTransport
@@ -339,6 +345,7 @@ pub enum StreamState {
         /// transfer, and an unconditional rename would overwrite it.
         no_clobber: bool,
         hasher: blake3::Hasher,
+        recv_encoding: RecvEncoding,
         expected_checksum: Option<Vec<u8>>,
         /// When set, the client will send a 32-byte BLAKE3 trailer on
         /// the same stream after the body bytes. We accumulate
@@ -511,6 +518,7 @@ mod tests {
             completed,
             no_clobber: false,
             hasher: blake3::Hasher::new(),
+            recv_encoding: RecvEncoding::Identity,
             expected_checksum: None,
             trailer_buf: None,
             reserved_bytes: reserved,

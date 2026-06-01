@@ -17,9 +17,11 @@ use tracing::warn;
 use crate::connection::ConnectionContext;
 use crate::metrics::Metrics;
 use crate::server::fail_stream;
+use qftp_protocol::compress::{CompressionError, ZstdDecoder};
 use qftp_protocol::handler::{self, err, io_code};
 use qftp_protocol::stream::{
-    temp_path_for, ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE, MAX_FILE_SIZE,
+    temp_path_for, RecvEncoding, ResumeRehash, StreamState, UploadClaim, FILE_CHUNK_SIZE,
+    MAX_FILE_SIZE,
 };
 use qftp_protocol::user::InFlightReservation;
 
@@ -39,6 +41,125 @@ pub(crate) fn put_overflow_err(o: qftp_protocol::stream::PutOverflow) -> Respons
     }
 }
 
+fn compressed_decode_err(e: CompressionError) -> Response {
+    match e {
+        CompressionError::PlaintextLimit { .. } => err(
+            ErrorCode::UploadOverflow,
+            "decompressed size exceeded declared size",
+        ),
+        CompressionError::Truncated => err(ErrorCode::DecodeError, "zstd frame is truncated"),
+        CompressionError::Codec(e) => {
+            err(ErrorCode::DecodeError, format!("zstd decode error: {e}"))
+        }
+        CompressionError::NoProgress => {
+            err(ErrorCode::DecodeError, "zstd decoder made no progress")
+        }
+    }
+}
+
+fn cleanup_rejected_upload(
+    temp_path: &Path,
+    owner: &Arc<qftp_protocol::user::User>,
+    reserved_bytes: u64,
+    prior_bytes: u64,
+    completed: &mut bool,
+) {
+    let _ = fs::remove_file(temp_path);
+    owner
+        .in_flight_bytes
+        .fetch_sub(reserved_bytes, Ordering::Relaxed);
+    if prior_bytes > 0 {
+        owner
+            .used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                Some(u.saturating_sub(prior_bytes))
+            })
+            .ok();
+    }
+    *completed = true;
+}
+
+fn fail_rejected_upload(
+    temp_path: &Path,
+    owner: &Arc<qftp_protocol::user::User>,
+    reserved_bytes: u64,
+    prior_bytes: u64,
+    completed: &mut bool,
+    resp: Response,
+) -> Response {
+    cleanup_rejected_upload(temp_path, owner, reserved_bytes, prior_bytes, completed);
+    resp
+}
+
+fn feed_zstd_put_chunk(
+    input: &[u8],
+    decoder: &mut ZstdDecoder,
+    writer: &mut BufWriter<File>,
+    hasher: &mut blake3::Hasher,
+    remaining: &mut u64,
+    trailer_buf: &mut Option<qftp_protocol::stream::TrailerBuf>,
+    metrics: &Metrics,
+) -> Result<(), Response> {
+    if decoder.frame_complete() {
+        append_put_trailer(input, trailer_buf)?;
+        return Ok(());
+    }
+
+    let progress = decoder.push(input).map_err(compressed_decode_err)?;
+    while !decoder.pending().is_empty() {
+        let n = decoder.pending().len();
+        if n as u64 > *remaining {
+            return Err(err(
+                ErrorCode::UploadOverflow,
+                "decompressed size exceeded declared size",
+            ));
+        }
+        writer
+            .write_all(decoder.pending())
+            .map_err(|e| err(ErrorCode::Internal, format!("Failed to write file: {e}")))?;
+        hasher.update(decoder.pending());
+        decoder.consume(n);
+        *remaining -= n as u64;
+        metrics.add_bytes_received(n as u64);
+    }
+
+    if progress.frame_complete {
+        if *remaining > 0 {
+            return Err(err(
+                ErrorCode::DecodeError,
+                format!("compressed body decoded to fewer bytes than declared: {remaining} bytes missing"),
+            ));
+        }
+        append_put_trailer(&input[progress.consumed..], trailer_buf)?;
+    } else if progress.consumed < input.len() {
+        return Err(err(
+            ErrorCode::DecodeError,
+            "zstd decoder stopped before consuming the compressed chunk",
+        ));
+    }
+    Ok(())
+}
+
+fn append_put_trailer(
+    bytes: &[u8],
+    trailer_buf: &mut Option<qftp_protocol::stream::TrailerBuf>,
+) -> Result<(), Response> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let Some(buf) = trailer_buf else {
+        return Err(err(
+            ErrorCode::UploadOverflow,
+            "Upload exceeded declared size",
+        ));
+    };
+    let consumed = buf.extend(bytes);
+    if consumed < bytes.len() {
+        return Err(err(ErrorCode::UploadOverflow, "Trailer bytes exceeded 32"));
+    }
+    Ok(())
+}
+
 /// Protocol-level parameters of a `Put` request, grouped so `start_put`
 /// takes the transport handles (`ctx`, `stream_id`, scratch, metrics)
 /// plus this one bundle rather than a dozen positional arguments.
@@ -50,6 +171,8 @@ pub(crate) struct PutRequest {
     pub expected_checksum: Option<Vec<u8>>,
     pub no_clobber: bool,
     pub checksum_trailer: bool,
+    pub encoding: Encoding,
+    pub plaintext_size: u64,
     pub leftover: Vec<u8>,
 }
 
@@ -68,6 +191,8 @@ pub(crate) fn start_put(
         expected_checksum,
         no_clobber,
         checksum_trailer,
+        encoding,
+        plaintext_size,
         leftover,
     } = req;
     let path = path.as_str();
@@ -97,6 +222,34 @@ pub(crate) fn start_put(
             ctx,
             ErrorCode::Unsupported,
             "resumed upload requires a checksum".to_string(),
+        );
+    }
+    if !encoding.is_supported() {
+        return send_err(
+            ctx,
+            ErrorCode::Unsupported,
+            "unsupported upload transfer encoding".to_string(),
+        );
+    }
+    if encoding != Encoding::Identity && !checksum_trailer && expected_checksum.is_none() {
+        return send_err(
+            ctx,
+            ErrorCode::Unsupported,
+            "compressed upload requires a checksum".to_string(),
+        );
+    }
+    if encoding != Encoding::Identity && offset != 0 {
+        return send_err(
+            ctx,
+            ErrorCode::Unsupported,
+            "compressed resume not supported".to_string(),
+        );
+    }
+    if encoding == Encoding::Zstd && plaintext_size != size {
+        return send_err(
+            ctx,
+            ErrorCode::Malformed,
+            format!("compressed upload size {size} != plaintext_size {plaintext_size}"),
         );
     }
 
@@ -311,6 +464,20 @@ pub(crate) fn start_put(
         }
     }
     let writer = BufWriter::with_capacity(FILE_CHUNK_SIZE, file);
+    let recv_encoding = match encoding {
+        Encoding::Identity => RecvEncoding::Identity,
+        Encoding::Zstd => match ZstdDecoder::new(size.min(MAX_FILE_SIZE)) {
+            Ok(decoder) => RecvEncoding::Zstd { decoder },
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    ErrorCode::Internal,
+                    format!("failed to initialize zstd decoder: {e}"),
+                );
+            }
+        },
+        Encoding::Unknown(_) => unreachable!("unsupported encodings are rejected above"),
+    };
 
     // The reservation is now owned by `ReadingFileData`'s Drop (via
     // `reserved_bytes`); disarm the guard so the bytes aren't released
@@ -325,6 +492,7 @@ pub(crate) fn start_put(
         completed: false,
         no_clobber,
         hasher,
+        recv_encoding,
         expected_checksum,
         trailer_buf: if checksum_trailer {
             Some(qftp_protocol::stream::TrailerBuf::new())
@@ -339,57 +507,88 @@ pub(crate) fn start_put(
     };
     if !leftover.is_empty() {
         if let StreamState::ReadingFileData {
+            temp_path,
             writer,
             remaining,
+            completed,
             hasher,
+            recv_encoding,
             trailer_buf,
+            reserved_bytes,
+            prior_bytes,
             rehash,
+            owner,
             ..
         } = &mut new_state
         {
-            // Bytes coalesced into the same recv as the Put request
-            // frame can hold the body *and* the 32-byte streaming
-            // checksum trailer. Use the shared classifier so the split
-            // policy matches `drive_put`'s Phase A and the web bridge
-            // exactly (#269) -- counting the trailer against the body
-            // length would spuriously reject the upload with
-            // UploadOverflow (and a checksum_trailer Put always sends
-            // that trailer in-band right after the body).
-            let trailer_remaining = trailer_buf.as_ref().map(|b| b.remaining()).unwrap_or(0);
-            let split = match qftp_protocol::stream::classify_put_chunk(
-                leftover.len(),
-                *remaining,
-                trailer_buf.is_some(),
-                trailer_remaining,
-            ) {
-                Ok(s) => s,
-                Err(o) => return fail_stream(ctx, stream_id, metrics, put_overflow_err(o)),
-            };
-            if split.to_trailer > 0 {
-                if let Some(buf) = trailer_buf {
-                    buf.extend(&leftover[split.to_body..split.to_body + split.to_trailer]);
+            match recv_encoding {
+                RecvEncoding::Identity => {
+                    // Bytes coalesced into the same recv as the Put
+                    // request frame can hold the body *and* the
+                    // 32-byte streaming checksum trailer. Use the
+                    // shared classifier so the split policy matches
+                    // `drive_put`'s Phase A and the web bridge exactly
+                    // (#269).
+                    let trailer_remaining =
+                        trailer_buf.as_ref().map(|b| b.remaining()).unwrap_or(0);
+                    let split = match qftp_protocol::stream::classify_put_chunk(
+                        leftover.len(),
+                        *remaining,
+                        trailer_buf.is_some(),
+                        trailer_remaining,
+                    ) {
+                        Ok(s) => s,
+                        Err(o) => return fail_stream(ctx, stream_id, metrics, put_overflow_err(o)),
+                    };
+                    if split.to_trailer > 0 {
+                        if let Some(buf) = trailer_buf {
+                            buf.extend(&leftover[split.to_body..split.to_body + split.to_trailer]);
+                        }
+                    }
+                    let body = &leftover[..split.to_body];
+                    if let Some(rh) = rehash {
+                        // Resume: the prefix isn't hashed yet, so
+                        // these body bytes can't be hashed in order
+                        // now. Hold them; the re-hash completion path
+                        // in `drive_put` writes and hashes them once
+                        // the prefix is done. The trailer (if any) is
+                        // already buffered above.
+                        rh.pending_body = body.to_vec();
+                    } else if !body.is_empty() {
+                        if let Err(e) = writer.write_all(body) {
+                            return fail_stream(
+                                ctx,
+                                stream_id,
+                                metrics,
+                                err(ErrorCode::Internal, format!("Failed to write file: {e}")),
+                            );
+                        }
+                        hasher.update(body);
+                        *remaining -= split.to_body as u64;
+                        metrics.add_bytes_received(split.to_body as u64);
+                    }
                 }
-            }
-            let body = &leftover[..split.to_body];
-            if let Some(rh) = rehash {
-                // Resume: the prefix isn't hashed yet, so these body
-                // bytes can't be hashed in order now. Hold them; the
-                // re-hash completion path in `drive_put` writes and
-                // hashes them once the prefix is done. The trailer (if
-                // any) is already buffered above.
-                rh.pending_body = body.to_vec();
-            } else if !body.is_empty() {
-                if let Err(e) = writer.write_all(body) {
-                    return fail_stream(
-                        ctx,
-                        stream_id,
+                RecvEncoding::Zstd { decoder } => {
+                    if let Err(resp) = feed_zstd_put_chunk(
+                        &leftover,
+                        decoder,
+                        writer,
+                        hasher,
+                        remaining,
+                        trailer_buf,
                         metrics,
-                        err(ErrorCode::Internal, format!("Failed to write file: {e}")),
-                    );
+                    ) {
+                        let resp = fail_rejected_upload(
+                            temp_path,
+                            owner,
+                            *reserved_bytes,
+                            *prior_bytes,
+                            completed,
+                            resp,
+                        );
+                        return fail_stream(ctx, stream_id, metrics, resp);
+                    }
                 }
-                hasher.update(body);
-                *remaining -= split.to_body as u64;
-                metrics.add_bytes_received(split.to_body as u64);
             }
         }
     }
@@ -424,6 +623,7 @@ pub(crate) fn drive_put(
         completed,
         no_clobber,
         hasher,
+        recv_encoding,
         expected_checksum,
         trailer_buf,
         reserved_bytes,
@@ -452,20 +652,14 @@ pub(crate) fn drive_put(
         // and mark the stream `completed` so Drop's abort accounting
         // does not double-count it.
         let mut abort_rehash = |err_resp: Response| -> Response {
-            let _ = fs::remove_file(&*temp_path);
-            owner
-                .in_flight_bytes
-                .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-            if *prior_bytes > 0 {
-                owner
-                    .used_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                        Some(u.saturating_sub(*prior_bytes))
-                    })
-                    .ok();
-            }
-            *completed = true;
-            err_resp
+            fail_rejected_upload(
+                temp_path,
+                owner,
+                *reserved_bytes,
+                *prior_bytes,
+                completed,
+                err_resp,
+            )
         };
         let rh = rehash.as_mut().unwrap();
         let want = (rh.remaining as usize).min(tmp.len());
@@ -518,47 +712,90 @@ pub(crate) fn drive_put(
         // so the upload would never reach Phase B / commit (#180).
     }
 
-    // Phase A: drain body bytes until `remaining == 0`. Anything past
-    // the body in the same recv goes into the trailer buffer when
-    // streaming-checksum mode is active.
+    // Phase A: drain body bytes. Identity bodies are length-delimited by
+    // `remaining`; zstd bodies are delimited by the self-terminating
+    // frame and decrement `remaining` by decoded plaintext bytes.
     loop {
-        if *remaining == 0 {
+        let body_done = match recv_encoding {
+            RecvEncoding::Identity => *remaining == 0,
+            RecvEncoding::Zstd { decoder } => decoder.frame_complete(),
+        };
+        if body_done {
             break;
         }
         match conn.stream_recv(stream_id, tmp) {
             Ok((len, fin)) => {
-                // Shared split policy (#269): body bytes first, the
-                // remainder into the streaming trailer when the client
-                // opted in, overflow otherwise.
-                let trailer_remaining = trailer_buf.as_ref().map(|b| b.remaining()).unwrap_or(0);
-                let split = match qftp_protocol::stream::classify_put_chunk(
-                    len,
-                    *remaining,
-                    trailer_buf.is_some(),
-                    trailer_remaining,
-                ) {
-                    Ok(s) => s,
-                    Err(o) => return Ok(Some(put_overflow_err(o))),
-                };
-                if let Err(e) = writer.write_all(&tmp[..split.to_body]) {
-                    return Ok(Some(err(
-                        ErrorCode::Internal,
-                        format!("Failed to write file: {e}"),
-                    )));
-                }
-                hasher.update(&tmp[..split.to_body]);
-                *remaining -= split.to_body as u64;
-                metrics.add_bytes_received(split.to_body as u64);
-                if split.to_trailer > 0 {
-                    if let Some(buf) = trailer_buf {
-                        buf.extend(&tmp[split.to_body..split.to_body + split.to_trailer]);
+                match recv_encoding {
+                    RecvEncoding::Identity => {
+                        // Shared split policy (#269): body bytes
+                        // first, the remainder into the streaming
+                        // trailer when the client opted in, overflow
+                        // otherwise.
+                        let trailer_remaining =
+                            trailer_buf.as_ref().map(|b| b.remaining()).unwrap_or(0);
+                        let split = match qftp_protocol::stream::classify_put_chunk(
+                            len,
+                            *remaining,
+                            trailer_buf.is_some(),
+                            trailer_remaining,
+                        ) {
+                            Ok(s) => s,
+                            Err(o) => return Ok(Some(put_overflow_err(o))),
+                        };
+                        if let Err(e) = writer.write_all(&tmp[..split.to_body]) {
+                            return Ok(Some(err(
+                                ErrorCode::Internal,
+                                format!("Failed to write file: {e}"),
+                            )));
+                        }
+                        hasher.update(&tmp[..split.to_body]);
+                        *remaining -= split.to_body as u64;
+                        metrics.add_bytes_received(split.to_body as u64);
+                        if split.to_trailer > 0 {
+                            if let Some(buf) = trailer_buf {
+                                buf.extend(&tmp[split.to_body..split.to_body + split.to_trailer]);
+                            }
+                        }
+                        if fin && *remaining > 0 {
+                            return Ok(Some(err(
+                                ErrorCode::UploadTruncated,
+                                format!("Upload truncated: {} bytes still expected", *remaining),
+                            )));
+                        }
                     }
-                }
-                if fin && *remaining > 0 {
-                    return Ok(Some(err(
-                        ErrorCode::UploadTruncated,
-                        format!("Upload truncated: {} bytes still expected", *remaining),
-                    )));
+                    RecvEncoding::Zstd { decoder } => {
+                        if let Err(resp) = feed_zstd_put_chunk(
+                            &tmp[..len],
+                            decoder,
+                            writer,
+                            hasher,
+                            remaining,
+                            trailer_buf,
+                            metrics,
+                        ) {
+                            return Ok(Some(fail_rejected_upload(
+                                temp_path,
+                                owner,
+                                *reserved_bytes,
+                                *prior_bytes,
+                                completed,
+                                resp,
+                            )));
+                        }
+                        if fin && !decoder.frame_complete() {
+                            return Ok(Some(fail_rejected_upload(
+                                temp_path,
+                                owner,
+                                *reserved_bytes,
+                                *prior_bytes,
+                                completed,
+                                err(
+                                    ErrorCode::UploadTruncated,
+                                    "Stream closed before zstd frame was complete",
+                                ),
+                            )));
+                        }
+                    }
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -572,7 +809,24 @@ pub(crate) fn drive_put(
     // Phase B: body fully received. If streaming-checksum mode is
     // active, keep draining until the 32-byte trailer is complete
     // before verifying.
-    if *remaining == 0 {
+    let body_done = match recv_encoding {
+        RecvEncoding::Identity => *remaining == 0,
+        RecvEncoding::Zstd { decoder } => decoder.frame_complete(),
+    };
+    if body_done {
+        if *remaining > 0 {
+            return Ok(Some(fail_rejected_upload(
+                temp_path,
+                owner,
+                *reserved_bytes,
+                *prior_bytes,
+                completed,
+                err(
+                    ErrorCode::DecodeError,
+                    format!("compressed body decoded to fewer bytes than declared: {remaining} bytes missing"),
+                ),
+            )));
+        }
         if let Some(buf) = trailer_buf.as_mut() {
             while !buf.is_full() {
                 match conn.stream_recv(stream_id, tmp) {
@@ -634,25 +888,16 @@ pub(crate) fn drive_put(
                 // deleting a corrupt download). Settle the reservation
                 // and mark the stream done so the abort path in
                 // `StreamState`'s Drop doesn't also account for it.
-                let _ = fs::remove_file(temp_path);
-                owner
-                    .in_flight_bytes
-                    .fetch_sub(*reserved_bytes, Ordering::Relaxed);
-                // The partial is being deleted. Refund the prefix bytes
-                // a prior aborted session charged to `used_bytes`, or
-                // they leak permanently against the user's quota.
-                if *prior_bytes > 0 {
-                    owner
-                        .used_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                            Some(u.saturating_sub(*prior_bytes))
-                        })
-                        .ok();
-                }
-                *completed = true;
-                return Ok(Some(err(
-                    ErrorCode::ChecksumMismatch,
-                    "Upload checksum verification failed",
+                return Ok(Some(fail_rejected_upload(
+                    temp_path,
+                    owner,
+                    *reserved_bytes,
+                    *prior_bytes,
+                    completed,
+                    err(
+                        ErrorCode::ChecksumMismatch,
+                        "Upload checksum verification failed",
+                    ),
                 )));
             }
         }
@@ -756,19 +1001,7 @@ fn no_clobber_commit_guard(
     if !(commit_no_clobber && std::fs::symlink_metadata(final_path).is_ok()) {
         return None;
     }
-    let _ = fs::remove_file(temp_path);
-    owner
-        .in_flight_bytes
-        .fetch_sub(reserved_bytes, Ordering::Relaxed);
-    if prior_bytes > 0 {
-        owner
-            .used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                Some(u.saturating_sub(prior_bytes))
-            })
-            .ok();
-    }
-    *completed = true;
+    cleanup_rejected_upload(temp_path, owner, reserved_bytes, prior_bytes, completed);
     Some(err(
         ErrorCode::AlreadyExists,
         format!("path already exists (no_clobber): {}", final_path.display()),
@@ -778,6 +1011,7 @@ fn no_clobber_commit_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qftp_protocol::compress::ZstdEncoder;
 
     /// The in-flight partial-upload temp file must be 0o600
     /// regardless of the process umask, so it isn't readable by
@@ -814,6 +1048,126 @@ mod tests {
         // A fresh open creates it; a following resume open then works.
         drop(open_temp(&path, false).expect("fresh open"));
         assert!(open_temp(&path, true).is_ok());
+    }
+
+    fn compress_all(plaintext: &[u8]) -> Vec<u8> {
+        let mut encoder = ZstdEncoder::new().unwrap();
+        for chunk in plaintext.chunks(7777) {
+            encoder.push(chunk).unwrap();
+        }
+        encoder.finish().unwrap();
+        let mut out = Vec::new();
+        while !encoder.pending().is_empty() {
+            out.extend_from_slice(encoder.pending());
+            let n = encoder.pending().len();
+            encoder.consume(n);
+        }
+        out
+    }
+
+    fn response_code(resp: Response) -> ErrorCode {
+        match resp {
+            Response::Err(e) => e.code,
+            other => panic!("expected error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zstd_put_feed_writes_plaintext_and_splits_trailer() {
+        let plaintext: Vec<u8> = (0..200_000).map(|i| b'a' + (i % 13) as u8).collect();
+        let compressed = compress_all(&plaintext);
+        let trailer = [0x42u8; 32];
+        let mut wire = compressed.clone();
+        wire.extend_from_slice(&trailer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("upload.partial")).unwrap();
+        let mut writer = BufWriter::new(file);
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = plaintext.len() as u64;
+        let mut trailer_buf = Some(qftp_protocol::stream::TrailerBuf::new());
+        let metrics = Metrics::default();
+        let mut decoder = ZstdDecoder::new(remaining).unwrap();
+
+        let splits = [
+            0usize,
+            1,
+            compressed.len() / 2,
+            compressed.len().saturating_sub(3),
+            compressed.len() + 5,
+            wire.len(),
+        ];
+        for pair in splits.windows(2) {
+            feed_zstd_put_chunk(
+                &wire[pair[0]..pair[1]],
+                &mut decoder,
+                &mut writer,
+                &mut hasher,
+                &mut remaining,
+                &mut trailer_buf,
+                &metrics,
+            )
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert_eq!(remaining, 0);
+        assert!(decoder.frame_complete());
+        assert_eq!(trailer_buf.unwrap().as_array(), trailer);
+        assert_eq!(
+            std::fs::read(dir.path().join("upload.partial")).unwrap(),
+            plaintext
+        );
+        assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 200_000);
+    }
+
+    #[test]
+    fn zstd_put_feed_rejects_decompression_bomb() {
+        let compressed = compress_all(&vec![b'x'; 4096]);
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("upload.partial")).unwrap();
+        let mut writer = BufWriter::new(file);
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = 128;
+        let mut trailer_buf = Some(qftp_protocol::stream::TrailerBuf::new());
+        let metrics = Metrics::default();
+        let mut decoder = ZstdDecoder::new(128).unwrap();
+
+        let err = feed_zstd_put_chunk(
+            &compressed,
+            &mut decoder,
+            &mut writer,
+            &mut hasher,
+            &mut remaining,
+            &mut trailer_buf,
+            &metrics,
+        )
+        .unwrap_err();
+        assert_eq!(response_code(err), ErrorCode::UploadOverflow);
+    }
+
+    #[test]
+    fn zstd_put_feed_rejects_malformed_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("upload.partial")).unwrap();
+        let mut writer = BufWriter::new(file);
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = 1024;
+        let mut trailer_buf = Some(qftp_protocol::stream::TrailerBuf::new());
+        let metrics = Metrics::default();
+        let mut decoder = ZstdDecoder::new(1024).unwrap();
+
+        let err = feed_zstd_put_chunk(
+            b"not a zstd frame",
+            &mut decoder,
+            &mut writer,
+            &mut hasher,
+            &mut remaining,
+            &mut trailer_buf,
+            &metrics,
+        )
+        .unwrap_err();
+        assert_eq!(response_code(err), ErrorCode::DecodeError);
     }
 
     use qftp_protocol::user::{Permissions, User};

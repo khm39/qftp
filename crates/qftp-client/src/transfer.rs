@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
-use qftp_protocol::compress::ZstdDecoder;
+use qftp_protocol::compress::{ZstdDecoder, ZstdEncoder};
 use qftp_protocol::stream::{FILE_CHUNK_SIZE, MAX_FILE_SIZE};
 
 use crate::proto::Session;
@@ -656,7 +656,14 @@ pub fn do_put(
 ) -> Result<()> {
     // Parent span for the whole upload.
     let _span = tracing::info_span!("transfer", op = "put", stream_id, path = %remote).entered();
-    let result = do_put_inner(session, stream_id, local, remote, offset, no_clobber);
+    let mut result = do_put_inner(session, stream_id, local, remote, offset, no_clobber, true);
+    if result
+        .as_ref()
+        .is_err_and(|e| e.is::<UnsupportedEncoding>())
+    {
+        let stream_id = session.take_stream();
+        result = do_put_inner(session, stream_id, local, remote, offset, no_clobber, false);
+    }
     if let Err(e) = &result {
         // A `StalePartial` error is a retry signal for the caller, not
         // an actual transfer failure -- the caller re-uploads from
@@ -677,6 +684,7 @@ fn do_put_inner(
     remote: &str,
     offset: u64,
     no_clobber: bool,
+    compression_enabled: bool,
 ) -> Result<()> {
     let meta =
         std::fs::metadata(local).with_context(|| format!("stat {} for upload", local.display()))?;
@@ -694,6 +702,11 @@ fn do_put_inner(
 
     let bytes_to_send = size - offset;
     let mode = unix_mode(&meta);
+    let encoding = if compression_enabled && offset == 0 && bytes_to_send >= 1024 {
+        Encoding::Zstd
+    } else {
+        Encoding::Identity
+    };
 
     let req = Request::Put {
         path: remote.to_string(),
@@ -706,8 +719,12 @@ fn do_put_inner(
         checksum: None,
         no_clobber,
         checksum_trailer: true,
-        encoding: Encoding::Identity,
-        plaintext_size: 0,
+        encoding,
+        plaintext_size: if encoding == Encoding::Zstd {
+            bytes_to_send
+        } else {
+            0
+        },
     };
     send_message(session.conn, stream_id, &req)?;
     flush_egress(session.conn, session.socket)?;
@@ -735,6 +752,11 @@ fn do_put_inner(
     let mut buf = vec![0u8; UPLOAD_CHUNK];
     let mut pacer = Pacer::new();
     let mut recv_buf = [0u8; 65535];
+    let mut encoder = if encoding == Encoding::Zstd {
+        Some(ZstdEncoder::new().context("initializing zstd encoder")?)
+    } else {
+        None
+    };
     while sent < bytes_to_send {
         let want = (bytes_to_send - sent) as usize;
         let want = want.min(buf.len());
@@ -773,35 +795,13 @@ fn do_put_inner(
             }
         }
 
-        // Drive a single chunk to the wire. quiche's stream_send will
-        // truncate or refuse the write when the connection's send
-        // capacity (flow-control + congestion window) is exhausted —
-        // in both cases we have to flush egress and pull ACKs in
-        // before the rest of the chunk can be queued. Propagating
-        // `Error::Done` here instead would fail any upload that
-        // didn't fit in the initial cwnd (~14 KiB).
-        //
-        // The trailer carries the FIN; never set chunk_fin on
-        // body bytes.
-        let mut sub = 0usize;
-        while sub < want {
-            let remaining = &buf[sub..want];
-            match session.conn.stream_send(stream_id, remaining, false) {
-                Ok(0) | Err(quiche::Error::Done) => {
-                    flush_egress(session.conn, session.socket)?;
-                    session.poll.poll(
-                        session.events,
-                        session.conn.timeout().or(Some(Duration::from_millis(20))),
-                    )?;
-                    session.conn.on_timeout();
-                    handle_ingress(session.conn, session.socket, &mut recv_buf)?;
-                    if session.conn.is_closed() {
-                        bail!("connection closed during upload");
-                    }
-                }
-                Ok(n) => sub += n,
-                Err(e) => bail!("stream_send failed: {e}"),
-            }
+        if let Some(encoder) = encoder.as_mut() {
+            encoder
+                .push(&buf[..want])
+                .context("compressing upload chunk")?;
+            drain_zstd_encoder_to_wire(session, stream_id, encoder, &mut recv_buf)?;
+        } else {
+            send_upload_bytes(session, stream_id, &buf[..want], false, &mut recv_buf)?;
         }
         flush_egress(session.conn, session.socket)?;
 
@@ -817,30 +817,14 @@ fn do_put_inner(
         handle_ingress(session.conn, session.socket, &mut recv_buf)?;
         flush_egress(session.conn, session.socket)?;
     }
+    if let Some(encoder) = encoder.as_mut() {
+        encoder.finish().context("finalizing zstd upload frame")?;
+        drain_zstd_encoder_to_wire(session, stream_id, encoder, &mut recv_buf)?;
+    }
 
     // Body fully queued. Push the 32-byte BLAKE3 trailer with FIN.
     let trailer = *hasher.finalize().as_bytes();
-    let mut sub = 0usize;
-    while sub < trailer.len() {
-        // The trailer is the last data on the stream, so every write
-        // carries FIN; quiche keeps it pending across partial writes.
-        match session.conn.stream_send(stream_id, &trailer[sub..], true) {
-            Ok(0) | Err(quiche::Error::Done) => {
-                flush_egress(session.conn, session.socket)?;
-                session.poll.poll(
-                    session.events,
-                    session.conn.timeout().or(Some(Duration::from_millis(20))),
-                )?;
-                session.conn.on_timeout();
-                handle_ingress(session.conn, session.socket, &mut recv_buf)?;
-                if session.conn.is_closed() {
-                    bail!("connection closed during trailer send");
-                }
-            }
-            Ok(n) => sub += n,
-            Err(e) => bail!("stream_send (trailer) failed: {e}"),
-        }
-    }
+    send_upload_bytes(session, stream_id, &trailer, true, &mut recv_buf)?;
     flush_egress(session.conn, session.socket)?;
 
     bar.finish_and_clear();
@@ -859,10 +843,55 @@ fn do_put_inner(
                 // whole upload from scratch.
                 return Err(anyhow::Error::new(StalePartial));
             }
+            if encoding == Encoding::Zstd && e.code == ErrorCode::Unsupported {
+                return Err(anyhow::Error::new(UnsupportedEncoding));
+            }
             bail!("server refused Put: {} ({:?})", e.message, e.code)
         }
         other => bail!("unexpected response to Put: {other:?}"),
     }
+}
+
+fn drain_zstd_encoder_to_wire(
+    session: &mut Session,
+    stream_id: u64,
+    encoder: &mut ZstdEncoder,
+    recv_buf: &mut [u8; 65535],
+) -> Result<()> {
+    while !encoder.pending().is_empty() {
+        let n = send_upload_bytes(session, stream_id, encoder.pending(), false, recv_buf)?;
+        encoder.consume(n);
+    }
+    Ok(())
+}
+
+fn send_upload_bytes(
+    session: &mut Session,
+    stream_id: u64,
+    bytes: &[u8],
+    fin: bool,
+    recv_buf: &mut [u8; 65535],
+) -> Result<usize> {
+    let mut sent = 0usize;
+    while sent < bytes.len() {
+        match session.conn.stream_send(stream_id, &bytes[sent..], fin) {
+            Ok(0) | Err(quiche::Error::Done) => {
+                flush_egress(session.conn, session.socket)?;
+                session.poll.poll(
+                    session.events,
+                    session.conn.timeout().or(Some(Duration::from_millis(20))),
+                )?;
+                session.conn.on_timeout();
+                handle_ingress(session.conn, session.socket, recv_buf)?;
+                if session.conn.is_closed() {
+                    bail!("connection closed during upload");
+                }
+            }
+            Ok(n) => sent += n,
+            Err(e) => bail!("stream_send failed: {e}"),
+        }
+    }
+    Ok(sent)
 }
 
 /// Error returned by [`do_put`] when a *resumed* upload (`offset > 0`)
@@ -880,6 +909,18 @@ impl std::fmt::Display for StalePartial {
 }
 
 impl std::error::Error for StalePartial {}
+
+/// Retry signal when a server refuses the zstd upload path.
+#[derive(Debug)]
+struct UnsupportedEncoding;
+
+impl std::fmt::Display for UnsupportedEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server does not support compressed upload; retrying identity")
+    }
+}
+
+impl std::error::Error for UnsupportedEncoding {}
 
 /// True when a refused resumed upload should be retried from scratch.
 /// The server-side partial is stale: its bytes mismatch the local file
