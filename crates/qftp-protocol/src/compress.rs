@@ -6,12 +6,48 @@
 //! exact compressed input boundary where a single frame completes.
 
 use std::io;
+use std::path::Path;
 
 use thiserror::Error;
 use zstd::stream::raw::{CParameter, DParameter, Decoder, Encoder, InBuffer, Operation, OutBuffer};
 
 pub const ZSTD_DEFAULT_LEVEL: i32 = 3;
 pub const ZSTD_WINDOW_LOG: u32 = 23;
+
+/// Heuristic for "this file is already compressed / high-entropy, so
+/// running zstd over it would burn CPU for no size win" (and can even
+/// grow the body slightly). Extension-based, like rsync's
+/// `--skip-compress` default list, so it needs no file I/O. Conservative:
+/// an unknown or absent extension is treated as compressible (we try).
+/// Matching is case-insensitive. Senders use this to fall back to
+/// `Encoding::Identity` for media/archives; it never affects the wire
+/// format, only the codec choice.
+pub fn is_likely_incompressible(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        // archives / compressed streams
+        "zip" | "gz" | "tgz" | "bz2" | "tbz2" | "tbz" | "xz" | "txz" | "zst" | "tzst" | "lz4"
+            | "lzma" | "lzo" | "7z" | "rar" | "br" | "z" | "cab" | "arj"
+            // already-compressed raster images
+            | "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "avif" | "jxl"
+            // audio
+            | "mp3" | "aac" | "m4a" | "ogg" | "oga" | "opus" | "flac" | "wma"
+            // video
+            | "mp4" | "m4v" | "mkv" | "webm" | "mov" | "avi" | "wmv" | "flv" | "mpeg" | "mpg"
+            | "ts"
+            // zip-based documents / packages
+            | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "jar" | "apk" | "epub"
+            // fonts (already compressed)
+            | "woff" | "woff2"
+            // OS packages / disk images
+            | "deb" | "rpm" | "dmg" | "iso"
+            // encrypted / high-entropy
+            | "gpg" | "pgp"
+    )
+}
 
 const CODEC_CHUNK: usize = 64 * 1024;
 
@@ -351,5 +387,38 @@ mod tests {
             truncated.finish().unwrap_err(),
             CompressionError::Truncated
         ));
+    }
+
+    #[test]
+    fn incompressible_detection_by_extension() {
+        use std::path::Path;
+        // Already-compressed formats -> skip.
+        for p in [
+            "photo.jpg",
+            "/srv/media/clip.MP4",
+            "dir/archive.tar.gz",
+            "pkg.zst",
+            "book.epub",
+            "sheet.xlsx",
+            "font.woff2",
+            "image.PNG",
+        ] {
+            assert!(is_likely_incompressible(Path::new(p)), "{p} should skip");
+        }
+        // Compressible / unknown -> try compressing.
+        for p in [
+            "notes.txt",
+            "data.json",
+            "main.rs",
+            "log.ndjson",
+            "Makefile",
+            "archive.tar",
+            "no_ext",
+        ] {
+            assert!(
+                !is_likely_incompressible(Path::new(p)),
+                "{p} should compress"
+            );
+        }
     }
 }

@@ -14,7 +14,7 @@ use tracing::warn;
 use crate::connection::ConnectionContext;
 use crate::metrics::Metrics;
 use crate::server::fail_stream;
-use qftp_protocol::compress::ZstdEncoder;
+use qftp_protocol::compress::{is_likely_incompressible, ZstdEncoder};
 use qftp_protocol::handler::{self, err, io_code};
 use qftp_protocol::stream::{SendEncoding, StreamState, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
 
@@ -111,7 +111,15 @@ pub(crate) fn start_get(
         Some(n) => n.min(remaining),
         None => remaining,
     };
-    let encoding = if bytes_to_send >= 1024 && accept_encoding.contains(&Encoding::Zstd) {
+    // Honor the client's `accept_encoding`, but skip compressing bodies
+    // that won't benefit: tiny transfers and already-compressed/media
+    // files (extension heuristic). The client can't see the file, so this
+    // auto-skip lives server-side; it only affects the codec choice, not
+    // the wire format.
+    let encoding = if bytes_to_send >= 1024
+        && accept_encoding.contains(&Encoding::Zstd)
+        && !is_likely_incompressible(&file_path)
+    {
         Encoding::Zstd
     } else {
         Encoding::Identity

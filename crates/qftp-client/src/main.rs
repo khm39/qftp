@@ -119,6 +119,12 @@ struct Args {
     /// Examples: `--bwlimit 5M` = 5 MB/s, `--bwlimit 100Ki`.
     #[arg(long, default_value = "0", global = true)]
     bwlimit: String,
+    /// Disable zstd transfer compression. By default qftp compresses
+    /// fresh uploads and requests compressed downloads (already-compressed
+    /// files like media/archives are auto-skipped); this turns it off
+    /// entirely, sending and requesting identity bodies.
+    #[arg(long, default_value_t = false, global = true)]
+    no_compress: bool,
     /// Print a shell-completion script to stdout and exit.
     /// Pipe it into the right place for your shell, e.g.
     ///   `qftp-client --generate-completions bash | sudo tee \
@@ -276,6 +282,10 @@ fn main() -> Result<()> {
     transfer::set_bw_limit_bps(bw);
     if bw > 0 {
         tracing::info!(bytes_per_sec = bw, "upload throttled by --bwlimit");
+    }
+    transfer::set_compression_disabled(args.no_compress);
+    if args.no_compress {
+        tracing::info!("zstd transfer compression disabled by --no-compress");
     }
 
     if let Some(shell) = args.generate_completions {

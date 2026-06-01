@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
-use qftp_protocol::compress::{ZstdDecoder, ZstdEncoder};
+use qftp_protocol::compress::{is_likely_incompressible, ZstdDecoder, ZstdEncoder};
 use qftp_protocol::stream::{FILE_CHUNK_SIZE, MAX_FILE_SIZE};
 
 use crate::proto::Session;
@@ -48,6 +48,21 @@ static BW_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 pub fn set_bw_limit_bps(rate: u64) {
     BW_LIMIT_BPS.store(rate, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `--no-compress` disables client-initiated zstd transfer compression
+/// process-wide: uploads are sent as `Identity` and downloads stop
+/// advertising `Zstd` in `accept_encoding`. `false` (default) leaves the
+/// default-on policy in place. Set once at startup, read per transfer.
+static COMPRESSION_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compression_disabled(disabled: bool) {
+    COMPRESSION_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn compression_disabled() -> bool {
+    COMPRESSION_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Token-bucket throttle applied per chunk. Sleeps just long enough
@@ -318,7 +333,14 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         path: remote.to_string(),
         offset: resume_offset,
         length: None,
-        accept_encoding: vec![Encoding::Zstd],
+        // Advertise zstd unless `--no-compress` is set. The server still
+        // makes the final choice (and may answer Identity for already-
+        // compressed or tiny files); an empty list means identity only.
+        accept_encoding: if compression_disabled() {
+            Vec::new()
+        } else {
+            vec![Encoding::Zstd]
+        },
     };
     send_message(session.conn, stream_id, &req)?;
     stream_send_all(session.conn, stream_id, &[], true)?;
@@ -702,7 +724,17 @@ fn do_put_inner(
 
     let bytes_to_send = size - offset;
     let mode = unix_mode(&meta);
-    let encoding = if compression_enabled && offset == 0 && bytes_to_send >= 1024 {
+    // Compress a fresh upload only when: the caller still allows it (the
+    // `Unsupported` retry sets this false), the process-wide `--no-compress`
+    // is off, the body clears a small floor where compression can't pay,
+    // and the local file isn't already a compressed/media format. Resumes
+    // (`offset > 0`) stay Identity (compressed resume is not yet wired).
+    let encoding = if compression_enabled
+        && !compression_disabled()
+        && offset == 0
+        && bytes_to_send >= 1024
+        && !is_likely_incompressible(local)
+    {
         Encoding::Zstd
     } else {
         Encoding::Identity
