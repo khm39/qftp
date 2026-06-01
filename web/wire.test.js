@@ -87,7 +87,13 @@ function vectorToReq(name, fields) {
     case "Cd": return { type: "Cd", path: fields.path };
     case "Pwd": return { type: "Pwd" };
     case "Get":
-      return { type: "Get", path: fields.path, offset: fields.offset, length: fields.length };
+      return {
+        type: "Get",
+        path: fields.path,
+        offset: fields.offset,
+        length: fields.length,
+        acceptEncoding: fields.accept_encoding,
+      };
     case "Put":
       // The web client never sets a header checksum; it streams a
       // trailer instead. Vectors that carry one aren't modelled.
@@ -100,6 +106,8 @@ function vectorToReq(name, fields) {
         offset: fields.offset,
         noClobber: fields.no_clobber,
         checksumTrailer: fields.checksum_trailer,
+        encoding: fields.encoding,
+        plaintextSize: fields.plaintext_size,
       };
     case "Mkdir": return { type: "Mkdir", path: fields.path };
     case "Rmdir": return { type: "Rmdir", path: fields.path };

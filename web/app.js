@@ -104,6 +104,11 @@ function encodeRequest(req) {
     case "Get":
       w.u32(3); w.str(req.path); w.u64(req.offset || 0);
       if (req.length == null) { w.u8(0); } else { w.u8(1); w.u64(req.length); }
+      {
+        const encodings = req.acceptEncoding || [];
+        w.u64(encodings.length);
+        for (const enc of encodings) w.u32(enc);
+      }
       break;
     case "Put":
       w.u32(4); w.str(req.path); w.u64(req.size); w.u32(req.mode);
@@ -112,6 +117,8 @@ function encodeRequest(req) {
       w.u8(0); // checksum: None (header-checksum path unused by the web client)
       w.bool(req.noClobber || false);
       w.bool(req.checksumTrailer || false);
+      w.u32(req.encoding || 0);
+      w.u64(req.plaintextSize || 0);
       break;
     case "Mkdir": w.u32(5); w.str(req.path); break;
     case "Rmdir": w.u32(6); w.str(req.path); break;
