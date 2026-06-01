@@ -6,6 +6,7 @@
 //! drives it over `quiche`; a future WebTransport bridge can drive the
 //! same logic over a different transport without forking it.
 
+pub mod compress;
 pub mod handler;
 pub mod stream;
 pub mod user;

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::compress::ZstdEncoder;
 use crate::user::User;
 
 /// Compute the deterministic `.qftp.partial` temp path for a final
@@ -174,6 +175,15 @@ pub enum PutOverflow {
     BodyExceeded,
     /// Bytes past the declared body + 32-byte trailer arrived.
     TrailerExceeded,
+}
+
+/// Transfer codec state for an in-progress Get send.
+pub enum SendEncoding {
+    Identity,
+    Zstd {
+        encoder: ZstdEncoder,
+        frame_finished: bool,
+    },
 }
 
 /// How a single received Put chunk should be split between the file
@@ -375,6 +385,7 @@ pub enum StreamState {
     SendingFileData {
         reader: std::io::BufReader<File>,
         total_size: u64,
+        encoding: SendEncoding,
         sent: u64,
         hasher: blake3::Hasher,
         /// After body is fully sent, the 32-byte checksum trailer is

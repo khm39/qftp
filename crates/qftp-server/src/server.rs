@@ -1196,6 +1196,7 @@ enum PendingAction {
         path: String,
         offset: u64,
         length: Option<u64>,
+        accept_encoding: Vec<Encoding>,
     },
     StartPut {
         stream_id: u64,
@@ -1408,13 +1409,14 @@ fn plan_actions(
                             path,
                             offset,
                             length,
-                            ..
+                            accept_encoding,
                         } => {
                             actions.push(PendingAction::StartGet {
                                 stream_id,
                                 path,
                                 offset,
                                 length,
+                                accept_encoding,
                             });
                             *state = StreamState::Done;
                         }
@@ -1515,8 +1517,17 @@ fn execute_pending_actions(
                 path,
                 offset,
                 length,
+                accept_encoding,
             } => {
-                crate::transfer_get::start_get(ctx, stream_id, &path, offset, length, metrics)?;
+                crate::transfer_get::start_get(
+                    ctx,
+                    stream_id,
+                    &path,
+                    offset,
+                    length,
+                    &accept_encoding,
+                    metrics,
+                )?;
             }
             PendingAction::StartPut {
                 stream_id,

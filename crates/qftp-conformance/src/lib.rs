@@ -172,7 +172,7 @@ pub fn request_samples() -> Vec<(&'static str, &'static str, Request)> {
             "Upload whose body is zstd-compressed on the wire.",
             Request::Put {
                 path: "up/logs.zst".into(),
-                size: 12_345,
+                size: 65_536,
                 mode: 0o644,
                 offset: 0,
                 hash_algorithm: HashAlgorithm::Blake3,
@@ -361,7 +361,7 @@ pub fn response_samples() -> Vec<(&'static str, &'static str, Response)> {
             "file_ready_zstd",
             "Get header for a zstd-compressed response body.",
             Response::FileReady {
-                size: 12_345,
+                size: 65_536,
                 total_size: 65_536,
                 checksum_follows: true,
                 hash_algorithm: HashAlgorithm::Blake3,

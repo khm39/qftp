@@ -14,8 +14,9 @@ use tracing::warn;
 use crate::connection::ConnectionContext;
 use crate::metrics::Metrics;
 use crate::server::fail_stream;
+use qftp_protocol::compress::ZstdEncoder;
 use qftp_protocol::handler::{self, err, io_code};
-use qftp_protocol::stream::{StreamState, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
+use qftp_protocol::stream::{SendEncoding, StreamState, MAX_FILE_SIZE, SEND_CHUNK_SIZE};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_get(
@@ -24,6 +25,7 @@ pub(crate) fn start_get(
     path: &str,
     offset: u64,
     length: Option<u64>,
+    accept_encoding: &[Encoding],
     metrics: &Metrics,
 ) -> Result<()> {
     let send_err = |ctx: &mut ConnectionContext, code, msg| -> Result<()> {
@@ -109,6 +111,28 @@ pub(crate) fn start_get(
         Some(n) => n.min(remaining),
         None => remaining,
     };
+    let encoding = if bytes_to_send >= 1024 && accept_encoding.contains(&Encoding::Zstd) {
+        Encoding::Zstd
+    } else {
+        Encoding::Identity
+    };
+    let send_encoding = match encoding {
+        Encoding::Identity => SendEncoding::Identity,
+        Encoding::Zstd => match ZstdEncoder::new() {
+            Ok(encoder) => SendEncoding::Zstd {
+                encoder,
+                frame_finished: false,
+            },
+            Err(e) => {
+                return send_err(
+                    ctx,
+                    ErrorCode::Internal,
+                    format!("failed to initialize zstd encoder: {e}"),
+                );
+            }
+        },
+        Encoding::Unknown(_) => unreachable!("server only selects known encodings"),
+    };
     send_message(
         &mut ctx.conn,
         stream_id,
@@ -117,8 +141,12 @@ pub(crate) fn start_get(
             total_size: meta.len(),
             checksum_follows: true,
             hash_algorithm: HashAlgorithm::Blake3,
-            encoding: Encoding::Identity,
-            plaintext_size: 0,
+            encoding,
+            plaintext_size: if encoding == Encoding::Zstd {
+                bytes_to_send
+            } else {
+                0
+            },
         },
     )?;
     // The reader stays at position 0 even for a resumed Get: the
@@ -134,6 +162,7 @@ pub(crate) fn start_get(
         StreamState::SendingFileData {
             reader: std::io::BufReader::with_capacity(SEND_CHUNK_SIZE, file),
             total_size: bytes_to_send,
+            encoding: send_encoding,
             sent: 0,
             hasher: blake3::Hasher::new(),
             trailer: None,
@@ -245,6 +274,7 @@ enum SendOutcome {
 struct BodySend<'a> {
     reader: &'a mut std::io::BufReader<std::fs::File>,
     total_size: &'a mut u64,
+    encoding: &'a mut SendEncoding,
     sent: &'a mut u64,
     hasher: &'a mut blake3::Hasher,
     trailer: &'a mut Option<[u8; 32]>,
@@ -265,6 +295,7 @@ fn drive_one_sender(
     let StreamState::SendingFileData {
         reader,
         total_size,
+        encoding,
         sent,
         hasher,
         trailer,
@@ -281,6 +312,7 @@ fn drive_one_sender(
     let mut bs = BodySend {
         reader,
         total_size,
+        encoding,
         sent,
         hasher,
         trailer,
@@ -348,6 +380,34 @@ fn send_phase_body(
     metrics: &Metrics,
     bs: &mut BodySend,
 ) -> Option<SendOutcome> {
+    match bs.encoding {
+        SendEncoding::Identity => send_phase_body_identity(conn, stream_id, chunk, metrics, bs),
+        SendEncoding::Zstd {
+            encoder,
+            frame_finished,
+        } => send_phase_body_zstd(
+            conn,
+            stream_id,
+            chunk,
+            metrics,
+            bs.reader,
+            bs.total_size,
+            bs.sent,
+            bs.hasher,
+            encoder,
+            frame_finished,
+            bs.trailer,
+        ),
+    }
+}
+
+fn send_phase_body_identity(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    chunk: &mut [u8],
+    metrics: &Metrics,
+    bs: &mut BodySend,
+) -> Option<SendOutcome> {
     while *bs.sent < *bs.total_size && bs.trailer.is_none() {
         let want = ((*bs.total_size - *bs.sent) as usize).min(chunk.len());
         if let Err(e) = bs.reader.read_exact(&mut chunk[..want]) {
@@ -386,6 +446,70 @@ fn send_phase_body(
                 warn!(stream_id, error = ?e, "stream_send failed during Get");
                 return Some(SendOutcome::Failed);
             }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_phase_body_zstd(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    chunk: &mut [u8],
+    metrics: &Metrics,
+    reader: &mut std::io::BufReader<std::fs::File>,
+    total_size: &mut u64,
+    sent: &mut u64,
+    hasher: &mut blake3::Hasher,
+    encoder: &mut ZstdEncoder,
+    frame_finished: &mut bool,
+    trailer: &mut Option<[u8; 32]>,
+) -> Option<SendOutcome> {
+    while (*sent < *total_size || !*frame_finished || !encoder.pending().is_empty())
+        && trailer.is_none()
+    {
+        if !encoder.pending().is_empty() {
+            match conn.stream_send(stream_id, encoder.pending(), false) {
+                Ok(0) | Err(quiche::Error::Done) => return Some(SendOutcome::Blocked),
+                Ok(n) => {
+                    encoder.consume(n);
+                    metrics.add_bytes_sent(n as u64);
+                    if !encoder.pending().is_empty() {
+                        return Some(SendOutcome::Blocked);
+                    }
+                }
+                Err(e) => {
+                    warn!(stream_id, error = ?e, "stream_send failed during compressed Get");
+                    return Some(SendOutcome::Failed);
+                }
+            }
+            continue;
+        }
+
+        if *sent < *total_size {
+            let want = ((*total_size - *sent) as usize).min(chunk.len());
+            if let Err(e) = reader.read_exact(&mut chunk[..want]) {
+                warn!(stream_id, error = %e, "file read failed mid-stream");
+                let _ = conn.stream_send(stream_id, &[], true);
+                return Some(SendOutcome::Failed);
+            }
+            hasher.update(&chunk[..want]);
+            if let Err(e) = encoder.push(&chunk[..want]) {
+                warn!(stream_id, error = %e, "zstd compression failed during Get");
+                let _ = conn.stream_send(stream_id, &[], true);
+                return Some(SendOutcome::Failed);
+            }
+            *sent += want as u64;
+            continue;
+        }
+
+        if !*frame_finished {
+            if let Err(e) = encoder.finish() {
+                warn!(stream_id, error = %e, "zstd compression finalization failed during Get");
+                let _ = conn.stream_send(stream_id, &[], true);
+                return Some(SendOutcome::Failed);
+            }
+            *frame_finished = true;
         }
     }
     None

@@ -13,6 +13,9 @@
 
 - **方向性(案C)は妥当。** ALPN `qftp/1` 据え置き・平文ドメイン中核原則・`#[non_exhaustive]` Encoding は、
   既存パターン(numeric u32 enum + 末尾追加)と `spec/versioning.md` に整合する。
+- **Phase 1 framing decision: 案Bを採用。** 圧縮Getのワイヤ本体は「単一の self-contained zstd frame」+「平文BLAKE3
+  32-byte trailer」とし、`FileReady.size == plaintext_size` とする。`size` は論理/平文byte数であり、圧縮ワイヤ本体の
+  delimiter ではない。受信側は zstd decoder が frame 完了と消費入力byte数を返した位置で trailer を切り出す。
 - **前提(2026-06-01 確定): 本プロジェクトはリリース前**。稼働中の旧peerが存在しないため、**圧縮を 1.0 ワイヤに
   最初から畳み込み、凍結ベースライン(test-vectors)ごと更新してよい**(#302 の「凍結」はリリース前の内部マイルストーン
   であり公開コミットではない)。これにより下記 §3 の bincode (B)方向問題は **本変更については発生しない**。

@@ -16,11 +16,13 @@
 //! Each protocol message is bincode-serialized (fixint, little-endian;
 //! enum tags are `u32`) into a length-prefixed frame (4-byte big-endian
 //! length, then the payload). File body bytes follow the framed
-//! `FileReady` response on the same stream and are sized exactly by
-//! `FileReady::size`. When `checksum_follows` is set, the digest of the
-//! streamed body follows immediately after the body (length = the
-//! negotiated [`HashAlgorithm`]'s [`HashAlgorithm::digest_len`], BLAKE3
-//! → 32 bytes), with the QUIC stream FIN flag set on the last byte.
+//! `FileReady` response on the same stream. Identity bodies are sized
+//! by `FileReady::size`; compressed Get bodies are a single
+//! self-terminating codec frame followed by the checksum trailer. When
+//! `checksum_follows` is set, the digest of the streamed plaintext
+//! follows immediately after the body (length = the negotiated
+//! [`HashAlgorithm`]'s [`HashAlgorithm::digest_len`], BLAKE3 → 32
+//! bytes), with the QUIC stream FIN flag set on the last byte.
 //!
 //! ## Numeric on-wire enums
 //!
@@ -37,10 +39,11 @@
 //! codec; `Identity` (the default) is byte-for-byte the uncompressed
 //! wire. Compression is a pure transport transform *below* integrity:
 //! the BLAKE3 trailer and `offset` always operate on the **plaintext**.
-//! When a body is compressed, the framed header's `size` counts the
-//! **encoded (wire)** bytes and `plaintext_size` counts the decoded
-//! bytes; receivers bound decompression by `plaintext_size` /
-//! `MAX_FILE_SIZE` (decompression-bomb defense). See
+//! When a Get body is compressed, the framed header's `size` is still
+//! the logical/plaintext byte count and equals `plaintext_size`; the
+//! compressed wire body is delimited by the self-contained codec frame.
+//! Receivers bound decompression by `plaintext_size` / `MAX_FILE_SIZE`
+//! (decompression-bomb defense). See
 //! `spec/proposals/issue-300-transfer-compression.md`.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -600,19 +603,20 @@ pub enum Request {
         /// preserved).
         #[serde(default)]
         checksum_trailer: bool,
-        /// Codec applied to the `size` body bytes that follow. `Identity`
-        /// (the default) means the body is plaintext and `size` is its
-        /// length. When non-identity, `size` counts the **encoded** bytes
-        /// and `plaintext_size` the decoded length; the server streams
-        /// decompression into the `.partial` and verifies the BLAKE3
-        /// trailer over the plaintext.
+        /// Codec applied to the body bytes that follow. `Identity` (the
+        /// default) means the body is plaintext and `size` is its length.
+        /// For compressed bodies, `size` remains the logical/plaintext
+        /// byte count; codec framing determines how the compressed wire
+        /// body is delimited, and the server verifies the BLAKE3 trailer
+        /// over the decoded plaintext.
         #[serde(default)]
         encoding: Encoding,
         /// Plaintext (post-decode) byte count. Ignored when
         /// `encoding == Identity` (receivers use `size`). For compressed
-        /// bodies the server checks this against the user's quota and
-        /// `MAX_FILE_SIZE` **before** decoding and bounds the decompressed
-        /// output to it (decompression-bomb defense).
+        /// bodies this equals `size`; the server checks it against the
+        /// user's quota and `MAX_FILE_SIZE` **before** decoding and
+        /// bounds the decompressed output to it (decompression-bomb
+        /// defense).
         #[serde(default)]
         plaintext_size: u64,
     },
@@ -660,9 +664,12 @@ pub enum Response {
     Path(String),
     FileStat(FileStat),
     /// Sent immediately before the body bytes for Get. `size` is the
-    /// number of bytes the server is about to stream (post-offset and
-    /// post-length clamping). `total_size` is the file's full size on
-    /// disk so the client can detect truncation across resume sessions.
+    /// logical/plaintext byte count the client will receive (post-offset
+    /// and post-length clamping). For `Identity` it also equals the wire
+    /// body length; for `Zstd`, it equals `plaintext_size` and the wire
+    /// body is delimited by the self-contained zstd frame. `total_size`
+    /// is the file's full size on disk so the client can detect
+    /// truncation across resume sessions.
     /// When `checksum_follows` is true, the digest bytes (length =
     /// `hash_algorithm.digest_len()`) immediately after the body are the
     /// hash of the streamed body; the client verifies them. Computing
@@ -677,14 +684,15 @@ pub enum Response {
         hash_algorithm: HashAlgorithm,
         /// Codec applied to the streamed body. `Identity` (the default)
         /// means the body bytes are plaintext and `size` is the plaintext
-        /// length. When non-identity, `size` counts encoded wire bytes and
-        /// `plaintext_size` the decoded plaintext length.
+        /// length. For `Zstd`, the wire body is one self-contained zstd
+        /// frame, and `size == plaintext_size`.
         #[serde(default)]
         encoding: Encoding,
         /// Plaintext (post-decode) byte count. Ignored when
         /// `encoding == Identity` (receivers use `size`). For compressed
-        /// bodies the client bounds decompression to this value and hashes
-        /// the resulting plaintext for the BLAKE3 trailer.
+        /// bodies this equals `size`; the client bounds decompression to
+        /// this value and hashes the resulting plaintext for the BLAKE3
+        /// trailer.
         #[serde(default)]
         plaintext_size: u64,
     },

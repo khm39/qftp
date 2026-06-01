@@ -16,7 +16,8 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
-use qftp_protocol::stream::FILE_CHUNK_SIZE;
+use qftp_protocol::compress::ZstdDecoder;
+use qftp_protocol::stream::{FILE_CHUNK_SIZE, MAX_FILE_SIZE};
 
 use crate::proto::Session;
 
@@ -198,6 +199,88 @@ fn hash_prefix<R: Read>(
     Ok(())
 }
 
+enum DownloadBody {
+    Identity { received: u64, size: u64 },
+    Zstd { decoder: ZstdDecoder },
+}
+
+impl DownloadBody {
+    fn is_complete(&self) -> bool {
+        match self {
+            DownloadBody::Identity { received, size } => received >= size,
+            DownloadBody::Zstd { decoder } => decoder.frame_complete(),
+        }
+    }
+
+    fn plaintext_received(&self) -> u64 {
+        match self {
+            DownloadBody::Identity { received, .. } => *received,
+            DownloadBody::Zstd { decoder } => decoder.decoded_len(),
+        }
+    }
+}
+
+fn drain_decoded_plaintext(
+    decoder: &mut ZstdDecoder,
+    file: &mut File,
+    hasher: &mut blake3::Hasher,
+) -> Result<()> {
+    while !decoder.pending().is_empty() {
+        let n = decoder.pending().len();
+        file.write_all(decoder.pending())
+            .context("writing decoded zstd body chunk")?;
+        hasher.update(decoder.pending());
+        decoder.consume(n);
+    }
+    Ok(())
+}
+
+fn accept_download_bytes(
+    body: &mut DownloadBody,
+    input: &[u8],
+    file: &mut File,
+    hasher: &mut blake3::Hasher,
+    trailer: &mut Vec<u8>,
+    bar: &ProgressBar,
+    resume_offset: u64,
+) -> Result<()> {
+    match body {
+        DownloadBody::Identity { received, size } => {
+            if *received < *size {
+                let body_room = (*size - *received) as usize;
+                let body_take = body_room.min(input.len());
+                if body_take > 0 {
+                    file.write_all(&input[..body_take])
+                        .context("writing body chunk")?;
+                    hasher.update(&input[..body_take]);
+                    *received += body_take as u64;
+                    bar.set_position(resume_offset + *received);
+                }
+                if body_take < input.len() {
+                    trailer.extend_from_slice(&input[body_take..]);
+                }
+            } else {
+                trailer.extend_from_slice(input);
+            }
+        }
+        DownloadBody::Zstd { decoder } => {
+            if decoder.frame_complete() {
+                trailer.extend_from_slice(input);
+                return Ok(());
+            }
+            let progress = decoder.push(input).context("decoding zstd body chunk")?;
+            drain_decoded_plaintext(decoder, file, hasher)?;
+            bar.set_position(resume_offset + decoder.decoded_len());
+            if progress.frame_complete {
+                trailer.extend_from_slice(&input[progress.consumed..]);
+            } else if progress.consumed < input.len() {
+                bail!("zstd decoder stopped before consuming the compressed chunk");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Download `remote` to `local`. If `local` already exists, resume from
 /// its current length. Verifies the server-supplied BLAKE3 trailer once
 /// the body is fully received and refuses to keep the file on mismatch.
@@ -235,7 +318,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         path: remote.to_string(),
         offset: resume_offset,
         length: None,
-        accept_encoding: Vec::new(),
+        accept_encoding: vec![Encoding::Zstd],
     };
     send_message(session.conn, stream_id, &req)?;
     stream_send_all(session.conn, stream_id, &[], true)?;
@@ -248,13 +331,15 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // entire body + trailer + FIN often arrives in the same ingress.
     let mut carryover: Vec<u8> = Vec::new();
     let resp = session.poll_response_with_buf(stream_id, &mut carryover)?;
-    let (size, total_size, checksum_follows) = match resp {
+    let (size, total_size, checksum_follows, encoding, plaintext_size) = match resp {
         Response::FileReady {
             size,
             total_size,
             checksum_follows,
+            encoding,
+            plaintext_size,
             ..
-        } => (size, total_size, checksum_follows),
+        } => (size, total_size, checksum_follows, encoding, plaintext_size),
         Response::Err(e) => {
             // A resumed Get whose offset is past the (now shorter)
             // remote file is refused with InvalidRange: the local
@@ -268,6 +353,26 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         }
         other => bail!("unexpected response to Get: {other:?}"),
     };
+    let logical_size = match encoding {
+        Encoding::Identity => size,
+        Encoding::Zstd => {
+            if size != plaintext_size {
+                bail!(
+                    "server returned inconsistent zstd sizes: size ({size}) \
+                     != plaintext_size ({plaintext_size})"
+                );
+            }
+            plaintext_size
+        }
+        Encoding::Unknown(n) => bail!("server selected unsupported transfer encoding {n}"),
+    };
+    if matches!(encoding, Encoding::Zstd) && plaintext_size > MAX_FILE_SIZE {
+        bail!(
+            "server announced zstd plaintext size {} above max {}",
+            plaintext_size,
+            MAX_FILE_SIZE
+        );
+    }
 
     // `total_size` is the server's announced full-file size; `size` is
     // the streamed body. `do_get` always sends `length: None`, so the
@@ -277,13 +382,13 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // trailer over a truncated body and banking on `total_size` going
     // unchecked); refuse before we touch the local disk.
     if resume_offset
-        .checked_add(size)
+        .checked_add(logical_size)
         .map(|t| t != total_size)
         .unwrap_or(true)
     {
         bail!(
             "server returned inconsistent sizes: resume_offset ({resume_offset}) \
-             + size ({size}) != total_size ({total_size})"
+             + size ({logical_size}) != total_size ({total_size})"
         );
     }
 
@@ -325,7 +430,14 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     let bar = make_bar(total_size, "download");
     bar.set_position(resume_offset);
 
-    let mut received: u64 = 0;
+    let mut body = match encoding {
+        Encoding::Identity => DownloadBody::Identity { received: 0, size },
+        Encoding::Zstd => DownloadBody::Zstd {
+            decoder: ZstdDecoder::new(plaintext_size.min(MAX_FILE_SIZE))
+                .context("initializing zstd decoder")?,
+        },
+        Encoding::Unknown(_) => unreachable!("unsupported encodings are rejected above"),
+    };
     let mut trailer = Vec::<u8>::new();
     let mut tmp = [0u8; FILE_CHUNK_SIZE];
     let mut recv_buf = [0u8; 65535];
@@ -337,18 +449,15 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // response frame. For small files the entire body + trailer is
     // sitting in `carryover` before we ever hit stream_recv.
     if !carryover.is_empty() {
-        let body_room = (size - received) as usize;
-        let body_take = body_room.min(carryover.len());
-        if body_take > 0 {
-            file.write_all(&carryover[..body_take])
-                .context("writing body chunk from carryover")?;
-            hasher.update(&carryover[..body_take]);
-            received += body_take as u64;
-            bar.set_position(resume_offset + received);
-        }
-        if body_take < carryover.len() {
-            trailer.extend_from_slice(&carryover[body_take..]);
-        }
+        accept_download_bytes(
+            &mut body,
+            &carryover,
+            &mut file,
+            &mut hasher,
+            &mut trailer,
+            &bar,
+            resume_offset,
+        )?;
         carryover.clear();
     }
 
@@ -365,7 +474,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // BLAKE3 trailer check is the real backstop -- a truncated body that
     // merely happens to match the length targets cannot also match the
     // whole-file hash.
-    if received >= size && trailer.len() >= want_trailer && !stream_finished {
+    if body.is_complete() && trailer.len() >= want_trailer && !stream_finished {
         handle_ingress(session.conn, session.socket, &mut recv_buf)?;
         match session.conn.stream_recv(stream_id, &mut tmp) {
             Ok((len, fin)) => {
@@ -374,7 +483,15 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
                 // reads only the first 32 bytes); we only care about the
                 // FIN here.
                 if len > 0 {
-                    trailer.extend_from_slice(&tmp[..len]);
+                    accept_download_bytes(
+                        &mut body,
+                        &tmp[..len],
+                        &mut file,
+                        &mut hasher,
+                        &mut trailer,
+                        &bar,
+                        resume_offset,
+                    )?;
                 }
                 if fin {
                     stream_finished = true;
@@ -393,7 +510,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         }
     }
 
-    while received < size || trailer.len() < want_trailer {
+    while !body.is_complete() || trailer.len() < want_trailer {
         // Three-step pump: always drain the socket and stream first,
         // and only block in poll.poll when both came up empty. The
         // previous "poll first" arrangement would sleep on the QUIC
@@ -409,20 +526,16 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
             match session.conn.stream_recv(stream_id, &mut tmp) {
                 Ok((len, fin)) => {
                     drained_any = true;
-                    if received < size {
-                        let body_room = (size - received) as usize;
-                        let body_take = body_room.min(len);
-                        file.write_all(&tmp[..body_take])
-                            .context("writing body chunk")?;
-                        hasher.update(&tmp[..body_take]);
-                        received += body_take as u64;
-                        bar.set_position(resume_offset + received);
-                        if body_take < len {
-                            // overflow into trailer bytes
-                            trailer.extend_from_slice(&tmp[body_take..len]);
-                        }
-                    } else {
-                        trailer.extend_from_slice(&tmp[..len]);
+                    if len > 0 {
+                        accept_download_bytes(
+                            &mut body,
+                            &tmp[..len],
+                            &mut file,
+                            &mut hasher,
+                            &mut trailer,
+                            &bar,
+                            resume_offset,
+                        )?;
                     }
                     if fin {
                         stream_finished = true;
@@ -449,18 +562,18 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         // If the server FIN'd the stream early without delivering the
         // full body + trailer, don't sit and spin waiting for bytes
         // that will never come.
-        if stream_finished && (received < size || trailer.len() < want_trailer) {
+        if stream_finished && (!body.is_complete() || trailer.len() < want_trailer) {
             let _ = std::fs::remove_file(local);
             bail!(
                 "server closed stream early: got {}/{} body bytes and {}/{} trailer bytes",
-                received,
-                size,
+                body.plaintext_received(),
+                logical_size,
                 trailer.len(),
                 want_trailer
             );
         }
 
-        if session.conn.is_closed() && (received < size || trailer.len() < want_trailer) {
+        if session.conn.is_closed() && (!body.is_complete() || trailer.len() < want_trailer) {
             bail!("connection closed during download");
         }
 
@@ -472,6 +585,18 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
                 session.conn.timeout().or(Some(Duration::from_millis(100))),
             )?;
             session.conn.on_timeout();
+        }
+    }
+
+    if let DownloadBody::Zstd { decoder } = &body {
+        decoder.finish().context("zstd frame did not complete")?;
+        if decoder.decoded_len() != plaintext_size {
+            let _ = std::fs::remove_file(local);
+            bail!(
+                "zstd plaintext size mismatch: decoded {} bytes, expected {}",
+                decoder.decoded_len(),
+                plaintext_size
+            );
         }
     }
 
@@ -501,18 +626,18 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
             let _ = std::fs::remove_file(local);
             bail!(
                 "BLAKE3 checksum mismatch after download (expected {} bytes, hash didn't match)",
-                size
+                logical_size
             );
         }
     }
 
     println!(
         "Downloaded {} bytes to {} ({}verified)",
-        size,
+        logical_size,
         local.display(),
         if checksum_follows { "" } else { "un" }
     );
-    crate::stats::record_download(size);
+    crate::stats::record_download(logical_size);
     Ok(())
 }
 

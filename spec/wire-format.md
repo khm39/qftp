@@ -290,15 +290,17 @@ limit, refusing larger directories with `ErrorCode::Internal`.
 
 `Get` and `Put` carry file body bytes on the **same** QUIC stream as
 the control messages, immediately after the relevant framed message.
-These body bytes are **not** length-prefixed or otherwise framed — the
-byte count is carried in the control message, and the QUIC stream FIN
-marks the end.
+Identity body bytes are **not** length-prefixed or otherwise framed —
+the byte count is carried in the control message, and the QUIC stream
+FIN marks the end. A compressed Get body is codec-framed as described
+below.
 
 When `encoding == Identity`, `size` is the plaintext length and
-`plaintext_size` is ignored; receivers use `size`. When the body is
-compressed, `size` is the number of encoded wire bytes and
-`plaintext_size` is the decoded plaintext length. The `offset` field
-and the BLAKE3 trailer always operate on plaintext, independent of
+`plaintext_size` is ignored; receivers use `size`. For a compressed Get,
+`size` remains the logical/plaintext byte count and is set equal to
+`plaintext_size`; it is **not** a wire delimiter. The compressed wire
+body is a single self-terminating codec frame. The `offset` field and
+the BLAKE3 trailer always operate on plaintext, independent of
 `encoding`.
 
 The trailer, when present, is exactly **the negotiated
@@ -311,17 +313,25 @@ length prefix.
 ```
 client -> server : frame( Request::Get { path, offset, length, accept_encoding } )
 server -> client : frame( Response::FileReady { size, total_size, checksum_follows, hash_algorithm, encoding, plaintext_size } )
-server -> client : <size> body bytes
+server -> client : body bytes
 server -> client : <digest-length trailer>       (only if checksum_follows == true)
                    QUIC stream FIN on the last byte
 ```
 
-- The server streams exactly `size` body bytes. For `Identity` this is
-  the post-`offset`, post-`length` plaintext slice; for compressed
-  bodies it is the encoded representation of that plaintext slice.
-- When `size == 0` the body phase is skipped: no body bytes are sent.
-  A trailer (if `checksum_follows`) still follows, covering the empty
-  body.
+- For `Identity`, the server streams exactly `size` body bytes: the
+  post-`offset`, post-`length` plaintext slice.
+- For `Zstd`, the server streams one self-contained zstd frame whose
+  decoded output is exactly `plaintext_size` bytes, and
+  `size == plaintext_size`. The frame end, not `size`, delimits the
+  compressed wire body. The client feeds bytes to the zstd decoder until
+  the decoder reports frame completion and the exact number of input
+  bytes consumed; bytes after that boundary are the trailer and MUST NOT
+  be consumed by the decoder.
+- For `Identity` with `size == 0`, the body phase is skipped: no body
+  bytes are sent. For `Zstd` with `size == plaintext_size == 0`, the
+  body is still an empty zstd frame so the receiver can observe the
+  frame boundary before the trailer. A trailer (if `checksum_follows`)
+  still follows, covering the empty plaintext.
 - When `checksum_follows` is `true`, a trailer of the
   `hash_algorithm` digest length follows the body: the hash of the
   streamed plaintext (not the encoded bytes, and not necessarily the
@@ -344,9 +354,11 @@ server -> client : frame( Response::Ok ) | frame( Response::Err( ErrorResponse )
 ```
 
 - The client streams exactly `size` body bytes. For `Identity`, these
-  bytes are plaintext; for compressed bodies they are encoded bytes and
-  `plaintext_size` declares the decoded byte count. When `size == 0`
-  the body phase is skipped.
+  bytes are plaintext. Compressed Put is reserved for a later phase; its
+  compressed wire framing will be specified with the same plaintext
+  domain invariants (`offset`, `size`, `plaintext_size`, quota, and
+  digest all refer to decoded bytes). When `size == 0` the body phase is
+  skipped.
 - The QUIC stream **FIN** is set on the last trailer byte when a
   trailer follows, otherwise on the last body byte.
 - When `checksum_trailer` is `true`, a trailer of the `hash_algorithm`
