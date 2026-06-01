@@ -112,6 +112,32 @@ async fn put(conn: &Connection, path: &str, body: &[u8], checksum: Option<[u8; 3
     decode_response(&mut data)
 }
 
+/// Upload declaring `encoding: Zstd`. The bridge has no zstd decode path,
+/// so it must refuse this with `Unsupported` rather than store the raw
+/// bytes verbatim (#300). Uses a streamed trailer like the SPA does.
+async fn put_zstd(conn: &Connection, path: &str, body: &[u8]) -> Response {
+    let (mut send, mut recv) = open_bi(conn).await;
+    let req = Request::Put {
+        path: path.to_string(),
+        size: body.len() as u64,
+        mode: 0o644,
+        offset: 0,
+        hash_algorithm: qftp_common::protocol::HashAlgorithm::Blake3,
+        checksum: None,
+        no_clobber: false,
+        checksum_trailer: true,
+        encoding: Encoding::Zstd,
+        plaintext_size: body.len() as u64,
+    };
+    send.write_all(&encode_framed_message(&req).unwrap())
+        .await
+        .expect("write put header");
+    send.write_all(body).await.expect("write put body");
+    send.finish().await.expect("finish put");
+    let mut data = read_to_end(&mut recv).await;
+    decode_response(&mut data)
+}
+
 /// Upload `body` the way the browser SPA does: declare
 /// `checksum_trailer = true` and append a 32-byte BLAKE3 trailer after
 /// the body on the same stream.
@@ -521,6 +547,18 @@ async fn end_to_end_webtransport() {
     assert!(
         !root.join("alice/sub/bad-trailer.bin").exists(),
         "a trailer-checksum-failed upload must not be committed"
+    );
+    // A compressed Put must be refused: the bridge has no zstd decode path,
+    // so it rejects a non-identity upload with `Unsupported` rather than
+    // store the raw compressed bytes (#300).
+    let code = expect_err(
+        put_zstd(&alice, "/sub/zstd.bin", &body).await,
+        "put with zstd encoding",
+    );
+    assert_eq!(code, ErrorCode::Unsupported);
+    assert!(
+        !root.join("alice/sub/zstd.bin").exists(),
+        "a compressed upload the bridge can't decode must not be committed"
     );
     expect_ok(
         op(

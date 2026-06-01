@@ -91,6 +91,7 @@ async fn dispatch_request(
             checksum,
             no_clobber,
             checksum_trailer,
+            encoding,
             ..
         } => {
             // qftp/1 negotiates BLAKE3 only.
@@ -100,6 +101,22 @@ async fn dispatch_request(
                     ErrorResponse::new(
                         ErrorCode::Unsupported,
                         "unsupported hash algorithm (only BLAKE3 is supported)",
+                    ),
+                )
+                .await;
+            }
+            // The bridge stores the upload body verbatim; it has no zstd
+            // decode path. Refuse a compressed (or unknown-codec) Put
+            // rather than write the raw compressed bytes to disk -- which
+            // would surface as a confusing `ChecksumMismatch`, or, when no
+            // checksum is sent, as silent corruption. The browser SPA only
+            // ever sends `Identity`, so this rejects nothing it does (#300).
+            if encoding != Encoding::Identity {
+                return reply_err(
+                    send,
+                    ErrorResponse::new(
+                        ErrorCode::Unsupported,
+                        "the web bridge does not support compressed uploads",
                     ),
                 )
                 .await;
@@ -301,6 +318,11 @@ async fn do_get(
 
     let mut file = tokio::fs::File::from_std(std_file);
 
+    // The bridge serves bodies uncompressed regardless of the client's
+    // `accept_encoding`: the browser SPA decodes in JS and has no bundled
+    // zstd, so compression for the web path is intentionally out of scope
+    // (the spec allows a server to answer `Identity` for any Get). The
+    // native server honors `accept_encoding`; the bridge does not (#300).
     send_framed(
         send,
         &Response::FileReady {

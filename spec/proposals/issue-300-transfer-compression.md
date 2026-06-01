@@ -1,6 +1,6 @@
 # Proposal: 転送圧縮 (zstd, オプトイン) — Issue #300 方針決定
 
-ステータス: **方針提案 (spike/decision)** — 実装着手前のレビュー対象。
+ステータス: **実装済 (Phase 0a–3b, PR #316)** — 当初は spike/decision として書かれ、ここで決めた方針どおり実装済み(Get/Put/resume 圧縮、既圧縮自動回避、`--no-compress`)。以下の本文は決定の根拠・経緯の記録であり、確定挙動は spec/wire-format.md・実コードを正とする。
 関連: Issue #300 / wire-freeze proposal ([qftp1-wire-freeze.md](qftp1-wire-freeze.md), #302) / spec-first 運用 (#298, #303)。
 
 本ドキュメントは「圧縮のベストプラクティス再調査」を踏まえ、Issue #300 の推奨案(案C)を
@@ -205,4 +205,4 @@ quota は `used_bytes + in_flight_bytes` の reserve-before-check 型(`transfer_
 
 ---
 
-*本提案は spike/decision であり最終実装ではない。スキーマ・ワイヤ仕様は実装着手前のレビューで変更されうる。*
+*本ドキュメントは当初 spike/decision として書かれ、ここで決めた方針は Phase 0a–3b (PR #316) で実装済み。確定したスキーマ・ワイヤ仕様は `spec/wire-format.md` と実コードを正とし、本文は決定の根拠・経緯の記録として残す。*

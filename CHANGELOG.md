@@ -12,6 +12,16 @@ this file tracks the reference implementation.
 
 ### Added
 
+- **zstd transfer compression (opt-out).** File bodies are compressed in
+  transit with zstd by default: downloads request it (`accept_encoding`),
+  fresh and resumed uploads send a self-contained zstd frame, and the
+  BLAKE3 trailer / `offset` / on-disk `.partial` stay in the **plaintext**
+  domain so integrity and resume are unchanged. Already-compressed files
+  (media/archives, by extension) and tiny transfers fall back to identity
+  automatically; `--no-compress` disables it. Decompression is bounded by
+  the declared plaintext size / `MAX_FILE_SIZE` and a frozen 8 MiB window
+  (`window_log = 23`) as a decompression-bomb defense. The web bridge
+  serves and accepts identity only. (#300)
 - **`mget` — remote wildcard download.** `mget <glob> [local-dir]`
   lists a remote directory and downloads every file whose name matches
   the glob, the download counterpart to `put`'s existing client-side
