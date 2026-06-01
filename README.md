@@ -193,7 +193,7 @@ legacy flags / defaults.
 | `--execute "<cmd>"` (`-e`) | Run a single command and exit. Repeatable. |
 | `--batch` | Read commands from stdin, one per line, instead of opening a REPL. Also implicit when stdin is not a TTY. |
 | `--history <path>` | Override the default `~/.qftp_history`. |
-| `--no-compress` | Disable zstd transfer compression. By default fresh uploads are compressed and downloads request compression; already-compressed files (media/archives) are auto-skipped. |
+| `--no-compress` | Disable zstd transfer compression. By default uploads (including resumes) are compressed and downloads request compression; already-compressed files (media/archives) are auto-skipped. |
 
 ## Web client (browser)
 

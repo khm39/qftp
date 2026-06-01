@@ -724,14 +724,15 @@ fn do_put_inner(
 
     let bytes_to_send = size - offset;
     let mode = unix_mode(&meta);
-    // Compress a fresh upload only when: the caller still allows it (the
-    // `Unsupported` retry sets this false), the process-wide `--no-compress`
-    // is off, the body clears a small floor where compression can't pay,
-    // and the local file isn't already a compressed/media format. Resumes
-    // (`offset > 0`) stay Identity (compressed resume is not yet wired).
+    // Compress when: the caller still allows it (the `Unsupported` retry
+    // sets this false), the process-wide `--no-compress` is off, the body
+    // clears a small floor where compression can't pay, and the local file
+    // isn't already a compressed/media format. A resume (`offset > 0`)
+    // compresses just the post-offset tail as its own independent zstd
+    // frame; the prefix stays plaintext on disk and is re-hashed by both
+    // sides, so the trailer still covers the whole file.
     let encoding = if compression_enabled
         && !compression_disabled()
-        && offset == 0
         && bytes_to_send >= 1024
         && !is_likely_incompressible(local)
     {

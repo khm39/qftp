@@ -181,10 +181,10 @@ server -> client : Response::Ok | Response::Err(...)
   length. For `encoding == Zstd`, the body is one self-contained zstd
   frame whose decoded output is exactly `plaintext_size` bytes, and
   `size == plaintext_size`; the frame end, not `size`, delimits the
-  compressed wire body. The reference implementation supports
-  compressed Put only for fresh uploads (`offset == 0`); compressed
-  resume is a future extension and is refused with
-  `ErrorCode::Unsupported`.
+  compressed wire body. A resume (`offset > 0`) may also be compressed:
+  the post-`offset` plaintext tail is sent as its own independent zstd
+  frame, while the on-disk prefix stays plaintext and is re-hashed by
+  both sides so the trailer covers the whole file.
 - `hash_algorithm` names the digest used for both `checksum` and the
   trailer; it is BLAKE3 in `qftp/1`
   (see [`HashAlgorithm`](wire-format.md#hashalgorithm)). A server that

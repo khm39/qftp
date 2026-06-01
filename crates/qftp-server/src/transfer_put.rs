@@ -238,13 +238,6 @@ pub(crate) fn start_put(
             "compressed upload requires a checksum".to_string(),
         );
     }
-    if encoding != Encoding::Identity && offset != 0 {
-        return send_err(
-            ctx,
-            ErrorCode::Unsupported,
-            "compressed resume not supported".to_string(),
-        );
-    }
     if encoding == Encoding::Zstd && plaintext_size != size {
         return send_err(
             ctx,
@@ -569,7 +562,16 @@ pub(crate) fn start_put(
                     }
                 }
                 RecvEncoding::Zstd { decoder } => {
-                    if let Err(resp) = feed_zstd_put_chunk(
+                    if let Some(rh) = rehash {
+                        // Resume: the prefix isn't hashed yet, and a
+                        // compressed frame can't be split by byte count,
+                        // so hold the whole compressed leftover. The
+                        // rehash-completion path in `drive_put` feeds it
+                        // through the decoder once the prefix is hashed,
+                        // so the decoded plaintext follows the prefix in
+                        // hash order.
+                        rh.pending_body = leftover.clone();
+                    } else if let Err(resp) = feed_zstd_put_chunk(
                         &leftover,
                         decoder,
                         writer,
@@ -651,31 +653,32 @@ pub(crate) fn drive_put(
         // the temp, refund `prior_bytes` to the owner's `used_bytes`,
         // and mark the stream `completed` so Drop's abort accounting
         // does not double-count it.
-        let mut abort_rehash = |err_resp: Response| -> Response {
-            fail_rejected_upload(
-                temp_path,
-                owner,
-                *reserved_bytes,
-                *prior_bytes,
-                completed,
-                err_resp,
-            )
-        };
         let rh = rehash.as_mut().unwrap();
         let want = (rh.remaining as usize).min(tmp.len());
         let n = match std::io::Read::read(&mut rh.reader, &mut tmp[..want]) {
             Ok(0) => {
-                return Ok(Some(abort_rehash(err(
-                    ErrorCode::Internal,
-                    "partial upload shrank during resume re-hash",
-                ))));
+                return Ok(Some(fail_rejected_upload(
+                    temp_path,
+                    owner,
+                    *reserved_bytes,
+                    *prior_bytes,
+                    completed,
+                    err(
+                        ErrorCode::Internal,
+                        "partial upload shrank during resume re-hash",
+                    ),
+                )));
             }
             Ok(n) => n,
             Err(e) => {
-                return Ok(Some(abort_rehash(err(
-                    io_code(&e),
-                    format!("resume re-hash read failed: {e}"),
-                ))));
+                return Ok(Some(fail_rejected_upload(
+                    temp_path,
+                    owner,
+                    *reserved_bytes,
+                    *prior_bytes,
+                    completed,
+                    err(io_code(&e), format!("resume re-hash read failed: {e}")),
+                )));
             }
         };
         hasher.update(&tmp[..n]);
@@ -690,21 +693,50 @@ pub(crate) fn drive_put(
         let pending = std::mem::take(&mut rh.pending_body);
         *rehash = None;
         if !pending.is_empty() {
-            if pending.len() as u64 > *remaining {
-                return Ok(Some(err(
-                    ErrorCode::UploadOverflow,
-                    "Upload exceeded declared size",
-                )));
+            match recv_encoding {
+                RecvEncoding::Identity => {
+                    if pending.len() as u64 > *remaining {
+                        return Ok(Some(err(
+                            ErrorCode::UploadOverflow,
+                            "Upload exceeded declared size",
+                        )));
+                    }
+                    if let Err(e) = writer.write_all(&pending) {
+                        return Ok(Some(err(
+                            ErrorCode::Internal,
+                            format!("Failed to write file: {e}"),
+                        )));
+                    }
+                    hasher.update(&pending);
+                    *remaining -= pending.len() as u64;
+                    metrics.add_bytes_received(pending.len() as u64);
+                }
+                RecvEncoding::Zstd { decoder } => {
+                    // `pending` is the compressed leftover that arrived
+                    // with the Put request, held back so the prefix could
+                    // be hashed first. Now decode it: the helper writes
+                    // plaintext, hashes it, decrements `remaining`, and
+                    // routes any trailing bytes into the trailer.
+                    if let Err(resp) = feed_zstd_put_chunk(
+                        &pending,
+                        decoder,
+                        writer,
+                        hasher,
+                        remaining,
+                        trailer_buf,
+                        metrics,
+                    ) {
+                        return Ok(Some(fail_rejected_upload(
+                            temp_path,
+                            owner,
+                            *reserved_bytes,
+                            *prior_bytes,
+                            completed,
+                            resp,
+                        )));
+                    }
+                }
             }
-            if let Err(e) = writer.write_all(&pending) {
-                return Ok(Some(err(
-                    ErrorCode::Internal,
-                    format!("Failed to write file: {e}"),
-                )));
-            }
-            hasher.update(&pending);
-            *remaining -= pending.len() as u64;
-            metrics.add_bytes_received(pending.len() as u64);
         }
         // Deliberately fall through into Phase A rather than returning:
         // if `pending` already held the whole body, the stream has no

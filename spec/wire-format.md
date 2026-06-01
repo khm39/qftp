@@ -361,10 +361,10 @@ server -> client : frame( Response::Ok ) | frame( Response::Err( ErrorResponse )
   compressed wire body. The server feeds bytes to the zstd decoder until
   the decoder reports frame completion and the exact number of input
   bytes consumed; bytes after that boundary are the trailer and MUST NOT
-  be consumed by the decoder. The reference implementation supports
-  compressed Put only for fresh uploads (`offset == 0`); compressed
-  resume is a future extension and is refused with
-  [`Unsupported`](error-codes.md).
+  be consumed by the decoder. A resume (`offset > 0`) may also be
+  compressed: the post-`offset` plaintext tail is sent as its own
+  independent zstd frame, while the on-disk prefix stays plaintext and is
+  re-hashed by both sides so the trailer still covers the whole file.
 - For `Identity` with `size == 0`, the body phase is skipped. For
   `Zstd` with `size == plaintext_size == 0`, the body is still an empty
   zstd frame so the receiver can observe the frame boundary before the
