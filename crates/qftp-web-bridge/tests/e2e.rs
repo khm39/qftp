@@ -132,8 +132,12 @@ async fn put_zstd(conn: &Connection, path: &str, body: &[u8]) -> Response {
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
         .expect("write put header");
-    send.write_all(body).await.expect("write put body");
-    send.finish().await.expect("finish put");
+    // The bridge rejects a compressed Put at the header, before reading
+    // any body bytes, then drops its receive side. Writing the body /
+    // finishing can therefore race a stream reset -- tolerate failures
+    // here; the rejection arrives on the recv stream regardless.
+    let _ = send.write_all(body).await;
+    let _ = send.finish().await;
     let mut data = read_to_end(&mut recv).await;
     decode_response(&mut data)
 }
