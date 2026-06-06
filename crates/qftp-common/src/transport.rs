@@ -78,6 +78,7 @@ pub fn tune_udp_buffers(_socket: &std::net::UdpSocket) {}
 /// path kicks in; 32 leaves comfortable headroom for slightly
 /// larger MTUs (DPLPMTUD pushing us toward 1500) without flipping
 /// the GSO-disabled flag.
+#[cfg(target_os = "linux")]
 const GSO_BURST_PACKETS: usize = 32;
 
 /// Tracks whether UDP_SEGMENT (GSO) is usable on this socket. Starts

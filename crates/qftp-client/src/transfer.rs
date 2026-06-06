@@ -16,7 +16,8 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use qftp_common::protocol::*;
 use qftp_common::transport::*;
-use qftp_protocol::stream::FILE_CHUNK_SIZE;
+use qftp_protocol::compress::{is_likely_incompressible, ZstdDecoder, ZstdEncoder};
+use qftp_protocol::stream::{FILE_CHUNK_SIZE, MAX_FILE_SIZE};
 
 use crate::proto::Session;
 
@@ -47,6 +48,21 @@ static BW_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 pub fn set_bw_limit_bps(rate: u64) {
     BW_LIMIT_BPS.store(rate, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `--no-compress` disables client-initiated zstd transfer compression
+/// process-wide: uploads are sent as `Identity` and downloads stop
+/// advertising `Zstd` in `accept_encoding`. `false` (default) leaves the
+/// default-on policy in place. Set once at startup, read per transfer.
+static COMPRESSION_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compression_disabled(disabled: bool) {
+    COMPRESSION_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn compression_disabled() -> bool {
+    COMPRESSION_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Token-bucket throttle applied per chunk. Sleeps just long enough
@@ -198,6 +214,88 @@ fn hash_prefix<R: Read>(
     Ok(())
 }
 
+enum DownloadBody {
+    Identity { received: u64, size: u64 },
+    Zstd { decoder: ZstdDecoder },
+}
+
+impl DownloadBody {
+    fn is_complete(&self) -> bool {
+        match self {
+            DownloadBody::Identity { received, size } => received >= size,
+            DownloadBody::Zstd { decoder } => decoder.frame_complete(),
+        }
+    }
+
+    fn plaintext_received(&self) -> u64 {
+        match self {
+            DownloadBody::Identity { received, .. } => *received,
+            DownloadBody::Zstd { decoder } => decoder.decoded_len(),
+        }
+    }
+}
+
+fn drain_decoded_plaintext(
+    decoder: &mut ZstdDecoder,
+    file: &mut File,
+    hasher: &mut blake3::Hasher,
+) -> Result<()> {
+    while !decoder.pending().is_empty() {
+        let n = decoder.pending().len();
+        file.write_all(decoder.pending())
+            .context("writing decoded zstd body chunk")?;
+        hasher.update(decoder.pending());
+        decoder.consume(n);
+    }
+    Ok(())
+}
+
+fn accept_download_bytes(
+    body: &mut DownloadBody,
+    input: &[u8],
+    file: &mut File,
+    hasher: &mut blake3::Hasher,
+    trailer: &mut Vec<u8>,
+    bar: &ProgressBar,
+    resume_offset: u64,
+) -> Result<()> {
+    match body {
+        DownloadBody::Identity { received, size } => {
+            if *received < *size {
+                let body_room = (*size - *received) as usize;
+                let body_take = body_room.min(input.len());
+                if body_take > 0 {
+                    file.write_all(&input[..body_take])
+                        .context("writing body chunk")?;
+                    hasher.update(&input[..body_take]);
+                    *received += body_take as u64;
+                    bar.set_position(resume_offset + *received);
+                }
+                if body_take < input.len() {
+                    trailer.extend_from_slice(&input[body_take..]);
+                }
+            } else {
+                trailer.extend_from_slice(input);
+            }
+        }
+        DownloadBody::Zstd { decoder } => {
+            if decoder.frame_complete() {
+                trailer.extend_from_slice(input);
+                return Ok(());
+            }
+            let progress = decoder.push(input).context("decoding zstd body chunk")?;
+            drain_decoded_plaintext(decoder, file, hasher)?;
+            bar.set_position(resume_offset + decoder.decoded_len());
+            if progress.frame_complete {
+                trailer.extend_from_slice(&input[progress.consumed..]);
+            } else if progress.consumed < input.len() {
+                bail!("zstd decoder stopped before consuming the compressed chunk");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Download `remote` to `local`. If `local` already exists, resume from
 /// its current length. Verifies the server-supplied BLAKE3 trailer once
 /// the body is fully received and refuses to keep the file on mismatch.
@@ -235,6 +333,14 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         path: remote.to_string(),
         offset: resume_offset,
         length: None,
+        // Advertise zstd unless `--no-compress` is set. The server still
+        // makes the final choice (and may answer Identity for already-
+        // compressed or tiny files); an empty list means identity only.
+        accept_encoding: if compression_disabled() {
+            Vec::new()
+        } else {
+            vec![Encoding::Zstd]
+        },
     };
     send_message(session.conn, stream_id, &req)?;
     stream_send_all(session.conn, stream_id, &[], true)?;
@@ -247,13 +353,15 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // entire body + trailer + FIN often arrives in the same ingress.
     let mut carryover: Vec<u8> = Vec::new();
     let resp = session.poll_response_with_buf(stream_id, &mut carryover)?;
-    let (size, total_size, checksum_follows) = match resp {
+    let (size, total_size, checksum_follows, encoding, plaintext_size) = match resp {
         Response::FileReady {
             size,
             total_size,
             checksum_follows,
+            encoding,
+            plaintext_size,
             ..
-        } => (size, total_size, checksum_follows),
+        } => (size, total_size, checksum_follows, encoding, plaintext_size),
         Response::Err(e) => {
             // A resumed Get whose offset is past the (now shorter)
             // remote file is refused with InvalidRange: the local
@@ -267,6 +375,26 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         }
         other => bail!("unexpected response to Get: {other:?}"),
     };
+    let logical_size = match encoding {
+        Encoding::Identity => size,
+        Encoding::Zstd => {
+            if size != plaintext_size {
+                bail!(
+                    "server returned inconsistent zstd sizes: size ({size}) \
+                     != plaintext_size ({plaintext_size})"
+                );
+            }
+            plaintext_size
+        }
+        Encoding::Unknown(n) => bail!("server selected unsupported transfer encoding {n}"),
+    };
+    if matches!(encoding, Encoding::Zstd) && plaintext_size > MAX_FILE_SIZE {
+        bail!(
+            "server announced zstd plaintext size {} above max {}",
+            plaintext_size,
+            MAX_FILE_SIZE
+        );
+    }
 
     // `total_size` is the server's announced full-file size; `size` is
     // the streamed body. `do_get` always sends `length: None`, so the
@@ -276,13 +404,13 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // trailer over a truncated body and banking on `total_size` going
     // unchecked); refuse before we touch the local disk.
     if resume_offset
-        .checked_add(size)
+        .checked_add(logical_size)
         .map(|t| t != total_size)
         .unwrap_or(true)
     {
         bail!(
             "server returned inconsistent sizes: resume_offset ({resume_offset}) \
-             + size ({size}) != total_size ({total_size})"
+             + size ({logical_size}) != total_size ({total_size})"
         );
     }
 
@@ -324,7 +452,14 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     let bar = make_bar(total_size, "download");
     bar.set_position(resume_offset);
 
-    let mut received: u64 = 0;
+    let mut body = match encoding {
+        Encoding::Identity => DownloadBody::Identity { received: 0, size },
+        Encoding::Zstd => DownloadBody::Zstd {
+            decoder: ZstdDecoder::new(plaintext_size.min(MAX_FILE_SIZE))
+                .context("initializing zstd decoder")?,
+        },
+        Encoding::Unknown(_) => unreachable!("unsupported encodings are rejected above"),
+    };
     let mut trailer = Vec::<u8>::new();
     let mut tmp = [0u8; FILE_CHUNK_SIZE];
     let mut recv_buf = [0u8; 65535];
@@ -336,18 +471,15 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // response frame. For small files the entire body + trailer is
     // sitting in `carryover` before we ever hit stream_recv.
     if !carryover.is_empty() {
-        let body_room = (size - received) as usize;
-        let body_take = body_room.min(carryover.len());
-        if body_take > 0 {
-            file.write_all(&carryover[..body_take])
-                .context("writing body chunk from carryover")?;
-            hasher.update(&carryover[..body_take]);
-            received += body_take as u64;
-            bar.set_position(resume_offset + received);
-        }
-        if body_take < carryover.len() {
-            trailer.extend_from_slice(&carryover[body_take..]);
-        }
+        accept_download_bytes(
+            &mut body,
+            &carryover,
+            &mut file,
+            &mut hasher,
+            &mut trailer,
+            &bar,
+            resume_offset,
+        )?;
         carryover.clear();
     }
 
@@ -364,7 +496,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
     // BLAKE3 trailer check is the real backstop -- a truncated body that
     // merely happens to match the length targets cannot also match the
     // whole-file hash.
-    if received >= size && trailer.len() >= want_trailer && !stream_finished {
+    if body.is_complete() && trailer.len() >= want_trailer && !stream_finished {
         handle_ingress(session.conn, session.socket, &mut recv_buf)?;
         match session.conn.stream_recv(stream_id, &mut tmp) {
             Ok((len, fin)) => {
@@ -373,7 +505,15 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
                 // reads only the first 32 bytes); we only care about the
                 // FIN here.
                 if len > 0 {
-                    trailer.extend_from_slice(&tmp[..len]);
+                    accept_download_bytes(
+                        &mut body,
+                        &tmp[..len],
+                        &mut file,
+                        &mut hasher,
+                        &mut trailer,
+                        &bar,
+                        resume_offset,
+                    )?;
                 }
                 if fin {
                     stream_finished = true;
@@ -392,7 +532,7 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         }
     }
 
-    while received < size || trailer.len() < want_trailer {
+    while !body.is_complete() || trailer.len() < want_trailer {
         // Three-step pump: always drain the socket and stream first,
         // and only block in poll.poll when both came up empty. The
         // previous "poll first" arrangement would sleep on the QUIC
@@ -408,20 +548,16 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
             match session.conn.stream_recv(stream_id, &mut tmp) {
                 Ok((len, fin)) => {
                     drained_any = true;
-                    if received < size {
-                        let body_room = (size - received) as usize;
-                        let body_take = body_room.min(len);
-                        file.write_all(&tmp[..body_take])
-                            .context("writing body chunk")?;
-                        hasher.update(&tmp[..body_take]);
-                        received += body_take as u64;
-                        bar.set_position(resume_offset + received);
-                        if body_take < len {
-                            // overflow into trailer bytes
-                            trailer.extend_from_slice(&tmp[body_take..len]);
-                        }
-                    } else {
-                        trailer.extend_from_slice(&tmp[..len]);
+                    if len > 0 {
+                        accept_download_bytes(
+                            &mut body,
+                            &tmp[..len],
+                            &mut file,
+                            &mut hasher,
+                            &mut trailer,
+                            &bar,
+                            resume_offset,
+                        )?;
                     }
                     if fin {
                         stream_finished = true;
@@ -448,18 +584,18 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
         // If the server FIN'd the stream early without delivering the
         // full body + trailer, don't sit and spin waiting for bytes
         // that will never come.
-        if stream_finished && (received < size || trailer.len() < want_trailer) {
+        if stream_finished && (!body.is_complete() || trailer.len() < want_trailer) {
             let _ = std::fs::remove_file(local);
             bail!(
                 "server closed stream early: got {}/{} body bytes and {}/{} trailer bytes",
-                received,
-                size,
+                body.plaintext_received(),
+                logical_size,
                 trailer.len(),
                 want_trailer
             );
         }
 
-        if session.conn.is_closed() && (received < size || trailer.len() < want_trailer) {
+        if session.conn.is_closed() && (!body.is_complete() || trailer.len() < want_trailer) {
             bail!("connection closed during download");
         }
 
@@ -471,6 +607,18 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
                 session.conn.timeout().or(Some(Duration::from_millis(100))),
             )?;
             session.conn.on_timeout();
+        }
+    }
+
+    if let DownloadBody::Zstd { decoder } = &body {
+        decoder.finish().context("zstd frame did not complete")?;
+        if decoder.decoded_len() != plaintext_size {
+            let _ = std::fs::remove_file(local);
+            bail!(
+                "zstd plaintext size mismatch: decoded {} bytes, expected {}",
+                decoder.decoded_len(),
+                plaintext_size
+            );
         }
     }
 
@@ -500,18 +648,18 @@ fn do_get_inner(session: &mut Session, stream_id: u64, remote: &str, local: &Pat
             let _ = std::fs::remove_file(local);
             bail!(
                 "BLAKE3 checksum mismatch after download (expected {} bytes, hash didn't match)",
-                size
+                logical_size
             );
         }
     }
 
     println!(
         "Downloaded {} bytes to {} ({}verified)",
-        size,
+        logical_size,
         local.display(),
         if checksum_follows { "" } else { "un" }
     );
-    crate::stats::record_download(size);
+    crate::stats::record_download(logical_size);
     Ok(())
 }
 
@@ -530,7 +678,14 @@ pub fn do_put(
 ) -> Result<()> {
     // Parent span for the whole upload.
     let _span = tracing::info_span!("transfer", op = "put", stream_id, path = %remote).entered();
-    let result = do_put_inner(session, stream_id, local, remote, offset, no_clobber);
+    let mut result = do_put_inner(session, stream_id, local, remote, offset, no_clobber, true);
+    if result
+        .as_ref()
+        .is_err_and(|e| e.is::<UnsupportedEncoding>())
+    {
+        let stream_id = session.take_stream();
+        result = do_put_inner(session, stream_id, local, remote, offset, no_clobber, false);
+    }
     if let Err(e) = &result {
         // A `StalePartial` error is a retry signal for the caller, not
         // an actual transfer failure -- the caller re-uploads from
@@ -551,6 +706,7 @@ fn do_put_inner(
     remote: &str,
     offset: u64,
     no_clobber: bool,
+    compression_enabled: bool,
 ) -> Result<()> {
     let meta =
         std::fs::metadata(local).with_context(|| format!("stat {} for upload", local.display()))?;
@@ -568,6 +724,22 @@ fn do_put_inner(
 
     let bytes_to_send = size - offset;
     let mode = unix_mode(&meta);
+    // Compress when: the caller still allows it (the `Unsupported` retry
+    // sets this false), the process-wide `--no-compress` is off, the body
+    // clears a small floor where compression can't pay, and the local file
+    // isn't already a compressed/media format. A resume (`offset > 0`)
+    // compresses just the post-offset tail as its own independent zstd
+    // frame; the prefix stays plaintext on disk and is re-hashed by both
+    // sides, so the trailer still covers the whole file.
+    let encoding = if compression_enabled
+        && !compression_disabled()
+        && bytes_to_send >= 1024
+        && !is_likely_incompressible(local)
+    {
+        Encoding::Zstd
+    } else {
+        Encoding::Identity
+    };
 
     let req = Request::Put {
         path: remote.to_string(),
@@ -580,6 +752,12 @@ fn do_put_inner(
         checksum: None,
         no_clobber,
         checksum_trailer: true,
+        encoding,
+        plaintext_size: if encoding == Encoding::Zstd {
+            bytes_to_send
+        } else {
+            0
+        },
     };
     send_message(session.conn, stream_id, &req)?;
     flush_egress(session.conn, session.socket)?;
@@ -607,6 +785,11 @@ fn do_put_inner(
     let mut buf = vec![0u8; UPLOAD_CHUNK];
     let mut pacer = Pacer::new();
     let mut recv_buf = [0u8; 65535];
+    let mut encoder = if encoding == Encoding::Zstd {
+        Some(ZstdEncoder::new().context("initializing zstd encoder")?)
+    } else {
+        None
+    };
     while sent < bytes_to_send {
         let want = (bytes_to_send - sent) as usize;
         let want = want.min(buf.len());
@@ -645,35 +828,13 @@ fn do_put_inner(
             }
         }
 
-        // Drive a single chunk to the wire. quiche's stream_send will
-        // truncate or refuse the write when the connection's send
-        // capacity (flow-control + congestion window) is exhausted —
-        // in both cases we have to flush egress and pull ACKs in
-        // before the rest of the chunk can be queued. Propagating
-        // `Error::Done` here instead would fail any upload that
-        // didn't fit in the initial cwnd (~14 KiB).
-        //
-        // The trailer carries the FIN; never set chunk_fin on
-        // body bytes.
-        let mut sub = 0usize;
-        while sub < want {
-            let remaining = &buf[sub..want];
-            match session.conn.stream_send(stream_id, remaining, false) {
-                Ok(0) | Err(quiche::Error::Done) => {
-                    flush_egress(session.conn, session.socket)?;
-                    session.poll.poll(
-                        session.events,
-                        session.conn.timeout().or(Some(Duration::from_millis(20))),
-                    )?;
-                    session.conn.on_timeout();
-                    handle_ingress(session.conn, session.socket, &mut recv_buf)?;
-                    if session.conn.is_closed() {
-                        bail!("connection closed during upload");
-                    }
-                }
-                Ok(n) => sub += n,
-                Err(e) => bail!("stream_send failed: {e}"),
-            }
+        if let Some(encoder) = encoder.as_mut() {
+            encoder
+                .push(&buf[..want])
+                .context("compressing upload chunk")?;
+            drain_zstd_encoder_to_wire(session, stream_id, encoder, &mut recv_buf)?;
+        } else {
+            send_upload_bytes(session, stream_id, &buf[..want], false, &mut recv_buf)?;
         }
         flush_egress(session.conn, session.socket)?;
 
@@ -689,30 +850,14 @@ fn do_put_inner(
         handle_ingress(session.conn, session.socket, &mut recv_buf)?;
         flush_egress(session.conn, session.socket)?;
     }
+    if let Some(encoder) = encoder.as_mut() {
+        encoder.finish().context("finalizing zstd upload frame")?;
+        drain_zstd_encoder_to_wire(session, stream_id, encoder, &mut recv_buf)?;
+    }
 
     // Body fully queued. Push the 32-byte BLAKE3 trailer with FIN.
     let trailer = *hasher.finalize().as_bytes();
-    let mut sub = 0usize;
-    while sub < trailer.len() {
-        // The trailer is the last data on the stream, so every write
-        // carries FIN; quiche keeps it pending across partial writes.
-        match session.conn.stream_send(stream_id, &trailer[sub..], true) {
-            Ok(0) | Err(quiche::Error::Done) => {
-                flush_egress(session.conn, session.socket)?;
-                session.poll.poll(
-                    session.events,
-                    session.conn.timeout().or(Some(Duration::from_millis(20))),
-                )?;
-                session.conn.on_timeout();
-                handle_ingress(session.conn, session.socket, &mut recv_buf)?;
-                if session.conn.is_closed() {
-                    bail!("connection closed during trailer send");
-                }
-            }
-            Ok(n) => sub += n,
-            Err(e) => bail!("stream_send (trailer) failed: {e}"),
-        }
-    }
+    send_upload_bytes(session, stream_id, &trailer, true, &mut recv_buf)?;
     flush_egress(session.conn, session.socket)?;
 
     bar.finish_and_clear();
@@ -731,10 +876,55 @@ fn do_put_inner(
                 // whole upload from scratch.
                 return Err(anyhow::Error::new(StalePartial));
             }
+            if encoding == Encoding::Zstd && e.code == ErrorCode::Unsupported {
+                return Err(anyhow::Error::new(UnsupportedEncoding));
+            }
             bail!("server refused Put: {} ({:?})", e.message, e.code)
         }
         other => bail!("unexpected response to Put: {other:?}"),
     }
+}
+
+fn drain_zstd_encoder_to_wire(
+    session: &mut Session,
+    stream_id: u64,
+    encoder: &mut ZstdEncoder,
+    recv_buf: &mut [u8; 65535],
+) -> Result<()> {
+    while !encoder.pending().is_empty() {
+        let n = send_upload_bytes(session, stream_id, encoder.pending(), false, recv_buf)?;
+        encoder.consume(n);
+    }
+    Ok(())
+}
+
+fn send_upload_bytes(
+    session: &mut Session,
+    stream_id: u64,
+    bytes: &[u8],
+    fin: bool,
+    recv_buf: &mut [u8; 65535],
+) -> Result<usize> {
+    let mut sent = 0usize;
+    while sent < bytes.len() {
+        match session.conn.stream_send(stream_id, &bytes[sent..], fin) {
+            Ok(0) | Err(quiche::Error::Done) => {
+                flush_egress(session.conn, session.socket)?;
+                session.poll.poll(
+                    session.events,
+                    session.conn.timeout().or(Some(Duration::from_millis(20))),
+                )?;
+                session.conn.on_timeout();
+                handle_ingress(session.conn, session.socket, recv_buf)?;
+                if session.conn.is_closed() {
+                    bail!("connection closed during upload");
+                }
+            }
+            Ok(n) => sent += n,
+            Err(e) => bail!("stream_send failed: {e}"),
+        }
+    }
+    Ok(sent)
 }
 
 /// Error returned by [`do_put`] when a *resumed* upload (`offset > 0`)
@@ -752,6 +942,18 @@ impl std::fmt::Display for StalePartial {
 }
 
 impl std::error::Error for StalePartial {}
+
+/// Retry signal when a server refuses the zstd upload path.
+#[derive(Debug)]
+struct UnsupportedEncoding;
+
+impl std::fmt::Display for UnsupportedEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server does not support compressed upload; retrying identity")
+    }
+}
+
+impl std::error::Error for UnsupportedEncoding {}
 
 /// True when a refused resumed upload should be retried from scratch.
 /// The server-side partial is stale: its bytes mismatch the local file

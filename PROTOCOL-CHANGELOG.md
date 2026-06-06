@@ -29,9 +29,9 @@ The first published wire version. The full specification is in
   `Put`, `Mkdir`, `Rmdir`, `Rm`, `Rename`, `Chmod`, `Stat`, `Quota`,
   `Quit`) and `Response` (7 variants: `Ok`, `Err`, `DirListing`,
   `Path`, `FileStat`, `FileReady`, `QuotaInfo`).
-- **Error codes.** A 16-entry `ErrorCode` registry
+- **Error codes.** A 17-entry `ErrorCode` registry
   ([spec/error-codes.md](spec/error-codes.md)).
-- **Body streaming.** `Get`/`Put` carry raw file bytes on the request
+- **Body streaming.** `Get`/`Put` carry file body bytes on the request
   stream, with an optional 32-byte BLAKE3 trailer
   ([spec/wire-format.md](spec/wire-format.md#body-streaming)).
 - **Resume and integrity.** Ranged/resumed `Get`, append-style `Put`
@@ -90,6 +90,16 @@ authoritative.
   `seq<u8>` whose length is the algorithm's digest length (BLAKE3 →
   32), replacing the fixed `[u8; 32]`. A future algorithm is added as a
   new `HashAlgorithm` value and the trailer length follows from it.
+- **Transfer-compression schema.** An `Encoding` enum (`u32`,
+  `Identity=0`, `Zstd=1`) is added for opt-in body compression.
+  `Request::Get` appends `accept_encoding: seq<Encoding>`, and both
+  `Request::Put` and `Response::FileReady` append `encoding: Encoding`
+  plus `plaintext_size: u64`. `Identity` is the default; compressed
+  transfers use `size` for encoded wire bytes and `plaintext_size` for
+  decoded plaintext bytes. The BLAKE3 trailer and resume `offset`
+  remain plaintext-domain. `ErrorCode::DecodeError` is assigned `431`
+  for malformed compressed frames or zstd windows exceeding
+  `window_log = 23` (8 MiB).
 
 Compatible refinements landed in the same revision (not new breaks):
 the `Put` FIN/trailer framing was clarified (FIN on the last trailer

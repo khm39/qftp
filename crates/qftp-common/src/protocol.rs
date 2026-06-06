@@ -16,20 +16,35 @@
 //! Each protocol message is bincode-serialized (fixint, little-endian;
 //! enum tags are `u32`) into a length-prefixed frame (4-byte big-endian
 //! length, then the payload). File body bytes follow the framed
-//! `FileReady` response on the same stream and are sized exactly by
-//! `FileReady::size`. When `checksum_follows` is set, the digest of the
-//! streamed body follows immediately after the body (length = the
-//! negotiated [`HashAlgorithm`]'s [`HashAlgorithm::digest_len`], BLAKE3
-//! → 32 bytes), with the QUIC stream FIN flag set on the last byte.
+//! `FileReady` response on the same stream. Identity bodies are sized
+//! by `FileReady::size`; compressed Get bodies are a single
+//! self-terminating codec frame followed by the checksum trailer. When
+//! `checksum_follows` is set, the digest of the streamed plaintext
+//! follows immediately after the body (length = the negotiated
+//! [`HashAlgorithm`]'s [`HashAlgorithm::digest_len`], BLAKE3 → 32
+//! bytes), with the QUIC stream FIN flag set on the last byte.
 //!
 //! ## Numeric on-wire enums
 //!
-//! [`FileType`], [`HashAlgorithm`] and [`ErrorCode`] are encoded as a
-//! single `u32` value (not a positional bincode index) via hand-written
-//! [`Serialize`]/[`Deserialize`] impls, so unknown values decode to an
-//! `Unknown(n)` variant instead of failing. [`Request`]/[`Response`]/
-//! [`ErrorDetails`] keep derived serde; bincode already writes their
-//! variant tag as a `u32`.
+//! [`FileType`], [`HashAlgorithm`], [`Encoding`] and [`ErrorCode`] are
+//! encoded as a single `u32` value (not a positional bincode index) via
+//! hand-written [`Serialize`]/[`Deserialize`] impls, so unknown values
+//! decode to an `Unknown(n)` variant instead of failing. [`Request`]/
+//! [`Response`]/[`ErrorDetails`] keep derived serde; bincode already
+//! writes their variant tag as a `u32`.
+//!
+//! ## Transfer compression (Issue #300)
+//!
+//! A file body MAY be compressed in transit. [`Encoding`] names the
+//! codec; `Identity` (the default) is byte-for-byte the uncompressed
+//! wire. Compression is a pure transport transform *below* integrity:
+//! the BLAKE3 trailer and `offset` always operate on the **plaintext**.
+//! When a Get body is compressed, the framed header's `size` is still
+//! the logical/plaintext byte count and equals `plaintext_size`; the
+//! compressed wire body is delimited by the self-contained codec frame.
+//! Receivers bound decompression by `plaintext_size` / `MAX_FILE_SIZE`
+//! (decompression-bomb defense). See
+//! `spec/proposals/issue-300-transfer-compression.md`.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -300,6 +315,63 @@ impl<'de> Deserialize<'de> for HashAlgorithm {
     }
 }
 
+/// Transfer-encoding (compression) applied to a file body, encoded on
+/// the wire as a `u32`. `Identity` (the default) is no compression and
+/// matches the uncompressed wire byte-for-byte. Unknown values decode to
+/// `Unknown(n)` so a future codec (e.g. `lz4`) can be added post-1.0
+/// without a wire-major bump. Compression never changes the meaning of
+/// `offset` or the BLAKE3 trailer, which always cover the plaintext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Encoding {
+    /// No compression. `size` == plaintext length; the wire is identical
+    /// to a pre-compression qftp/1 transfer.
+    #[default]
+    Identity,
+    /// zstd, streamed as a single self-contained frame per transfer with
+    /// a bounded window (`window_log <= 23`, 8 MiB). See the proposal doc.
+    Zstd,
+    /// A codec value this build doesn't have a named variant for. Carried
+    /// so unknown encodings decode rather than failing; a peer that can't
+    /// handle it refuses the transfer with [`ErrorCode::Unsupported`].
+    Unknown(u32),
+}
+
+impl Encoding {
+    pub fn to_u32(self) -> u32 {
+        match self {
+            Encoding::Identity => 0,
+            Encoding::Zstd => 1,
+            Encoding::Unknown(n) => n,
+        }
+    }
+
+    pub fn from_u32(n: u32) -> Self {
+        match n {
+            0 => Encoding::Identity,
+            1 => Encoding::Zstd,
+            other => Encoding::Unknown(other),
+        }
+    }
+
+    /// Whether this build can encode/decode this codec. `Unknown(_)` and
+    /// any future-but-unimplemented codec return `false`.
+    pub fn is_supported(self) -> bool {
+        matches!(self, Encoding::Identity | Encoding::Zstd)
+    }
+}
+
+impl Serialize for Encoding {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(self.to_u32())
+    }
+}
+
+impl<'de> Deserialize<'de> for Encoding {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Encoding::from_u32(u32::deserialize(d)?))
+    }
+}
+
 /// Machine-readable error category, encoded on the wire as a numeric
 /// `u32` status (class structure mirrors HTTP: `4xx` caller-caused,
 /// `5xx` server-caused). Scripts and recursive transfers check this
@@ -323,6 +395,12 @@ pub enum ErrorCode {
     UploadOverflow,
     /// Peer sent FIN before delivering its declared body bytes.
     UploadTruncated,
+    /// A compressed body could not be decoded: a malformed codec frame,
+    /// or a frame whose window exceeds the negotiated maximum. Distinct
+    /// from `UploadOverflow` (a plaintext-output size breach) and
+    /// `Malformed` (a corrupt control frame): here the control frame is
+    /// well-formed but the compressed payload is not (#300).
+    DecodeError,
     /// BLAKE3 checksum verification failed.
     ChecksumMismatch,
     /// In-connection rate limit kicked in.
@@ -368,6 +446,7 @@ impl ErrorCode {
             ErrorCode::UploadTruncated => 424,
             ErrorCode::RateLimited => 429,
             ErrorCode::QuotaExceeded => 430,
+            ErrorCode::DecodeError => 431,
             ErrorCode::Internal => 500,
             ErrorCode::Unknown(n) => n,
         }
@@ -390,6 +469,7 @@ impl ErrorCode {
             424 => ErrorCode::UploadTruncated,
             429 => ErrorCode::RateLimited,
             430 => ErrorCode::QuotaExceeded,
+            431 => ErrorCode::DecodeError,
             500 => ErrorCode::Internal,
             other => ErrorCode::Unknown(other),
         }
@@ -482,6 +562,13 @@ pub enum Request {
         offset: u64,
         #[serde(default)]
         length: Option<u64>,
+        /// Codecs the client can decode for the streamed body, in
+        /// preference order. Empty (the default) means identity only. The
+        /// server picks the first it supports and echoes the choice in
+        /// [`Response::FileReady::encoding`]; it MAY answer `Identity`
+        /// regardless (e.g. for already-compressed or tiny files).
+        #[serde(default)]
+        accept_encoding: Vec<Encoding>,
     },
     /// Upload. `offset` lets clients append to a server-side `.partial`
     /// from where they left off; the server validates that the existing
@@ -516,6 +603,25 @@ pub enum Request {
         /// preserved).
         #[serde(default)]
         checksum_trailer: bool,
+        /// Codec applied to the body bytes that follow. `Identity` (the
+        /// default) means the body is plaintext and `size` is its length.
+        /// For compressed bodies, `size` remains the logical/plaintext
+        /// byte count; codec framing determines how the compressed wire
+        /// body is delimited, and the server verifies the BLAKE3 trailer
+        /// over the decoded plaintext. A resume (`offset > 0`) compresses
+        /// the post-offset tail as its own independent frame; the on-disk
+        /// prefix stays plaintext and is re-hashed so the trailer covers
+        /// the whole file.
+        #[serde(default)]
+        encoding: Encoding,
+        /// Plaintext (post-decode) byte count. Ignored when
+        /// `encoding == Identity` (receivers use `size`). For compressed
+        /// bodies this equals `size`; the server checks it against the
+        /// user's quota and `MAX_FILE_SIZE` **before** decoding and
+        /// bounds the decompressed output to it (decompression-bomb
+        /// defense).
+        #[serde(default)]
+        plaintext_size: u64,
     },
     Mkdir {
         path: String,
@@ -561,9 +667,12 @@ pub enum Response {
     Path(String),
     FileStat(FileStat),
     /// Sent immediately before the body bytes for Get. `size` is the
-    /// number of bytes the server is about to stream (post-offset and
-    /// post-length clamping). `total_size` is the file's full size on
-    /// disk so the client can detect truncation across resume sessions.
+    /// logical/plaintext byte count the client will receive (post-offset
+    /// and post-length clamping). For `Identity` it also equals the wire
+    /// body length; for `Zstd`, it equals `plaintext_size` and the wire
+    /// body is delimited by the self-contained zstd frame. `total_size`
+    /// is the file's full size on disk so the client can detect
+    /// truncation across resume sessions.
     /// When `checksum_follows` is true, the digest bytes (length =
     /// `hash_algorithm.digest_len()`) immediately after the body are the
     /// hash of the streamed body; the client verifies them. Computing
@@ -576,6 +685,19 @@ pub enum Response {
         checksum_follows: bool,
         #[serde(default)]
         hash_algorithm: HashAlgorithm,
+        /// Codec applied to the streamed body. `Identity` (the default)
+        /// means the body bytes are plaintext and `size` is the plaintext
+        /// length. For `Zstd`, the wire body is one self-contained zstd
+        /// frame, and `size == plaintext_size`.
+        #[serde(default)]
+        encoding: Encoding,
+        /// Plaintext (post-decode) byte count. Ignored when
+        /// `encoding == Identity` (receivers use `size`). For compressed
+        /// bodies this equals `size`; the client bounds decompression to
+        /// this value and hashes the resulting plaintext for the BLAKE3
+        /// trailer.
+        #[serde(default)]
+        plaintext_size: u64,
     },
     /// Reply to `Request::Quota`. `limit_bytes = None` means "no
     /// quota configured" (unlimited).
@@ -653,6 +775,8 @@ mod tests {
             checksum: Some(vec![7u8; 32]),
             no_clobber: true,
             checksum_trailer: false,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         };
         match round_trip_request(&req) {
             Request::Put {
@@ -664,6 +788,8 @@ mod tests {
                 checksum,
                 no_clobber,
                 checksum_trailer,
+                encoding,
+                plaintext_size,
             } => {
                 assert_eq!(path, "dir/file.bin");
                 assert_eq!(size, 12345);
@@ -673,6 +799,8 @@ mod tests {
                 assert_eq!(checksum, Some(vec![7u8; 32]));
                 assert!(no_clobber);
                 assert!(!checksum_trailer);
+                assert_eq!(encoding, Encoding::Identity);
+                assert_eq!(plaintext_size, 0);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -684,16 +812,19 @@ mod tests {
             path: "big.iso".into(),
             offset: 1024 * 1024,
             length: Some(8 * 1024 * 1024),
+            accept_encoding: Vec::new(),
         };
         match round_trip_request(&req) {
             Request::Get {
                 path,
                 offset,
                 length,
+                accept_encoding,
             } => {
                 assert_eq!(path, "big.iso");
                 assert_eq!(offset, 1024 * 1024);
                 assert_eq!(length, Some(8 * 1024 * 1024));
+                assert_eq!(accept_encoding, Vec::<Encoding>::new());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -737,6 +868,8 @@ mod tests {
             total_size: 200,
             checksum_follows: true,
             hash_algorithm: HashAlgorithm::Blake3,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         };
         match round_trip_response(&resp) {
             Response::FileReady {
@@ -744,11 +877,15 @@ mod tests {
                 total_size,
                 checksum_follows,
                 hash_algorithm,
+                encoding,
+                plaintext_size,
             } => {
                 assert_eq!(size, 99);
                 assert_eq!(total_size, 200);
                 assert!(checksum_follows);
                 assert_eq!(hash_algorithm, HashAlgorithm::Blake3);
+                assert_eq!(encoding, Encoding::Identity);
+                assert_eq!(plaintext_size, 0);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -812,8 +949,10 @@ mod tests {
         assert_eq!(ErrorCode::Malformed.to_u32(), 400);
         assert_eq!(ErrorCode::NotFound.to_u32(), 404);
         assert_eq!(ErrorCode::QuotaExceeded.to_u32(), 430);
+        assert_eq!(ErrorCode::DecodeError.to_u32(), 431);
         assert_eq!(ErrorCode::Internal.to_u32(), 500);
         assert_eq!(ErrorCode::from_u32(404), ErrorCode::NotFound);
+        assert_eq!(ErrorCode::from_u32(431), ErrorCode::DecodeError);
         assert_eq!(ErrorCode::from_u32(999), ErrorCode::Unknown(999));
         assert_eq!(ErrorCode::NotFound.class(), ErrorClass::Client);
         assert_eq!(ErrorCode::Internal.class(), ErrorClass::Server);
@@ -842,6 +981,18 @@ mod tests {
         let unknown = bincode::serialize(&9u32).unwrap();
         let back: FileType = bincode::deserialize(&unknown).unwrap();
         assert_eq!(back, FileType::Unknown(9));
+    }
+
+    #[test]
+    fn encoding_serializes_as_u32() {
+        assert_eq!(Encoding::default(), Encoding::Identity);
+        let bytes = bincode::serialize(&Encoding::Zstd).unwrap();
+        assert_eq!(bytes, 1u32.to_le_bytes());
+        let back: Encoding = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back, Encoding::Zstd);
+        let unknown = bincode::serialize(&99u32).unwrap();
+        let back: Encoding = bincode::deserialize(&unknown).unwrap();
+        assert_eq!(back, Encoding::Unknown(99));
     }
 
     #[test]
@@ -877,6 +1028,7 @@ mod tests {
             path: "a".repeat(MAX_PATH_LEN),
             offset: 0,
             length: None,
+            accept_encoding: Vec::new(),
         };
         validate_request(&req).expect("MAX_PATH_LEN exactly should pass");
     }
@@ -920,6 +1072,8 @@ mod tests {
             checksum: Some(vec![0u8; MAX_CHECKSUM_LEN + 1]),
             no_clobber: false,
             checksum_trailer: false,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         };
         let e = validate_request(&req).unwrap_err();
         assert!(
@@ -939,6 +1093,8 @@ mod tests {
             checksum: Some(vec![0u8; MAX_CHECKSUM_LEN]),
             no_clobber: false,
             checksum_trailer: false,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         };
         validate_request(&req).expect("MAX_CHECKSUM_LEN exactly should pass");
     }
@@ -954,6 +1110,8 @@ mod tests {
             checksum: None,
             no_clobber: false,
             checksum_trailer: false,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         };
         let e = validate_request(&req).unwrap_err();
         assert!(

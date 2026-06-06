@@ -55,6 +55,7 @@ reassigned. Each code is exercised by a golden vector in
 | `424` | `UploadTruncated` | client | The peer sent the stream FIN before delivering its declared `size` body bytes (or before completing the digest trailer). |
 | `429` | `RateLimited` | client | The per-request rate limit on the connection refused this request. |
 | `430` | `QuotaExceeded` | client | The operation would push the user past their configured storage quota. |
+| `431` | `DecodeError` | client | A compressed body could not be decoded (malformed codec frame or window exceeding the negotiated maximum). |
 | `500` | `Internal` | server | A server-side I/O error or an otherwise unexpected internal failure. |
 
 ## The `message` field

@@ -106,6 +106,23 @@ wire. Do not treat a matching BLAKE3 digest as a signature.
 Message-layer authenticity (a per-message MAC or signed manifest) is a
 [qftp/2 direction](PROTOCOL-CHANGELOG.md), not a `qftp/1` guarantee.
 
+### Transfer compression
+
+qftp transfer compression is a body-only, per-file transform. CRIME and
+BREACH-style chosen-plaintext attacks are structurally non-applicable:
+control frames, credentials, bearer tokens, and other secrets are not
+mixed into the compressed body, and each transfer is an independent
+frame. Compress-then-encrypt leaks the encoded length of a file; qftp
+accepts that for file transfer, where size disclosure is already part of
+the protocol surface.
+
+The main compression risk is decompression bombs. Receivers must bound
+decoded output by `plaintext_size` and `MAX_FILE_SIZE`, truncate/refuse
+output that exceeds the plaintext declaration, and charge storage quota
+on plaintext bytes rather than encoded bytes. Malformed compressed
+frames or zstd windows above the qftp/1 limit (`window_log = 23`, 8 MiB)
+are `DecodeError` (`431`).
+
 ## Out of scope
 
 - Side channels in the BLAKE3 / HMAC implementations (we rely on the

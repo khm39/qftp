@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use qftp_common::protocol::{ErrorCode, Request, Response};
+use qftp_common::protocol::{Encoding, ErrorCode, Request, Response};
 use qftp_common::transport::{decode_framed_message, encode_framed_message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wtransport::endpoint::endpoint_side::Client;
@@ -100,12 +100,44 @@ async fn put(conn: &Connection, path: &str, body: &[u8], checksum: Option<[u8; 3
         checksum: checksum.map(|c| c.to_vec()),
         no_clobber: false,
         checksum_trailer: false,
+        encoding: Encoding::Identity,
+        plaintext_size: 0,
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
         .expect("write put header");
     send.write_all(body).await.expect("write put body");
     send.finish().await.expect("finish put");
+    let mut data = read_to_end(&mut recv).await;
+    decode_response(&mut data)
+}
+
+/// Upload declaring `encoding: Zstd`. The bridge has no zstd decode path,
+/// so it must refuse this with `Unsupported` rather than store the raw
+/// bytes verbatim (#300). Uses a streamed trailer like the SPA does.
+async fn put_zstd(conn: &Connection, path: &str, body: &[u8]) -> Response {
+    let (mut send, mut recv) = open_bi(conn).await;
+    let req = Request::Put {
+        path: path.to_string(),
+        size: body.len() as u64,
+        mode: 0o644,
+        offset: 0,
+        hash_algorithm: qftp_common::protocol::HashAlgorithm::Blake3,
+        checksum: None,
+        no_clobber: false,
+        checksum_trailer: true,
+        encoding: Encoding::Zstd,
+        plaintext_size: body.len() as u64,
+    };
+    send.write_all(&encode_framed_message(&req).unwrap())
+        .await
+        .expect("write put header");
+    // The bridge rejects a compressed Put at the header, before reading
+    // any body bytes, then drops its receive side. Writing the body /
+    // finishing can therefore race a stream reset -- tolerate failures
+    // here; the rejection arrives on the recv stream regardless.
+    let _ = send.write_all(body).await;
+    let _ = send.finish().await;
     let mut data = read_to_end(&mut recv).await;
     decode_response(&mut data)
 }
@@ -129,6 +161,8 @@ async fn put_with_trailer(
         checksum: None,
         no_clobber: false,
         checksum_trailer: true,
+        encoding: Encoding::Identity,
+        plaintext_size: 0,
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
@@ -148,6 +182,7 @@ async fn get(conn: &Connection, path: &str) -> (Response, Vec<u8>) {
         path: path.to_string(),
         offset: 0,
         length: None,
+        accept_encoding: Vec::new(),
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
@@ -166,6 +201,7 @@ async fn get_at(conn: &Connection, path: &str, offset: u64) -> (Response, Vec<u8
         path: path.to_string(),
         offset,
         length: None,
+        accept_encoding: Vec::new(),
     };
     send.write_all(&encode_framed_message(&req).unwrap())
         .await
@@ -515,6 +551,18 @@ async fn end_to_end_webtransport() {
     assert!(
         !root.join("alice/sub/bad-trailer.bin").exists(),
         "a trailer-checksum-failed upload must not be committed"
+    );
+    // A compressed Put must be refused: the bridge has no zstd decode path,
+    // so it rejects a non-identity upload with `Unsupported` rather than
+    // store the raw compressed bytes (#300).
+    let code = expect_err(
+        put_zstd(&alice, "/sub/zstd.bin", &body).await,
+        "put with zstd encoding",
+    );
+    assert_eq!(code, ErrorCode::Unsupported);
+    assert!(
+        !root.join("alice/sub/zstd.bin").exists(),
+        "a compressed upload the bridge can't decode must not be committed"
     );
     expect_ok(
         op(

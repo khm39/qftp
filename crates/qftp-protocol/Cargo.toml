@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 x509-parser = "0.16"
 blake3 = "1"
 tracing = "0.1"
+zstd = "0.13.3"
 
 [dev-dependencies]
 tempfile = "3"

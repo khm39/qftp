@@ -22,6 +22,12 @@ in the QUIC ALPN identifier; see [versioning.md](versioning.md)).
 > any change an existing `qftp/1` decoder cannot accept **MUST** be
 > made in a new ALPN major (`qftp/2`). Deferred directions for that
 > next major are listed in the protocol changelog.
+>
+> Transfer compression (zstd, Issue #300) was subsequently folded into
+> `qftp/1` as a backward-compatible append-only extension — a numeric
+> `Encoding`, the trailing `accept_encoding` / `encoding` /
+> `plaintext_size` fields, and a `DecodeError` status — and is likewise
+> recorded in the protocol changelog.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **MAY**, etc. in
 these documents are to be interpreted as described in RFC 2119.

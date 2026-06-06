@@ -1196,6 +1196,7 @@ enum PendingAction {
         path: String,
         offset: u64,
         length: Option<u64>,
+        accept_encoding: Vec<Encoding>,
     },
     StartPut {
         stream_id: u64,
@@ -1206,6 +1207,8 @@ enum PendingAction {
         expected_checksum: Option<Vec<u8>>,
         no_clobber: bool,
         checksum_trailer: bool,
+        encoding: Encoding,
+        plaintext_size: u64,
         leftover: Vec<u8>,
     },
     HandleSimple {
@@ -1408,12 +1411,14 @@ fn plan_actions(
                             path,
                             offset,
                             length,
+                            accept_encoding,
                         } => {
                             actions.push(PendingAction::StartGet {
                                 stream_id,
                                 path,
                                 offset,
                                 length,
+                                accept_encoding,
                             });
                             *state = StreamState::Done;
                         }
@@ -1426,6 +1431,8 @@ fn plan_actions(
                             checksum,
                             no_clobber,
                             checksum_trailer,
+                            encoding,
+                            plaintext_size,
                         } => {
                             // qftp/1 negotiates BLAKE3 only; anything else is
                             // refused rather than silently treated as BLAKE3.
@@ -1450,6 +1457,8 @@ fn plan_actions(
                                 expected_checksum: checksum,
                                 no_clobber,
                                 checksum_trailer,
+                                encoding,
+                                plaintext_size,
                                 leftover,
                             });
                             *state = StreamState::Done;
@@ -1513,8 +1522,17 @@ fn execute_pending_actions(
                 path,
                 offset,
                 length,
+                accept_encoding,
             } => {
-                crate::transfer_get::start_get(ctx, stream_id, &path, offset, length, metrics)?;
+                crate::transfer_get::start_get(
+                    ctx,
+                    stream_id,
+                    &path,
+                    offset,
+                    length,
+                    &accept_encoding,
+                    metrics,
+                )?;
             }
             PendingAction::StartPut {
                 stream_id,
@@ -1525,6 +1543,8 @@ fn execute_pending_actions(
                 expected_checksum,
                 no_clobber,
                 checksum_trailer,
+                encoding,
+                plaintext_size,
                 leftover,
             } => {
                 crate::transfer_put::start_put(
@@ -1538,6 +1558,8 @@ fn execute_pending_actions(
                         expected_checksum,
                         no_clobber,
                         checksum_trailer,
+                        encoding,
+                        plaintext_size,
                         leftover,
                     },
                     tmp,
@@ -1679,6 +1701,7 @@ mod tests {
             path: "x".into(),
             offset: 0,
             length: None,
+            accept_encoding: Vec::new(),
         }));
     }
 
@@ -1693,6 +1716,8 @@ mod tests {
             checksum: Some(vec![0u8; 32]),
             no_clobber: false,
             checksum_trailer: false,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
         }));
         assert!(!request_is_replay_safe(&Request::Rm { path: "x".into() }));
         assert!(!request_is_replay_safe(&Request::Mkdir {
