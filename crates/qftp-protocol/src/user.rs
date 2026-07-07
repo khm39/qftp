@@ -691,6 +691,20 @@ impl UserDirectory {
     pub fn anonymous(&self) -> Arc<User> {
         Arc::clone(&self.anonymous)
     }
+
+    /// True when at least one named (non-anonymous) user is configured.
+    ///
+    /// The server uses this to decide whether 0-RTT early data must be
+    /// refused wholesale: until the QUIC handshake completes, a
+    /// connection runs as the anonymous user, whose home under the
+    /// common `--users` config (no explicit `[anonymous]` section) is
+    /// the whole server root. If a named identity could later be
+    /// resolved from the peer certificate, serving even a read-only
+    /// early-data request against that anonymous view would leak
+    /// directory contents across the identity boundary.
+    pub fn has_named_users(&self) -> bool {
+        !self.by_name.is_empty()
+    }
 }
 
 /// Pull every plausible identity string out of a DER-encoded leaf

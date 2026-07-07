@@ -24,7 +24,7 @@ mod auth;
 mod http;
 mod transfer;
 
-use auth::TokenDirectory;
+use auth::{OriginPolicy, TokenDirectory};
 
 /// Upper bound on bidirectional streams handled concurrently within a
 /// single WebTransport session. Each accepted stream spawns a task that
@@ -96,12 +96,25 @@ struct Args {
     /// in production.
     #[arg(long, default_value = "127.0.0.1:8080")]
     http_bind: SocketAddr,
+
+    /// Comma-separated list of web origins allowed to open WebTransport
+    /// sessions (e.g. `https://files.example.com`), or `*` to allow
+    /// any. WebTransport is NOT covered by CORS or the same-origin
+    /// policy, so without this gate any web page the operator's users
+    /// visit can attempt a session against a reachable bridge. When
+    /// unset: sessions without an `origin` header (non-browser clients)
+    /// are admitted, and browser sessions are admitted only when
+    /// `--users-tokens` auth gates them — in anonymous mode browser
+    /// sessions are refused until an allowlist is configured.
+    #[arg(long)]
+    allowed_origins: Option<String>,
 }
 
 /// Process-wide state shared by every accepted session.
 struct Shared {
     users: UserDirectory,
     tokens: TokenDirectory,
+    origins: OriginPolicy,
 }
 
 #[tokio::main]
@@ -165,6 +178,26 @@ async fn main() -> Result<()> {
         );
     }
 
+    let origins = OriginPolicy::parse(args.allowed_origins.as_deref())?;
+    if matches!(origins, OriginPolicy::Unconfigured) {
+        if tokens.auth_enabled() {
+            info!(
+                "no --allowed-origins: browser sessions are gated by bearer \
+                 tokens only; set --allowed-origins for cross-site defense \
+                 in depth"
+            );
+        } else {
+            warn!(
+                "no --allowed-origins and no --users-tokens: browser sessions \
+                 (any session carrying an `origin` header) will be REFUSED, \
+                 because WebTransport has no same-origin protection and an \
+                 unauthenticated bridge would be readable by any web page. \
+                 Set --allowed-origins to your SPA's origin to serve \
+                 browsers, or `*` to explicitly serve everyone"
+            );
+        }
+    }
+
     let identity = Identity::load_pemfiles(&args.cert, &args.key)
         .await
         .context("failed to load TLS certificate/key")?;
@@ -186,7 +219,11 @@ async fn main() -> Result<()> {
         .build();
 
     let endpoint = Endpoint::server(config).context("failed to start WebTransport endpoint")?;
-    let shared = Arc::new(Shared { users, tokens });
+    let shared = Arc::new(Shared {
+        users,
+        tokens,
+        origins,
+    });
 
     // Serve the bundled SPA over plain HTTP on a separate task.
     let http_bind = args.http_bind;
@@ -234,6 +271,21 @@ async fn authenticate_session(
     shared: &Arc<Shared>,
 ) -> Result<Option<(Connection, Arc<User>)>> {
     let request = incoming.await.context("incoming session failed")?;
+
+    // Origin gate first, before any token work: WebTransport has no
+    // CORS/same-origin protection, so this is the only thing standing
+    // between a drive-by web page and an anonymous bridge (see
+    // `OriginPolicy`). The origin is attacker-controlled input; log it
+    // with `?` (Debug) so control characters are escaped.
+    if !shared
+        .origins
+        .admits(request.origin(), shared.tokens.auth_enabled())
+    {
+        info!(remote = %request.remote_address(), origin = ?request.origin(),
+            "rejecting WebTransport session: origin not allowed");
+        request.forbidden().await;
+        return Ok(None);
+    }
 
     let user = match shared.tokens.resolve(request.path(), &shared.users) {
         Some(u) => u,

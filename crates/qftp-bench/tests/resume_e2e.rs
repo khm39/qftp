@@ -51,10 +51,12 @@ fn connects_via_hostname() {
     );
 }
 
-/// #178: a resumed download must verify successfully. The client hashes
-/// only the streamed `[offset..]` bytes, matching the server's suffix
-/// trailer; before the fix it hashed the whole local file, so every
-/// resume failed the BLAKE3 check and the partial file was deleted.
+/// #178: a resumed download must verify successfully. Client and
+/// server both compute the cumulative BLAKE3 over `[0, offset + sent)`
+/// — the client folds its local `[0..offset)` prefix into the hash,
+/// the server re-reads the same range on its side (#221) — so the
+/// trailer only matches when the local prefix is byte-identical to
+/// the server's.
 ///
 /// Verifying only the final content can't tell a working resume apart
 /// from a silent full re-download: both leave the right bytes on disk.
@@ -172,6 +174,49 @@ fn resumes_an_interrupted_upload() {
         !partial.exists(),
         "the resumed upload must consume <dest>.qftp.partial on commit"
     );
+}
+
+/// A resumed download whose staged local prefix spans *multiple server
+/// re-hash chunks* must complete promptly. The server re-hashes the
+/// `[0..offset)` prefix one 256 KiB chunk per event-loop iteration and
+/// sends nothing on the wire while doing so — no network event will
+/// wake its loop. `compute_poll_timeout` must therefore force a zero
+/// poll timeout while a `SendingFileData` stream still has
+/// `prefix_remaining > 0`; before that fix only the Put-side re-hash
+/// was detected, so a resumed Get with an offset beyond one chunk
+/// crawled at QUIC-timer pace (tens of seconds per chunk) and this
+/// test timed out in the 60 s `run_repl` budget.
+///
+/// The staged prefix here is *valid* (a byte-true copy of the server
+/// file's first `ALREADY_HAVE` bytes), so the resume verifies and the
+/// single `get` must succeed on the first call.
+#[test]
+fn resumed_download_with_multi_chunk_prefix_completes_promptly() {
+    // 5+ SEND_CHUNK_SIZE (256 KiB) chunks of prefix to re-hash, and a
+    // tail large enough that the transfer is a real resume, not a
+    // near-complete edge case.
+    const SIZE: usize = 2_000_000;
+    const ALREADY_HAVE: usize = 1_400_000;
+
+    let fx = ServerFixture::start().expect("start server");
+    let server_home = fx.root.path().join("anonymous");
+    fs::create_dir_all(&server_home).expect("server home");
+    let server_file = server_home.join("big-resume.bin");
+    write_random_file(&server_file, SIZE).expect("stage server file");
+
+    let home = fx.client_env_home();
+    fs::create_dir_all(&home).expect("client home");
+    let dest = home.join("big-resume.bin");
+    let good_prefix = read_prefix(&server_file, ALREADY_HAVE).expect("read prefix");
+    fs::write(&dest, &good_prefix).expect("stage valid partial download");
+
+    fx.run_repl(&format!("get /big-resume.bin {}", dest.display()))
+        .expect("resumed get with a multi-chunk prefix should succeed promptly");
+
+    let got = fs::read(&dest).expect("read resumed download");
+    let want = fs::read(&server_file).expect("read server file");
+    assert_eq!(got.len(), want.len(), "resumed download has wrong length");
+    assert!(got == want, "resumed download content does not match");
 }
 
 /// A resumed upload whose server-side partial is the *right length but

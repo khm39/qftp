@@ -154,6 +154,107 @@ impl TokenDirectory {
     }
 }
 
+/// Cross-origin admission policy for WebTransport sessions.
+///
+/// WebTransport is **not** covered by CORS or the same-origin policy:
+/// any web page a victim's browser renders can attempt
+/// `new WebTransport("https://bridge:4433/...")` against any bridge the
+/// victim's machine can reach. With token auth the token is the gate —
+/// a hostile page does not know it — but in anonymous mode a drive-by
+/// page could silently list and read files from a LAN or localhost
+/// bridge. The bridge therefore checks the extended-CONNECT request's
+/// `origin` header against an operator-supplied allowlist
+/// (`--allowed-origins`) before token resolution.
+///
+/// Browsers always attach `origin` to the WebTransport CONNECT, so a
+/// session *without* one cannot have been initiated by a web page;
+/// native/test clients that omit it are judged separately (see
+/// [`OriginPolicy::admits`]).
+pub enum OriginPolicy {
+    /// `--allowed-origins` was not given. Non-browser sessions (no
+    /// `origin` header) are admitted; browser sessions are admitted
+    /// only when token auth gates them, and refused in anonymous mode
+    /// (the drive-by case this policy exists to stop).
+    Unconfigured,
+    /// `--allowed-origins '*'`: every session is admitted regardless
+    /// of origin. An explicit operator opt-out, for deployments that
+    /// intend to be a public anonymous read-only endpoint.
+    AllowAny,
+    /// Explicit allowlist of normalized origins. Only sessions whose
+    /// `origin` header matches an entry are admitted; sessions without
+    /// an `origin` header are refused (see [`OriginPolicy::admits`]).
+    List(Vec<String>),
+}
+
+impl OriginPolicy {
+    /// Parse the `--allowed-origins` argument: a comma-separated list
+    /// of web origins (`scheme://host[:port]`), or the single wildcard
+    /// `*`. Entries are normalized (trimmed, lowercased, one trailing
+    /// `/` stripped) so `https://App.Example/` matches the
+    /// `https://app.example` a browser actually sends.
+    pub fn parse(arg: Option<&str>) -> Result<Self> {
+        let Some(arg) = arg else {
+            return Ok(Self::Unconfigured);
+        };
+        let raw: Vec<&str> = arg.split(',').map(str::trim).collect();
+        if raw.contains(&"*") {
+            if raw.len() != 1 {
+                bail!("--allowed-origins: '*' cannot be combined with other origins");
+            }
+            return Ok(Self::AllowAny);
+        }
+        let mut list = Vec::new();
+        for entry in raw {
+            if entry.is_empty() {
+                bail!("--allowed-origins: empty origin in list");
+            }
+            if !entry.contains("://") {
+                bail!(
+                    "--allowed-origins: '{entry}' is not an origin \
+                     (expected scheme://host[:port], e.g. https://files.example.com)"
+                );
+            }
+            list.push(normalize_origin(entry));
+        }
+        Ok(Self::List(list))
+    }
+
+    /// Decide whether a session with the given `origin` header may
+    /// proceed to authentication. `auth_enabled` is whether bearer-token
+    /// auth is active (see [`TokenDirectory::auth_enabled`]).
+    ///
+    /// * With an explicit allowlist, only a matching `origin` is
+    ///   admitted. A session with *no* `origin` header is refused too:
+    ///   the operator asked for origin gating, and a header-less dialer
+    ///   is not a browser, so it has no business on the browser bridge
+    ///   (the native `qftp-server` serves it better and with mTLS).
+    /// * Unconfigured: header-less (non-browser) sessions are admitted;
+    ///   browser sessions are admitted only when a bearer token still
+    ///   gates access, and refused in anonymous mode — a drive-by page
+    ///   must not reach an unauthenticated bridge.
+    pub fn admits(&self, origin: Option<&str>, auth_enabled: bool) -> bool {
+        match self {
+            Self::AllowAny => true,
+            Self::List(list) => match origin {
+                Some(o) => list.contains(&normalize_origin(o)),
+                None => false,
+            },
+            Self::Unconfigured => match origin {
+                None => true,
+                Some(_) => auth_enabled,
+            },
+        }
+    }
+}
+
+/// Normalize an origin string for comparison: trim whitespace, strip
+/// one trailing `/`, lowercase. Scheme and host are case-insensitive
+/// (RFC 3986); an origin has no path component, so a trailing slash is
+/// operator input noise, not meaning.
+fn normalize_origin(origin: &str) -> String {
+    origin.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
 /// Pull the `token` query parameter out of a WebTransport `:path` and
 /// percent-decode it.
 ///
@@ -284,6 +385,49 @@ mod tests {
 
         let anon_dbg = format!("{:?}", TokenDirectory::anonymous());
         assert!(anon_dbg.contains("false"), "{anon_dbg}");
+    }
+
+    #[test]
+    fn origin_policy_unconfigured_blocks_browsers_in_anonymous_mode() {
+        let p = OriginPolicy::parse(None).unwrap();
+        // Non-browser dialers (no `origin` header) are always admitted.
+        assert!(p.admits(None, false));
+        assert!(p.admits(None, true));
+        // Browser sessions: admitted only when a token still gates
+        // access. In anonymous mode a drive-by page must be refused.
+        assert!(p.admits(Some("https://app.example"), true));
+        assert!(!p.admits(Some("https://evil.example"), false));
+    }
+
+    #[test]
+    fn origin_policy_list_matches_normalized() {
+        let p = OriginPolicy::parse(Some("https://App.Example/, http://lan.box:8080")).unwrap();
+        assert!(p.admits(Some("https://app.example"), false));
+        assert!(p.admits(Some("HTTPS://APP.EXAMPLE"), true));
+        assert!(p.admits(Some("http://lan.box:8080"), false));
+        assert!(!p.admits(Some("https://evil.example"), true));
+        // Same host, different port / scheme are different origins.
+        assert!(!p.admits(Some("http://lan.box:9090"), false));
+        assert!(!p.admits(Some("https://lan.box:8080"), false));
+        // With an explicit allowlist, header-less dialers are refused.
+        assert!(!p.admits(None, true));
+        assert!(!p.admits(None, false));
+    }
+
+    #[test]
+    fn origin_policy_wildcard_admits_everything() {
+        let p = OriginPolicy::parse(Some("*")).unwrap();
+        assert!(p.admits(None, false));
+        assert!(p.admits(Some("https://anything.example"), false));
+    }
+
+    #[test]
+    fn origin_policy_rejects_bad_args() {
+        // '*' mixed with explicit origins is a configuration error.
+        assert!(OriginPolicy::parse(Some("*, https://a.example")).is_err());
+        // Empty entries and non-origin strings are refused.
+        assert!(OriginPolicy::parse(Some("https://a.example,,https://b.example")).is_err());
+        assert!(OriginPolicy::parse(Some("files.example.com")).is_err());
     }
 
     #[test]

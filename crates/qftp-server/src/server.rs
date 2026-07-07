@@ -65,17 +65,49 @@ fn request_is_replay_safe(req: &Request) -> bool {
     // reflected-download attacks. The latency cost of forcing 1-RTT
     // for Get is one extra round trip on the first request of a
     // session; subsequent requests within the same session run at
-    // normal 1-RTT either way. The list below intentionally keeps
-    // only small fixed-size replies (Ls is capped at MAX_DIR_ENTRIES,
-    // Stat is a fixed struct, Pwd/Cd/Quit are tiny acks).
+    // normal 1-RTT either way.
+    //
+    // Ls is NOT in this set for the same amplification reason as Get:
+    // a single DirListing page can carry up to MAX_DIR_ENTRIES
+    // entries — a multi-MiB frame, bounded only by the 16 MiB frame
+    // cap — so a replayed 0-RTT Ls against a spoofed source IP is a
+    // strong reflection primitive, far larger than the ~25-byte
+    // QuotaInfo that was already excluded. The list below keeps only
+    // small fixed-size replies (Stat is a fixed struct, Pwd/Cd/Quit
+    // are tiny acks).
     matches!(
         req,
-        Request::Ls { .. }
-            | Request::Cd { .. }
-            | Request::Pwd
-            | Request::Stat { .. }
-            | Request::Quit,
+        Request::Cd { .. } | Request::Pwd | Request::Stat { .. } | Request::Quit,
     )
+}
+
+/// True when a stream has pure-local (non-network-driven) work
+/// pending, so the main loop must poll with a zero timeout instead of
+/// sleeping on QUIC timers: a resumed Put re-hashing its on-disk
+/// partial (`ReadingFileData { rehash: Some(_) }`), or a resumed Get
+/// re-hashing its `[0..offset)` prefix before streaming
+/// (`SendingFileData { prefix_remaining > 0 }`). Both advance one
+/// chunk per loop iteration and produce no network traffic while they
+/// run.
+fn stream_needs_local_progress(s: &StreamState) -> bool {
+    match s {
+        StreamState::ReadingFileData { rehash, .. } => rehash.is_some(),
+        StreamState::SendingFileData {
+            prefix_remaining, ..
+        } => *prefix_remaining > 0,
+        _ => false,
+    }
+}
+
+/// Decide whether a request that arrived as 0-RTT early data must be
+/// refused with "requires 1-RTT". `refuse_all` is the identity gate:
+/// when the server could upgrade this connection to a named user once
+/// the handshake completes (mTLS required, or named users configured),
+/// no early-data request may be served, because it would run as the
+/// anonymous user and answer with the anonymous view. Without an
+/// identity story, only replay-unsafe requests are refused.
+fn early_data_refused(refuse_all: bool, req: &Request) -> bool {
+    refuse_all || !request_is_replay_safe(req)
 }
 
 const SERVER_TOKEN: Token = Token(0);
@@ -664,20 +696,20 @@ fn compute_poll_timeout(
             }
         })
         .min();
-    // A resumed Put re-hashing its on-disk prefix has pure local
+    // A resumed transfer re-hashing its on-disk prefix has pure local
     // work to do that no network event will wake the loop for; spin
-    // at a zero timeout until that re-hash finishes.
-    let rehash_pending = connections.values().any(|c| {
-        c.streams.values().any(|s| {
-            matches!(
-                s,
-                StreamState::ReadingFileData {
-                    rehash: Some(_),
-                    ..
-                }
-            )
-        })
-    });
+    // at a zero timeout until that re-hash finishes. This covers both
+    // directions: a resumed Put (`ReadingFileData` with `rehash`) and
+    // a resumed Get (`SendingFileData` with `prefix_remaining > 0`).
+    // The Get side is load-bearing: `send_phase_prefix_rehash`
+    // advances one chunk per loop iteration and sends nothing on the
+    // wire while the prefix walk runs, so the peer generates no
+    // packets either — without this the loop would sleep on QUIC
+    // timers and a resumed Get with an offset beyond one chunk would
+    // stall for seconds per chunk.
+    let rehash_pending = connections
+        .values()
+        .any(|c| c.streams.values().any(stream_needs_local_progress));
     match (closing, rehash_pending, shortest_timeout) {
         (true, _, t) => Some(t.unwrap_or(Duration::from_millis(250))),
         (false, true, _) => Some(Duration::ZERO),
@@ -1256,7 +1288,19 @@ fn process_readable_streams(ctx: &mut ConnectionContext, sx: &mut StreamCtx) -> 
     sx.readable_ids.clear();
     sx.readable_ids.extend(ctx.conn.readable());
 
-    let actions = plan_actions(ctx, sx.metrics, sx.rate_limiter, sx.tmp, sx.readable_ids)?;
+    // Identity gate for 0-RTT early data: with mTLS required or named
+    // users configured, the anonymous view served before the handshake
+    // completes could leak across the identity boundary, so every
+    // early-data request is refused (see `early_data_refused`).
+    let refuse_all_early_data = sx.mtls_required || sx.users.has_named_users();
+    let actions = plan_actions(
+        ctx,
+        sx.metrics,
+        sx.rate_limiter,
+        sx.tmp,
+        sx.readable_ids,
+        refuse_all_early_data,
+    )?;
 
     execute_pending_actions(ctx, sx.socket, sx.metrics, sx.pool, sx.tmp, actions)
 }
@@ -1273,6 +1317,7 @@ fn validate_request_prerequisites(
     rate_limiter: &mut RateLimiter,
     metrics: &Metrics,
     peer_ip: std::net::IpAddr,
+    refuse_all_early_data: bool,
 ) -> Option<Response> {
     // Per-request rate limit: token-bucket also gates
     // protocol requests on established connections so a
@@ -1299,13 +1344,24 @@ fn validate_request_prerequisites(
     // that mutates server state is refused with
     // `Unsupported` and the client falls back to a
     // 1-RTT retry.
+    //
+    // Additionally, when the server can resolve named identities
+    // (`refuse_all_early_data`: mTLS is required or named users are
+    // configured), *every* early-data request is refused. Until the
+    // handshake completes the connection runs as the anonymous user,
+    // whose home under `--users` (without an explicit `[anonymous]`
+    // section) is the whole server root; serving even a replay-safe
+    // read in that window would answer with the anonymous view and
+    // leak directory contents across the identity boundary to a peer
+    // that is about to become a scoped user. The refusal reuses the
+    // standard "requires 1-RTT" contract, so a conforming client
+    // retries transparently after the handshake.
     if conn.is_in_early_data() {
-        if request_is_replay_safe(req) {
-            metrics.inc_zero_rtt_accepted();
-        } else {
+        if early_data_refused(refuse_all_early_data, req) {
             metrics.inc_zero_rtt_rejected();
             return Some(err(ErrorCode::Unsupported, "Operation requires 1-RTT data"));
         }
+        metrics.inc_zero_rtt_accepted();
     }
 
     if let Some(resp) = handler::acl_reject(user, req) {
@@ -1325,6 +1381,7 @@ fn plan_actions(
     rate_limiter: &mut RateLimiter,
     tmp: &mut [u8],
     readable_ids: &[u64],
+    refuse_all_early_data: bool,
 ) -> Result<Vec<PendingAction>> {
     let peer_ip = ctx.peer_addr.ip();
 
@@ -1400,6 +1457,7 @@ fn plan_actions(
                         rate_limiter,
                         metrics,
                         peer_ip,
+                        refuse_all_early_data,
                     ) {
                         actions.push(PendingAction::AclReject { stream_id, resp });
                         *state = StreamState::Done;
@@ -1681,10 +1739,6 @@ mod tests {
 
     #[test]
     fn replay_safe_allows_readonly_ops() {
-        assert!(request_is_replay_safe(&Request::Ls {
-            path: "/".into(),
-            cursor: None
-        }));
         assert!(request_is_replay_safe(&Request::Cd { path: "/".into() }));
         assert!(request_is_replay_safe(&Request::Pwd));
         assert!(request_is_replay_safe(&Request::Stat { path: "x".into() }));
@@ -1703,6 +1757,79 @@ mod tests {
             length: None,
             accept_encoding: Vec::new(),
         }));
+    }
+
+    /// Ls must NOT be in the replay-safe set either: a single
+    /// DirListing page can carry up to MAX_DIR_ENTRIES entries (a
+    /// multi-MiB frame), so a replayed 0-RTT Ls is a reflection /
+    /// amplification primitive just like Get.
+    #[test]
+    fn replay_safe_rejects_ls_for_amplification() {
+        assert!(!request_is_replay_safe(&Request::Ls {
+            path: "/".into(),
+            cursor: None
+        }));
+    }
+
+    /// A resumed Get still walking its `[0..offset)` prefix
+    /// (`prefix_remaining > 0`) has pure-local work pending and must
+    /// force a zero poll timeout; once the walk finishes
+    /// (`prefix_remaining == 0`) the stream is network-driven again.
+    /// This is the regression guard for the resumed-Get stall: only
+    /// the Put-side rehash used to be detected, so a Get with an
+    /// offset beyond one 256 KiB chunk crawled at QUIC-timer pace.
+    #[test]
+    fn resumed_get_prefix_rehash_forces_zero_poll_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"data").unwrap();
+        let mk = |prefix_remaining: u64| StreamState::SendingFileData {
+            reader: std::io::BufReader::new(std::fs::File::open(&path).unwrap()),
+            total_size: 4,
+            encoding: qftp_protocol::stream::SendEncoding::Identity,
+            sent: 0,
+            hasher: blake3::Hasher::new(),
+            trailer: None,
+            trailer_offset: 0,
+            finished: false,
+            prefix_remaining,
+        };
+        assert!(stream_needs_local_progress(&mk(1)));
+        assert!(stream_needs_local_progress(&mk(SEND_CHUNK_SIZE as u64 * 3)));
+        assert!(!stream_needs_local_progress(&mk(0)));
+        assert!(!stream_needs_local_progress(&StreamState::ReadingRequest {
+            buf: Vec::new()
+        }));
+        assert!(!stream_needs_local_progress(&StreamState::Done));
+    }
+
+    /// The identity gate: with mTLS required or named users configured
+    /// (`refuse_all = true`), even replay-safe reads are refused as
+    /// early data, because they would run as the anonymous user before
+    /// the handshake resolves the peer's real identity. Without an
+    /// identity story (`refuse_all = false`), only replay-unsafe
+    /// requests are refused.
+    #[test]
+    fn early_data_identity_gate_refuses_everything() {
+        let stat = Request::Stat { path: "x".into() };
+        let put = Request::Put {
+            path: "x".into(),
+            size: 0,
+            mode: 0o644,
+            offset: 0,
+            hash_algorithm: qftp_common::protocol::HashAlgorithm::Blake3,
+            checksum: Some(vec![0u8; 32]),
+            no_clobber: false,
+            checksum_trailer: false,
+            encoding: Encoding::Identity,
+            plaintext_size: 0,
+        };
+        // Identity configured: everything is refused.
+        assert!(early_data_refused(true, &stat));
+        assert!(early_data_refused(true, &put));
+        // No identity story: replay-safe reads pass, mutations don't.
+        assert!(!early_data_refused(false, &stat));
+        assert!(early_data_refused(false, &put));
     }
 
     #[test]

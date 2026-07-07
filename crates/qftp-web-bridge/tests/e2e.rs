@@ -658,3 +658,187 @@ async fn end_to_end_webtransport() {
     drop(bob);
     let _ = bridge.0.kill();
 }
+
+/// Origin gating, end to end. WebTransport is not covered by CORS or
+/// the same-origin policy, so the bridge enforces `--allowed-origins`
+/// itself in `authenticate_session`:
+///
+///  * with an allowlist: an allowlisted `origin` (plus a valid token)
+///    is served; a hostile origin is refused even with a valid token;
+///    a header-less (non-browser) dial is refused too;
+///  * without an allowlist, in anonymous mode: an origin-bearing dial
+///    (i.e. any browser page — the drive-by case) is refused, while a
+///    header-less native dial still works read-only.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_policy_enforcement() {
+    use wtransport::endpoint::ConnectOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let base: PathBuf = dir.path().canonicalize().unwrap();
+
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let cert_hash = identity.certificate_chain().as_slice()[0].hash();
+    let cert_path = base.join("cert.pem");
+    let key_path = base.join("key.pem");
+    identity
+        .certificate_chain()
+        .store_pemfile(&cert_path)
+        .await
+        .unwrap();
+    identity
+        .private_key()
+        .store_secret_pemfile(&key_path)
+        .await
+        .unwrap();
+
+    let users_path = base.join("users.toml");
+    write_file(
+        &users_path,
+        "[[users]]\nname = \"alice\"\npermissions = { read = true }\n",
+    );
+    let tokens_path = base.join("tokens.toml");
+    write_file(
+        &tokens_path,
+        "[[tokens]]\ntoken = \"tok\"\nuser = \"alice\"\n",
+    );
+
+    let client_config = ClientConfig::builder()
+        .with_bind_address("127.0.0.1:0".parse().unwrap())
+        .with_server_certificate_hashes([cert_hash.clone()])
+        .build();
+    let endpoint = Endpoint::client(client_config).expect("client endpoint");
+
+    let spawn_bridge = |root: PathBuf, extra: Vec<String>| {
+        let wt_port = free_udp_port();
+        let http_port = free_tcp_port();
+        let mut args = vec![
+            "--cert".into(),
+            cert_path.to_str().unwrap().to_string(),
+            "--key".into(),
+            key_path.to_str().unwrap().to_string(),
+            "--bind".into(),
+            format!("127.0.0.1:{wt_port}"),
+            "--http-bind".into(),
+            format!("127.0.0.1:{http_port}"),
+            "--root".into(),
+            root.to_str().unwrap().to_string(),
+        ];
+        args.extend(extra);
+        let child = Command::new(env!("CARGO_BIN_EXE_qftp-web-bridge"))
+            .args(&args)
+            .env("RUST_LOG", "error")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn qftp-web-bridge");
+        (Bridge(child), wt_port)
+    };
+
+    let dial_opts = |port: u16, token: Option<&str>, origin: Option<&str>| {
+        let url = match token {
+            Some(t) => format!("https://127.0.0.1:{port}/?token={t}"),
+            None => format!("https://127.0.0.1:{port}/"),
+        };
+        let mut b = ConnectOptions::builder(&url);
+        if let Some(o) = origin {
+            b = b.add_header("origin", o);
+        }
+        b.build()
+    };
+
+    // --- Bridge A: tokens + --allowed-origins https://app.example ---
+    let root_a = base.join("root-a");
+    std::fs::create_dir(&root_a).unwrap();
+    let (mut bridge_a, port_a) = spawn_bridge(
+        root_a,
+        vec![
+            "--users".into(),
+            users_path.to_str().unwrap().to_string(),
+            "--users-tokens".into(),
+            tokens_path.to_str().unwrap().to_string(),
+            "--allowed-origins".into(),
+            "https://app.example".into(),
+        ],
+    );
+
+    // Wait for the bridge to come up: the allowlisted dial must succeed.
+    let mut allowed = None;
+    for _ in 0..50 {
+        if let Some(status) = bridge_a.0.try_wait().expect("try_wait") {
+            panic!("bridge A exited early with {status}");
+        }
+        match endpoint
+            .connect(dial_opts(port_a, Some("tok"), Some("https://app.example")))
+            .await
+        {
+            Ok(conn) => {
+                allowed = Some(conn);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    let allowed = allowed.expect("allowlisted origin never connected");
+    match op(&allowed, &Request::Pwd).await {
+        Response::Path(_) => {}
+        other => panic!("allowlisted session Pwd failed: {other:?}"),
+    }
+
+    // A hostile origin is refused even though its token is valid: the
+    // origin gate runs before token resolution.
+    assert!(
+        endpoint
+            .connect(dial_opts(port_a, Some("tok"), Some("https://evil.example")))
+            .await
+            .is_err(),
+        "non-allowlisted origin must be refused"
+    );
+    // With an explicit allowlist, a header-less dial is refused too.
+    assert!(
+        endpoint
+            .connect(dial_opts(port_a, Some("tok"), None))
+            .await
+            .is_err(),
+        "header-less dial must be refused when an allowlist is configured"
+    );
+    drop(allowed);
+    let _ = bridge_a.0.kill();
+
+    // --- Bridge B: anonymous mode, no --allowed-origins ---
+    let root_b = base.join("root-b");
+    std::fs::create_dir(&root_b).unwrap();
+    let (mut bridge_b, port_b) = spawn_bridge(root_b, vec![]);
+
+    // Header-less (native) dial: admitted, read-only anonymous.
+    let mut anon = None;
+    for _ in 0..50 {
+        if let Some(status) = bridge_b.0.try_wait().expect("try_wait") {
+            panic!("bridge B exited early with {status}");
+        }
+        match endpoint.connect(dial_opts(port_b, None, None)).await {
+            Ok(conn) => {
+                anon = Some(conn);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    let anon = anon.expect("header-less anonymous dial never connected");
+    match op(&anon, &Request::Pwd).await {
+        Response::Path(_) => {}
+        other => panic!("anonymous header-less Pwd failed: {other:?}"),
+    }
+
+    // The drive-by case: a browser page's dial (it always carries
+    // `origin`) against an anonymous bridge must be refused.
+    assert!(
+        endpoint
+            .connect(dial_opts(port_b, None, Some("https://evil.example")))
+            .await
+            .is_err(),
+        "origin-bearing dial must be refused by an anonymous bridge \
+         without --allowed-origins"
+    );
+
+    drop(anon);
+    let _ = bridge_b.0.kill();
+}

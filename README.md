@@ -45,8 +45,12 @@ Pre-1.0, but functionally complete for the supported feature set:
 - Prometheus metrics endpoint and `/healthz`.
 - Optional structured JSON logging.
 - 0-RTT session resumption: the second `qftp` connect to the same host
-  skips the TLS handshake. Writes are still gated to 1-RTT to defeat
-  replay; reads (Get / Ls / Stat / Pwd / Cd) go at 0-RTT.
+  resumes the TLS session from a stored ticket. Replay-unsafe or
+  amplification-prone requests (all writes, plus Get / Ls / Quota) are
+  gated to 1-RTT; only small fixed-size reads (Cd / Pwd / Stat / Quit)
+  may ride 0-RTT early data, and a server with mTLS or named users
+  configured refuses **all** early data until the client's identity is
+  resolved (see [spec/qftp-protocol.md](spec/qftp-protocol.md)).
 
 ## Quick start
 

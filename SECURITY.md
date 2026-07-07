@@ -88,6 +88,17 @@ server:
   TLS-encrypted HTTP/3 handshake.
 - Without `--users-tokens`, every browser session is the anonymous
   read-only user. Never run a writable deployment without it.
+- **WebTransport is not protected by CORS or the same-origin policy:**
+  any web page a user's browser renders can attempt
+  `new WebTransport("https://bridge:4433/...")` against any bridge that
+  user's machine can reach. The bridge therefore checks the CONNECT
+  request's `origin` header against `--allowed-origins`; set it to
+  your SPA's origin in every deployment. When it is unset, sessions
+  carrying an `origin` header (all browser sessions) are refused in
+  anonymous mode -- otherwise a drive-by page could silently list and
+  read files from a LAN or localhost bridge -- and are admitted only
+  when bearer tokens gate access. `--allowed-origins '*'` is an
+  explicit opt-out for deliberately public read-only endpoints.
 - The bundled SPA is served over plain HTTP on `--http-bind`; bind it
   to loopback and front it with a TLS-terminating reverse proxy.
 - Safari has no WebTransport support and cannot use the bridge.
