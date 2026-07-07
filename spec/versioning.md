@@ -66,11 +66,18 @@ message's payload**:
   it ignores the trailing bytes. (The reference implementation decodes
   with trailing bytes allowed.)
 - A decoder built for the **newer** shape, reading a frame produced by
-  an older sender, will not find the appended field. New fields are
-  therefore safe to add only when a receiver that does not understand a
-  field can proceed without it; senders **MUST NOT** assume a peer that
-  negotiated `qftp/1` populates fields introduced after the original
-  `qftp/1`.
+  an older sender, will not find the appended field — and because a
+  truncated message is `Malformed` (consequence 3 above), a naïve
+  newer decoder **rejects** the older frame outright. The append-only
+  rule is therefore **one-directional**: it lets *older decoders*
+  tolerate *newer senders*, not the reverse. A revision that appends a
+  field and needs to keep interoperating with unupgraded senders
+  **MUST** have its decoder explicitly accept both shapes (decode the
+  shorter, pre-revision layout and substitute a defined default for
+  the missing field), and **MUST** document that default here and in
+  the message's specification. Senders likewise **MUST NOT** assume a
+  peer that negotiated `qftp/1` populates fields introduced after the
+  original `qftp/1`.
 
 Changes that are **NOT** backward compatible within a major version and
 therefore **MUST** bump the major version include: reordering or

@@ -366,10 +366,20 @@ fn send_phase_prefix_rehash(
         }
         bs.hasher.update(&chunk[..want]);
         *bs.prefix_remaining -= want as u64;
-        // Yield to the event loop so other streams get a turn; the next
-        // iteration continues the prefix walk (or proceeds to Phase A
-        // once `prefix_remaining` hits 0).
-        return Some(SendOutcome::Blocked);
+        if *bs.prefix_remaining > 0 {
+            // Yield to the event loop so other streams get a turn; the
+            // prefix walk queued nothing on the wire, so the wake-up for
+            // the next chunk comes from the zero poll timeout that
+            // `stream_needs_local_progress` forces while
+            // `prefix_remaining > 0` (`compute_poll_timeout`).
+            return Some(SendOutcome::Blocked);
+        }
+        // Prefix fully hashed: fall through to the body phase in THIS
+        // call. Returning Blocked here would strand the stream — the
+        // prefix walk sent no bytes, so no network event will fire, and
+        // with `prefix_remaining` now 0 the zero-poll-timeout spin stops
+        // too; the loop would sleep on the QUIC idle timer and the peer
+        // would eventually close the connection unserved.
     }
     None
 }

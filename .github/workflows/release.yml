@@ -23,7 +23,26 @@ permissions:
   contents: write
 
 jobs:
+  # Release gate: never publish a tag whose tests don't pass. The tag
+  # is built directly by the jobs below without going through ci.yml,
+  # so run the test suite here against the exact ref being released.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # On workflow_dispatch GITHUB_REF is the default branch, not the
+      # tag; check out the requested tag explicitly so every job in
+      # this workflow builds the bytes being released.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +58,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
+      # `ref`: on workflow_dispatch GITHUB_REF is the default branch;
+      # without this the dispatch path would silently build and ship
+      # whatever main happened to be.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -72,11 +96,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          # `inputs.tag` wins on workflow_dispatch: GITHUB_REF_NAME is
+          # always set (to the *branch* name on dispatch), so a
+          # `${GITHUB_REF_NAME:-...}` fallback would never fire and the
+          # artifacts would be named after the branch.
+          tag="${{ inputs.tag || github.ref_name }}"
           dir="qftp-${tag}-${{ matrix.target }}"
           mkdir -p "$dir"
           cp target/${{ matrix.target }}/release/qftp-server "$dir/"
           cp target/${{ matrix.target }}/release/qftp-client "$dir/"
+          cp target/${{ matrix.target }}/release/qftp-admin "$dir/"
+          cp target/${{ matrix.target }}/release/qftp-web-bridge "$dir/"
           cp README.md CHANGELOG.md LICENSE.md "$dir/"
           tar czf "$dir.tar.gz" "$dir"
           # macOS ships shasum but not coreutils' sha256sum; the Linux
@@ -99,6 +129,7 @@ jobs:
   # the `[package.metadata.deb]` section in each binary crate's
   # Cargo.toml.
   deb:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -107,7 +138,10 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
     steps:
+      # See the build job for why `ref` matters on workflow_dispatch.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -131,7 +165,7 @@ jobs:
       - name: Build .deb packages
         run: |
           set -euo pipefail
-          for pkg in qftp-server qftp-client qftp-admin; do
+          for pkg in qftp-server qftp-client qftp-admin qftp-web-bridge; do
             cargo deb --target ${{ matrix.target }} -p "$pkg" --no-strip
           done
           mkdir -p dist-deb
@@ -152,8 +186,12 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job: point gh at the repo explicitly.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          # See the Package step for why `inputs.tag` must win on
+          # workflow_dispatch (GITHUB_REF_NAME is the branch there).
+          tag="${{ inputs.tag || github.ref_name }}"
           gh release create "$tag" --generate-notes \
             $(find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.deb' \))

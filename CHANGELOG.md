@@ -10,6 +10,47 @@ this file tracks the reference implementation.
 
 ## [Unreleased]
 
+### Security
+
+- **0-RTT identity gate.** With mTLS required or named users
+  configured, the server now refuses *every* request that arrives as
+  0-RTT early data ("requires 1-RTT"). Early data always executes as
+  the anonymous user — whose home under `--users` defaults to the
+  whole server root — so a resumed session could previously read
+  directory listings across the identity boundary at 0.5-RTT. `Ls` is
+  also removed from the 0-RTT allow list on amplification grounds (a
+  DirListing page is a multi-MiB reflection primitive; the allow list
+  keeps only small fixed-size replies: Cd/Pwd/Stat/Quit).
+- **WebTransport origin gating (`--allowed-origins`).** WebTransport
+  is not covered by CORS or the same-origin policy, so any web page
+  could previously attempt a session against a reachable bridge; in
+  anonymous mode a drive-by page could list and read files. The bridge
+  now checks the CONNECT `origin` header against an operator
+  allowlist. Without the flag, browser sessions are admitted only
+  behind token auth and refused in anonymous mode; `--allowed-origins
+  '*'` explicitly opts out for public read-only endpoints.
+
+### Fixed
+
+- **Resumed downloads with offsets past 256 KiB no longer stall.** The
+  server re-hashes a resumed Get's `[0..offset)` prefix one chunk per
+  event-loop iteration while sending nothing on the wire, but only the
+  Put-side re-hash forced the zero poll timeout, and the final prefix
+  chunk yielded without kicking off the body phase — so a resumed Get
+  beyond one chunk slept on QUIC timers until the peer's 30 s idle
+  timeout closed the connection. Both halves are fixed
+  (`compute_poll_timeout` now covers `SendingFileData`, and the last
+  prefix chunk falls through to the body phase), with a
+  multi-chunk-prefix resume e2e as the regression guard.
+- **`release.yml` workflow_dispatch built the wrong ref.** Dispatch
+  runs checked out the default branch (no `ref:` on checkout) and
+  named artifacts after the branch (`GITHUB_REF_NAME` is always set,
+  so the `inputs.tag` fallback never fired). Dispatch now builds and
+  names the requested tag, a `cargo test --workspace` gate runs
+  against the release ref before anything builds, and the tarballs /
+  debs now include `qftp-admin` and `qftp-web-bridge` (previously the
+  bridge shipped in no release artifact at all).
+
 ### Added
 
 - **zstd transfer compression (opt-out).** File bodies are compressed in

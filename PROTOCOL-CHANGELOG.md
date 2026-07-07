@@ -29,8 +29,9 @@ The first published wire version. The full specification is in
   `Put`, `Mkdir`, `Rmdir`, `Rm`, `Rename`, `Chmod`, `Stat`, `Quota`,
   `Quit`) and `Response` (7 variants: `Ok`, `Err`, `DirListing`,
   `Path`, `FileStat`, `FileReady`, `QuotaInfo`).
-- **Error codes.** A 17-entry `ErrorCode` registry
-  ([spec/error-codes.md](spec/error-codes.md)).
+- **Error codes.** A 16-entry `ErrorCode` registry (the 1.0 wire
+  freeze below adds `DecodeError = 431`, bringing the current registry
+  to 17; see [spec/error-codes.md](spec/error-codes.md)).
 - **Body streaming.** `Get`/`Put` carry file body bytes on the request
   stream, with an optional 32-byte BLAKE3 trailer
   ([spec/wire-format.md](spec/wire-format.md#body-streaming)).
@@ -113,6 +114,61 @@ against [`test-vectors/`](test-vectors/).
 
 The `qftp/1` major version is **not** bumped: all of the above is folded
 into `qftp/1` while it is still pre-release.
+
+### Post-freeze specification revisions (no wire change)
+
+Behavioural rules tightened after the 1.0 wire freeze. None of these
+change the bytes on the wire or the golden vectors; they change what a
+conforming endpoint does with already-frozen messages.
+
+- **0-RTT allow list narrowed, identity gate added.** `Ls` moved from
+  the 0-RTT allow list to the refused set: a single `DirListing` page
+  can be a multi-MiB frame, the same amplification reasoning that
+  already excluded `Get` and `Quota`. Additionally, a server that can
+  resolve named identities (mTLS enforced, or named users configured)
+  **MUST** refuse *every* request arriving as 0-RTT early data, since
+  early data can only execute as the anonymous user and would leak the
+  anonymous view across the identity boundary. Both refusals reuse
+  `ErrorCode::Unsupported` and the existing immediate-retry rule. See
+  [spec/qftp-protocol.md](spec/qftp-protocol.md#0-rtt-session-resumption).
+- **Path resolution specified.** A new normative section defines what
+  a `path` means: the per-user root is `/`, the per-connection cwd
+  (changed only by `Cd`), leading-`/` vs cwd-relative resolution,
+  `.`/`..` handling (`..` past the root is `PermissionDenied`, never
+  clamped), the no-escape-including-symlinks guarantee, the virtual
+  `Response::Path` representation, and the cross-stream ordering rule
+  for `Cd` (the new cwd is guaranteed only for requests issued after
+  the `Cd` response is received). Previously all of this was
+  implementation lore; independent implementations could not have
+  agreed on it. See
+  [spec/qftp-protocol.md](spec/qftp-protocol.md#path-resolution).
+- **`Cd` response corrected to `Response::Ok`.** The spec said a
+  successful `Cd` returns `Response::Path`; the reference
+  implementation has always returned `Response::Ok` (the cwd is
+  observable via `Pwd`). The spec now documents `Ok`.
+- **Get trailer coverage corrected — the trailer binds a resume to
+  the file version.** The spec described the Get trailer as covering
+  "exactly the streamed suffix"; all three reference endpoints
+  (server, client, web bridge) have always computed the **cumulative
+  digest over `[0, offset + body length)`**, folding the `[0..offset)`
+  prefix in on both sides. The spec now documents the cumulative
+  digest, which is also what protects a resumed Get against the
+  server-side file changing between sessions (a same-size content
+  change defeats the `total_size` check but not the prefix digest). A
+  suffix-only independent implementation would have failed every
+  resumed transfer against the reference stack.
+- **Upload verification made mandatory for risky `Put` shapes.** A
+  resumed `Put` (`offset > 0`) and a compressed `Put`
+  (`encoding != Identity`) **MUST** carry `checksum` and/or
+  `checksum_trailer`; the server refuses them with
+  `ErrorCode::Unsupported` otherwise. A compressed `Put` **MUST**
+  carry `size == plaintext_size` (violation: `Malformed`). The
+  reference server already enforced all three; the spec now says so.
+- **Append-only extension rule clarified as one-directional.** A newer
+  decoder reading an older sender's frame rejects it as `Malformed`
+  unless it explicitly accepts both shapes; revisions that append
+  fields and need mixed-version interop must define the decode
+  default. See [spec/versioning.md](spec/versioning.md).
 
 ### Future directions (deferred to qftp/2)
 

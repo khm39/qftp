@@ -25,7 +25,8 @@ qftp-web-bridge \
   --http-bind 127.0.0.1:8080 \
   --root /srv/qftp \
   --users users.toml \
-  --users-tokens tokens.toml
+  --users-tokens tokens.toml \
+  --allowed-origins https://files.example.com
 ```
 
 - `--bind` is the WebTransport (UDP / HTTP/3) listener.
@@ -36,6 +37,17 @@ qftp-web-bridge \
 - `--root` and `--users` have the same meaning as on `qftp-server`;
   point the bridge and the server at the same directory and
   `users.toml` to expose one filesystem through both.
+- `--allowed-origins` is the comma-separated list of web origins whose
+  pages may open sessions — set it to the origin the SPA is served
+  from (the reverse proxy's `https://host`, or `http://<http-bind>`
+  when browsing the bundled listener directly). WebTransport is **not**
+  covered by CORS or the same-origin policy, so this check is what
+  stops an unrelated web page from dialling your bridge from inside a
+  visitor's browser. When unset, non-browser sessions (no `origin`
+  header) are admitted, browser sessions are admitted only behind
+  `--users-tokens`, and in anonymous mode browser sessions are refused
+  outright. `--allowed-origins '*'` explicitly serves every origin
+  (public read-only endpoints only).
 
 Open `http://<http-bind>/` in the browser, fill in the WebTransport
 URL (`https://<host>:4433/`) and an access token, and connect.

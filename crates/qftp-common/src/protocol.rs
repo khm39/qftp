@@ -6,10 +6,21 @@
 //! ALPN value implies a single wire-compatible major version; QUIC
 //! refuses to establish a connection when neither side offers a
 //! compatible value, which is the same effect as a Hello/Welcome
-//! negotiation but with zero protocol round-trips. Minor extensions
-//! within the major version are accommodated by `#[non_exhaustive]`
-//! enums and `#[serde(default)]` fields, so older binaries silently
-//! ignore newer fields they don't understand.
+//! negotiation but with zero protocol round-trips.
+//!
+//! Within a major version the bincode encoding is positional and not
+//! self-describing, so the ONLY backward-compatible structural change
+//! is appending fields at the end of a message — and even that is
+//! one-directional: an **older decoder** tolerates a **newer sender**
+//! (`decode_framed_message` allows trailing bytes), but a **newer
+//! decoder** reading an **older sender's** frame hits end-of-payload
+//! mid-message and fails. `#[serde(default)]` does NOT help here: it
+//! only applies to self-describing formats, never to bincode. New
+//! numeric-enum *values* ([`FileType`], [`HashAlgorithm`],
+//! [`Encoding`], [`ErrorCode`]) are the genuinely forward-compatible
+//! extension point (they decode as `Unknown(n)`); new positional
+//! variants or fields require every deployed peer to be updated
+//! together, or a major-version (ALPN) bump. See spec/versioning.md.
 //!
 //! ## Wire format
 //!

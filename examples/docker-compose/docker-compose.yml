@@ -53,6 +53,11 @@ services:
       - --key=/certs/key.pem
       - --users=/config/users.toml
       - --users-tokens=/config/tokens.toml
+      # The SPA is served via nginx below; only its origin may open
+      # WebTransport sessions from a browser (WebTransport has no
+      # CORS/same-origin protection of its own). Replace with the
+      # hostname your users actually browse to.
+      - --allowed-origins=https://localhost:8443
     volumes:
       - ./data:/srv
       - ./certs:/certs:ro

@@ -334,8 +334,13 @@ server -> client : <digest-length trailer>       (only if checksum_follows == tr
   still follows, covering the empty plaintext.
 - When `checksum_follows` is `true`, a trailer of the
   `hash_algorithm` digest length follows the body: the hash of the
-  streamed plaintext (not the encoded bytes, and not necessarily the
-  whole file). The client **MUST** verify it and discard the data on
+  **cumulative plaintext range `[0, offset + body length)`** — never
+  of the encoded bytes. For a resumed Get (`offset > 0`) both ends
+  fold the `[0..offset)` prefix into the hash (the server re-reads it
+  from its file, the client re-reads its local partial), so the
+  trailer equals the whole-file hash when `length` is unset; see
+  [qftp-protocol.md](qftp-protocol.md#get) for the version-binding
+  rationale. The client **MUST** verify it and discard the data on
   mismatch.
 - The QUIC stream **FIN** is set on the last trailer byte when a
   trailer follows, otherwise on the last body byte (or, for `size == 0`

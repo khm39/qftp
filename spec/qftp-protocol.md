@@ -39,6 +39,64 @@ Each message is a length-prefixed frame (a 4-byte big-endian length
 followed by the payload), capped at 16 MiB. The complete framing and
 payload encoding are specified in [wire-format.md](wire-format.md).
 
+## Path resolution
+
+Every `path` field (and `Rename`'s `from`/`to`) is resolved server-side
+against two pieces of state. This section is normative: without it two
+implementations would disagree on what a given path names.
+
+- **The user's root.** Every identity (including the anonymous user)
+  is confined to a per-user root directory — its *home*. All paths a
+  connection can name resolve inside it, and the protocol provides no
+  way to name anything outside it. In protocol terms the user's root
+  **is** `/`; how homes map onto the server's filesystem is
+  implementation-defined and **MUST NOT** be observable on the wire.
+- **The connection's working directory (cwd).** Per-connection,
+  server-side state: it starts at the user's root when the connection
+  is accepted (and is reset to the authenticated user's root if the
+  identity is upgraded when the TLS handshake completes), is changed
+  only by a successful `Cd`, and is never shared between connections.
+
+Resolution rules:
+
+- A path beginning with `/` resolves from the user's root; any other
+  path resolves from the connection's cwd. An empty `Ls` path lists
+  the cwd.
+- The separator is `/`. Consecutive separators collapse; a trailing
+  separator is ignored. Whether any other byte (e.g. `\`) acts as a
+  separator follows the server's platform and is
+  implementation-defined — clients **MUST NOT** rely on it.
+- A `.` component is ignored. A `..` component ascends one level but
+  **MUST NOT** ascend past the user's root: a path that attempts to
+  (for example `/..`, or more `..` components than its depth) is
+  refused with `ErrorCode::PermissionDenied`, **not** silently clamped
+  to the root.
+- A server **MUST** ensure the resolved path cannot escape the user's
+  root, **including via symbolic links** encountered at any component.
+  The reference implementation enforces this conservatively: it walks
+  the path component by component and refuses any component that is a
+  symlink (`PermissionDenied`), accepting that legitimate in-root
+  symlinks are unusable. An implementation with a stronger primitive
+  (e.g. `openat2(RESOLVE_BENEATH)`) **MAY** admit in-root symlinks, but
+  the no-escape guarantee is not optional.
+- `Response::Path` (from `Pwd`) carries the cwd as a **virtual**
+  absolute path: `/`-separated, rooted at the user's root (`/` for the
+  root itself, `/sub/dir` below it). A server **MUST NOT** expose
+  server-native filesystem paths in it.
+
+### `Cd` and concurrent streams
+
+QUIC provides no ordering between streams, and the cwd is
+connection-level state consulted when the server starts executing a
+request. The new cwd is therefore guaranteed to apply only to requests
+the client issues **after receiving the `Cd`'s successful response**.
+A request that is in flight concurrently with a `Cd` — on any stream —
+resolves against an unspecified choice of the old or new cwd. A client
+that pipelines requests across streams **SHOULD** use `/`-rooted paths
+and treat the cwd purely as an interactive convenience (the reference
+client is lock-step: it never has a `Cd` and another request in flight
+together).
+
 ## Request / Response semantics
 
 The byte layout of every message is in
@@ -52,10 +110,11 @@ failure the server's `Response::Err` carries an `ErrorResponse { code,
 message }`; the `code` is the machine-readable handle for scripts (see
 [error-codes.md](error-codes.md)).
 
-- `Ls` returns `Response::DirListing`; `Pwd` and a successful `Cd`
-  return `Response::Path`; `Stat` returns `Response::FileStat`;
-  `Quota` returns `Response::QuotaInfo`; `Mkdir` / `Rmdir` / `Rm` /
-  `Rename` / `Chmod` return `Response::Ok`.
+- `Ls` returns `Response::DirListing`; `Pwd` returns `Response::Path`
+  (the virtual cwd, see [Path resolution](#path-resolution)); `Stat`
+  returns `Response::FileStat`; `Quota` returns `Response::QuotaInfo`;
+  a successful `Cd`, like `Mkdir` / `Rmdir` / `Rm` / `Rename` /
+  `Chmod`, returns `Response::Ok`.
 - `Quit` is replied to with `Response::Ok`, after which the server
   initiates a graceful QUIC `CONNECTION_CLOSE`.
 
@@ -131,13 +190,24 @@ server -> client : <digest-length trailer, if checksum_follows>
   below the client's `offset`) is `ErrorCode::InvalidRange`.
 - `hash_algorithm` names the digest the trailer uses; it is BLAKE3 in
   `qftp/1` (see [`HashAlgorithm`](wire-format.md#hashalgorithm)).
-- When `checksum_follows` is true, the body is immediately followed by a
-  trailer of the `hash_algorithm` digest length (BLAKE3 → 32 bytes)
-  covering exactly the streamed suffix (post-offset, post-length), not
-  the whole file. The client **MUST** compare it to its own running hash
-  and discard the local file on mismatch. A resumed Get (`offset > 0`)
-  **MUST NOT** be answered with `checksum_follows = false`: the client
-  needs the suffix digest to validate the resumed tail.
+- When `checksum_follows` is true, the body is immediately followed by
+  a trailer of the `hash_algorithm` digest length (BLAKE3 → 32 bytes).
+  The digest covers the **cumulative plaintext range
+  `[0, offset + body length)`**: the server re-reads the `[0, offset)`
+  prefix from its file and folds it into the hash before hashing the
+  streamed suffix. When `length` is unset this equals the whole-file
+  digest; with a bounded `length` it is the digest of the sent prefix
+  range. A resuming client **MUST** likewise fold its local
+  `[0, offset)` bytes into its running hash before hashing the received
+  suffix, and **MUST** discard the local file on mismatch.
+- **The trailer binds a resume to the file version.** Because both
+  sides hash the prefix, a server-side file that changed between
+  sessions — even to different content of the *same size*, which the
+  `total_size` shrink check cannot catch — produces disagreeing prefix
+  digests, so the splice is detected and discarded instead of being
+  committed silently. This is why a resumed Get (`offset > 0`)
+  **MUST NOT** be answered with `checksum_follows = false`: without
+  the trailer the resumed splice would go entirely unverified.
 
 #### Transfer compression
 
@@ -217,7 +287,25 @@ server -> client : Response::Ok | Response::Err(...)
   the server **MUST** reply `ErrorCode::UploadTruncated`. The chosen
   checksum is verified after the last byte; on mismatch the server
   removes the temp and replies `ErrorCode::ChecksumMismatch`. With
-  neither field set, the upload is accepted unverified.
+  neither field set, a fresh (`offset == 0`) `Identity` upload is
+  accepted unverified.
+- **Uploads that MUST be verified.** Two `Put` shapes are refused
+  outright when neither `checksum` nor `checksum_trailer` is set; the
+  server replies `ErrorCode::Unsupported` before reading any body
+  bytes:
+  - **A resume** (`offset > 0`). The existing partial's length probe
+    checks only its size, so without a whole-file digest a co-tenant
+    could substitute the prefix and have it committed unverified.
+  - **A compressed upload** (`encoding != Identity`). With
+    compression, the wire byte count no longer independently witnesses
+    the plaintext length; an unverified compressed upload would let a
+    corrupted or truncated decode commit silently.
+- **Compressed size consistency.** A `Put` with `encoding == Zstd`
+  **MUST** carry `size == plaintext_size`; the server **MUST** refuse
+  a mismatch with `ErrorCode::Malformed`. (The same `size ==
+  plaintext_size` invariant holds for a compressed
+  `Response::FileReady`; a client **SHOULD** treat a violation as a
+  protocol error.)
 - **Structured details.** A `Response::Err` **MAY** attach
   [`ErrorDetails`](wire-format.md#errordetails) for machine handling:
   `Range { offset, file_size }` with `InvalidRange`,
@@ -263,20 +351,42 @@ data:
 
 | Request | 0-RTT? |
 |---|---|
-| `Ls`, `Cd`, `Pwd`, `Stat`, `Quit` | Allowed — read-only / idempotent, small fixed-size reply |
-| `Get`, `Quota`, `Put`, `Rm`, `Mkdir`, `Rmdir`, `Rename`, `Chmod` | Refused with `ErrorCode::Unsupported` ("operation requires 1-RTT data") |
+| `Cd`, `Pwd`, `Stat`, `Quit` | Allowed — read-only / idempotent, small fixed-size reply |
+| `Ls`, `Get`, `Quota`, `Put`, `Rm`, `Mkdir`, `Rmdir`, `Rename`, `Chmod` | Refused with `ErrorCode::Unsupported` ("operation requires 1-RTT data") |
 
 `Get` is refused even though its reply is idempotent: it can return a
 large body, so a replayed 0-RTT flight is a bandwidth-amplification
-primitive (reflected downloads against a spoofed source IP). `Quota` is
-refused for the same amplification reason. The allow list therefore
-keeps only small fixed-size replies. The cost is one extra round trip
-on the first request of a session; subsequent requests run at 1-RTT
-either way. A request refused this way **MUST** be retried by the
-client **immediately** after the handshake completes — with no backoff,
-since the refusal is solely about 0-RTT, not the operation itself (the
+primitive (reflected downloads against a spoofed source IP). `Ls` is
+refused for the same reason: a single `DirListing` page may carry up
+to the 100000-entry cap — a multi-MiB frame, bounded only by the
+16 MiB frame cap — so a replayed 0-RTT `Ls` is a reflection primitive
+of the same order as `Get`. `Quota` is likewise refused as an
+amplification-hardening measure. The allow list therefore keeps only
+small fixed-size replies. The cost is one extra round trip on the
+first request of a session; subsequent requests run at 1-RTT either
+way. A request refused this way **MUST** be retried by the client
+**immediately** after the handshake completes — with no backoff, since
+the refusal is solely about 0-RTT, not the operation itself (the
 reference client does so transparently; see the retryability table in
 [error-codes.md](error-codes.md)).
+
+### Identity gate on early data
+
+Early data arrives before the TLS handshake — and therefore before any
+client-certificate identity — has been resolved, so a server can only
+execute it as the **anonymous** user. On a server where a connection
+could be upgraded to a named user once the handshake completes (mTLS
+is enforced, or named users are configured), the anonymous view and
+the eventual authenticated view are different trust domains: under the
+reference server's `--users` configuration the anonymous home defaults
+to the whole server root. Such a server **MUST** refuse **every**
+request that arrives as early data — including the reads in the allow
+list above — with `ErrorCode::Unsupported` ("operation requires 1-RTT
+data"), so that no request is ever answered with the anonymous view on
+a connection that is about to acquire a scoped identity. The client
+retry rule above applies unchanged. The replay-safety allow list is
+therefore only reachable on servers with no identity story (every peer
+is anonymous by construction).
 
 ## Stateless retry
 

@@ -32,3 +32,19 @@ tempfile = "3"
 # it needs tokio timers (startup-wait retry) and a TCP client (to
 # check the SPA HTTP listener).
 tokio = { version = "1", features = ["time", "net"] }
+
+[package.metadata.deb]
+maintainer = "khm39 <khm39@kuraft.com>"
+copyright = "2026 khm39 <khm39@kuraft.com>"
+extended-description = """\
+WebTransport (HTTP/3) bridge that serves qftp to browser clients,
+with the single-page web client embedded. Bearer-token auth,
+origin allowlisting, BLAKE3 integrity end-to-end in the browser."""
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/qftp-web-bridge", "/usr/bin/", "755"],
+    ["../../README.md", "/usr/share/doc/qftp-web-bridge/README.md", "644"],
+    ["../../docs/web-client.md", "/usr/share/doc/qftp-web-bridge/web-client.md", "644"],
+    ["../../LICENSE.md", "/usr/share/doc/qftp-web-bridge/LICENSE.md", "644"],
+]
