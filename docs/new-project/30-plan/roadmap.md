@@ -11,7 +11,7 @@
 | 4 | `qftp-client-core` + `qftp-client`(REPL / one-shot MVP) | クイックスタート(自己署名 + TOFU、ls / get / put / quit)が動く。終了コード規約の e2e。TOFU が one-shot でも効く |
 | 5 | 再帰転送、mget、双方向 bwlimit、`qftp-admin`、metrics / systemd / Docker / release、ベンチ(`qftp-e2e/benches`) | プロトタイプの機能一覧と等価(sync / watch / put-multi / Web を除く) |
 | 6 | sync / watch(`--checksum` と put-multi は廃止推奨) | 各コマンドの e2e。`.qftpignore` 互換 |
-| 7 | Web ブリッジ + SPA(ADR-006 の決定、WASM 共有の評価) | ブラウザ e2e(Playwright)。再開・圧縮・Cd がネイティブと同一 |
+| 7 | Web ブリッジ(wtransport、ADR-006 確定済み)+ SPA(WASM 共有の評価) | ブラウザ e2e(Playwright)。再開・圧縮・Cd がネイティブと同一 |
 
 ## フェーズ間の依存
 
@@ -31,4 +31,4 @@ Phase 4 終了時点で、プロトタイプの主要ユースケース(サー�
 | 3 | サーバ機能設計書の設定キーを実装と一致させる。運用設計書のメトリクス一覧を確定 |
 | 4 | クライアント機能設計書の終了コード表を確定 |
 | 5 | 運用設計書 §6〜§8(バックアップ、定期作業、キャパシティ)を運用主体と埋める |
-| 7 | ADR-006 決定、画面設計書のモックアップ |
+| 7 | 画面設計書のモックアップ、WASM 共有評価の結果 |
