@@ -1,0 +1,95 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ファイル形式リファレンス</title><style>
+:root{--text:#1b2430;--muted:#5c6b7f;--border:#e3e8ef;--bg:#fff;--soft:#f3f5f9;--page:#e9edf3;--accent:#165e83;--accent-soft:#e3eef4;--warn:#bc4425;--warn-soft:#faeee9;--ok:#2f7d4f;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--max:960px;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--text:#dde5ee;--muted:#8fa0b5;--border:#2a3543;--bg:#151c26;--soft:#1c2532;--page:#0e131a;--accent:#7cb8d9;--accent-soft:#1b3040;--warn:#e8926f;--warn-soft:#33221b;--ok:#7fc79b}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic","Meiryo",system-ui,sans-serif;font-size:14.5px;line-height:1.85;color:var(--text);background:var(--page);counter-reset:sec}
+main{max-width:var(--max);margin:40px auto;padding:48px 56px;background:var(--bg);border:1px solid var(--border);border-radius:14px}
+header.doc{border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:32px}
+header.doc .kind{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.12em;color:var(--accent);background:var(--accent-soft);padding:3px 12px;border-radius:999px;margin-bottom:12px}
+header.doc h1{margin:0;font-size:28px;line-height:1.35}
+header.doc .meta{margin-top:10px;font-size:12px;color:var(--muted)}
+nav.toc{font-size:13px;border:1px solid var(--border);background:var(--soft);border-radius:12px;padding:12px 16px;margin-bottom:32px}
+nav.toc ol{margin:6px 0 0;padding-left:22px}nav.toc a{color:var(--muted);text-decoration:none}nav.toc a:hover{color:var(--accent)}
+@media (min-width:1400px){nav.toc{position:fixed;top:40px;left:max(16px,calc(50% - var(--max)/2 - 260px));width:236px;max-height:calc(100vh - 80px);overflow-y:auto;margin:0;background:transparent;border:none}}
+section{margin:0 0 44px;scroll-margin-top:24px}
+section>h2{counter-increment:sec;display:flex;gap:12px;align-items:baseline;font-size:20px;margin:0 0 16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+section>h2::before{content:counter(sec);font-family:var(--mono);font-size:12.5px;color:var(--accent);background:var(--accent-soft);border-radius:8px;padding:1px 10px}
+h3{font-size:15px;margin:26px 0 8px}
+p{margin:0 0 10px}
+table{border-collapse:separate;border-spacing:0;width:100%;margin:12px 0;font-size:13px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+th,td{border-bottom:1px solid var(--border);padding:7px 11px;text-align:left;vertical-align:top}th+th,td+td{border-left:1px solid var(--border)}tr:last-child td{border-bottom:none}
+th{background:var(--soft);font-weight:600;font-size:12px;color:var(--muted)}
+table.prim td:nth-child(3){width:300px}
+code{font-family:var(--mono);font-size:12.5px;background:var(--soft);border:1px solid var(--border);padding:0 5px;border-radius:5px}
+figure.diagram{margin:14px 0;padding:12px;background:var(--soft);border:1px solid var(--border);border-radius:12px;overflow-x:auto}
+figure.diagram svg{display:block;margin:0 auto;max-width:100%;height:auto}
+figcaption{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+td figure.diagram{margin:0;padding:6px;background:transparent;border:none}
+.sq-life{stroke:var(--border);stroke-width:1.5;stroke-dasharray:4 4}
+.sq-actor{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}
+.sq-actor-text{fill:var(--accent);font-size:13px;font-weight:700}
+.sq-line{stroke:var(--text);stroke-width:1.4;fill:none}.sq-dash{stroke-dasharray:6 4;stroke:var(--muted)}
+.sq-arrowhead{fill:var(--text)}
+.sq-text{fill:var(--text);font-size:12px;font-family:var(--mono)}
+.sq-note{fill:var(--bg);stroke:var(--border);stroke-width:1}.sq-note-warn{fill:var(--warn-soft);stroke:var(--warn)}
+.sq-sep{stroke:var(--border);stroke-dasharray:2 4}.sq-sep-text{fill:var(--muted);font-size:11px}
+.bl-box{stroke:var(--border);stroke-width:1.2;fill:var(--bg)}
+.bl-hdr{fill:#fde8c7}.bl-body{fill:var(--bg)}.bl-int{fill:#dbeafe}.bl-tag{fill:#fce7f3}.bl-len{fill:#fef3c7}.bl-str{fill:#dcfce7}.bl-disc{fill:#ede9fe}.bl-enum{fill:#e0f2fe}.bl-opt{fill:#fce7f3}.bl-seq{fill:#fef3c7}
+@media (prefers-color-scheme:dark){.bl-hdr{fill:#4a3319}.bl-int{fill:#1e3a5f}.bl-tag{fill:#4a1d3a}.bl-len{fill:#4a3a10}.bl-str{fill:#14432a}.bl-disc{fill:#2e2560}.bl-enum{fill:#0f3a52}.bl-opt{fill:#4a1d3a}.bl-seq{fill:#4a3a10}}
+.bl-label{fill:var(--text);font-size:12px;font-family:var(--mono);font-weight:600}.bl-size{fill:var(--muted);font-size:10.5px;font-family:var(--mono)}.bl-sub{fill:var(--muted);font-size:10.5px}
+.hx-wrap{overflow-x:auto;margin:8px 0}
+table.hx{font-family:var(--mono);font-size:12px}table.hx caption{caption-side:top;text-align:left;font-family:inherit;font-size:12.5px;color:var(--muted);padding:6px 4px}
+table.hx td.hx-off{color:var(--muted);text-align:right;width:70px}table.hx td.hx-hex{white-space:nowrap;letter-spacing:.02em}
+tr.hx-disc td.hx-hex{background:#ede9fe}tr.hx-len td.hx-hex{background:#fef3c7}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#dcfce7}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#fce7f3}tr.hx-enum td.hx-hex{background:#e0f2fe}tr.hx-int td.hx-hex{background:#dbeafe}
+@media (prefers-color-scheme:dark){tr.hx-disc td.hx-hex{background:#2e2560}tr.hx-len td.hx-hex{background:#4a3a10}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#14432a}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#4a1d3a}tr.hx-enum td.hx-hex{background:#0f3a52}tr.hx-int td.hx-hex{background:#1e3a5f}}
+details.vec{border:1px solid var(--border);border-radius:10px;padding:6px 12px;margin:8px 0;background:var(--bg)}details.vec summary{cursor:pointer;font-size:13px;color:var(--accent)}
+.callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:0 10px 10px 0;margin:12px 0}.callout.warn{border-color:var(--warn);background:var(--warn-soft)}
+.legend{border:1px solid var(--border);border-radius:10px;padding:10px 14px;background:var(--soft)}.legend ul{margin:6px 0 0;padding-left:20px}
+.chip{display:inline-block;font-family:var(--mono);font-size:11px;padding:0 6px;border-radius:5px;border:1px solid var(--border)}.chip-be{background:#fde8c7;color:#7a4a00}.chip-le{background:#dbeafe;color:#1e3a5f}
+@media print{body{background:#fff;font-size:10.5pt}main{margin:0;padding:0;border:none;max-width:none}nav.toc{display:none}section{page-break-inside:avoid}details.vec{page-break-inside:avoid}details.vec[open]>summary{font-weight:700}figure.diagram{overflow:visible}}
+@media (max-width:720px){main{margin:0;padding:24px 16px;border:none;border-radius:0}}
+
+pre.code{background:var(--soft);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55;margin:10px 0}pre.code code{background:none;border:none;padding:0}
+td.k{white-space:nowrap}.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--border);background:var(--soft);color:var(--muted);margin-left:4px}
+</style></head><body><main>
+<header class="doc"><div class="kind">参照文書</div><h1>ファイル形式リファレンス</h1><div class="meta">作成日: 2026-09-03 / 対象: users.toml、tokens.toml、known_hosts、セッションチケット、temp と補助ファイル</div></header>
+<nav class='toc'><b>目次</b><ol><li><a href="#paths">ファイルの配置</a></li><li><a href="#users">users.toml</a></li><li><a href="#tokens">tokens.toml</a></li><li><a href="#known-hosts">known_hosts</a></li><li><a href="#ticket">セッションチケット(V2)</a></li><li><a href="#misc">その他の規則</a></li></ol></nav><section id="paths"><h2>ファイルの配置</h2>
+<table class=""><thead><tr><th>ファイル</th><th>既定パス</th><th>所有 / モード</th><th>作成者</th></tr></thead><tbody><tr><td>サーバ設定</td><td><code>/etc/qftp/server.toml</code></td><td>root / 0644</td><td>運用者</td></tr><tr><td>ユーザ定義</td><td><code>/etc/qftp/users.toml</code></td><td>root / 0640(サーバ実行ユーザが読める)</td><td>qftp-admin</td></tr><tr><td>トークン</td><td><code>/etc/qftp/tokens.toml</code></td><td>root / 0640</td><td>qftp-admin</td></tr><tr><td>永続自己署名</td><td><code>$XDG_STATE_HOME/qftp/self-signed/{cert.pem,key.pem}</code></td><td>サーバ実行ユーザ / dir 0700、key 0600</td><td>qftp-server</td></tr><tr><td>ストレージルート</td><td><code>root</code> 設定値</td><td>サーバ実行ユーザ</td><td>運用者</td></tr><tr><td>クライアント設定</td><td><code>~/.qftp/config.toml</code></td><td>利用者 / 0600 推奨</td><td>利用者</td></tr><tr><td>known_hosts</td><td><code>~/.qftp/known_hosts</code></td><td>利用者 / 0600</td><td>qftp-client</td></tr><tr><td>セッションチケット</td><td><code>~/.qftp/session-tickets/&lt;host_port&gt;.ticket</code></td><td>利用者 / dir 0700、file 0600</td><td>qftp-client</td></tr><tr><td>履歴</td><td><code>~/.qftp_history</code></td><td>利用者 / 0600</td><td>qftp-client</td></tr></tbody></table>
+</section><section id="users"><h2>users.toml</h2>
+<pre class="code"><code># users.toml
+[anonymous]                      # 任意。省略時: home = root、read のみ、quota なし
+home = &quot;public&quot;
+permissions = { read = true }
+
+[[users]]
+name = &quot;alice&quot;                   # 必須。空白のみ・&quot;anonymous&quot; は不可。大文字小文字は区別
+home = &quot;alice&quot;                   # 任意。相対 → &lt;root&gt;/alice、省略 → &lt;root&gt;/&lt;name&gt;、絶対パス可
+permissions = { read = true, write = true, delete = false, mkdir = true, rmdir = false, rename = false, chmod = false }
+quota_bytes = 1073741824         # 任意。0 は不可(無制限は省略で表す)
+
+[[users]]
+name = &quot;bob&quot;
+permissions = { read = true }</code></pre>
+<table class=""><thead><tr><th>検証</th><th>違反時</th></tr></thead><tbody><tr><td>未知キー</td><td>エラー</td></tr><tr><td><code>permissions</code> の未指定キー</td><td>false</td></tr><tr><td>相対 home に <code>..</code> を含む</td><td>エラー</td></tr><tr><td>home が root の外(canonicalize 後)</td><td>エラー</td></tr><tr><td>2 ユーザの home が同一または入れ子(anonymous を含む)</td><td>エラー(クォータカウンタが独立なため)</td></tr><tr><td>name の重複</td><td>エラー</td></tr><tr><td><code>quota_bytes = 0</code></td><td>エラー</td></tr><tr><td>home が存在しない</td><td>サーバ起動時に作成(0750)</td></tr></tbody></table>
+<p>mTLS の identity は証明書の SAN(dNSName → rfc822Name → URI)→ CN の順で候補を作り、<code>name</code> と完全一致(前後空白は除去)で照合します。複数ユーザに一致する証明書は拒否されます。</p>
+</section><section id="tokens"><h2>tokens.toml</h2>
+<pre class="code"><code># tokens.toml(qftp-admin token add が生成。手編集は check で検証すること)
+[[tokens]]
+user = &quot;alice&quot;
+label = &quot;laptop&quot;                                   # user 内で一意
+sha256 = &quot;9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08&quot;
+created = &quot;2026-09-03T00:00:00Z&quot;                   # RFC 3339
+# expires = &quot;2027-09-03T00:00:00Z&quot;                 # 任意</code></pre>
+<table class=""><thead><tr><th>項目</th><th>規定</th></tr></thead><tbody><tr><td>トークン本体</td><td>32 バイトの乱数を base64url(パディングなし、43 文字)で表した文字列。<code>token add</code> の stdout にだけ現れる</td></tr><tr><td>保存</td><td><code>sha256(token 文字列の UTF-8)</code> を小文字 hex 64 桁で保存(ADR-012)</td></tr><tr><td>照合</td><td>受信文字列を SHA-256 し、全エントリと定数時間比較(早期終了しない)。一致したエントリの <code>user</code> が users.toml に存在しなければ拒否</td></tr><tr><td>検証</td><td><code>user</code> の存在、<code>label</code> の一意性、hex の長さ、未知キー</td></tr><tr><td>失効</td><td>エントリ削除(<code>token revoke</code>)または <code>expires</code>。再読込は再起動(将来 SIGHUP)</td></tr></tbody></table>
+</section><section id="known-hosts"><h2>known_hosts</h2>
+<pre class="code"><code># ~/.qftp/known_hosts — 1 行 1 ホスト。# 以降はコメント
+files.work.example:4433 sha256:3b1f…e9a0
+[2001:db8::1]:4433 sha256:77c2…01aa
+home.lan:4433 sha256:0c9d…4e21   # 2026-09-03 に pin</code></pre>
+<table class=""><thead><tr><th>項目</th><th>規定</th></tr></thead><tbody><tr><td>キー</td><td>接続に使った <code>host:port</code> の文字列(SNI ではない)。IPv6 は <code>[…]:port</code>。大文字小文字はそのまま</td></tr><tr><td>値</td><td>leaf 証明書 DER の SHA-256、小文字 hex 64 桁、<code>sha256:</code> 接頭辞</td></tr><tr><td>照合</td><td>先頭から最初に一致した行。複数行の同一ホストは許さない(追記時に既存行があれば置換ではなくエラー)</td></tr><tr><td>不正行</td><td>警告して無視(<code>-v</code> で行番号)</td></tr><tr><td>追記</td><td><code>flock</code> で排他、0600、末尾に 1 行。ホスト文字列に空白・改行・<code>#</code> を含む場合は拒否(インジェクション防止)</td></tr><tr><td>不一致</td><td>接続を閉じ(データ未送出)、SSH 風バナー + 実際に使ったファイルパスを表示、終了コード 77</td></tr></tbody></table>
+</section><section id="ticket"><h2>セッションチケット(V2)</h2>
+<figure class="diagram"><svg class="diagram-svg" viewBox="0 0 652.5 92" width="652.5" role="img"><rect class="bl-box bl-hdr" x="10" y="26" width="144" height="34" rx="5"/><text class="bl-label" x="82.0" y="47" text-anchor="middle">magic</text><text class="bl-size" x="82.0" y="18" text-anchor="middle">8 B</text><text class="bl-sub" x="82.0" y="78" text-anchor="middle">&quot;QFT2\0FP\n&quot;</text><rect class="bl-box bl-int" x="158" y="26" width="144" height="34" rx="5"/><text class="bl-label" x="230.0" y="47" text-anchor="middle">created</text><text class="bl-size" x="230.0" y="18" text-anchor="middle">8 B</text><text class="bl-sub" x="230.0" y="78" text-anchor="middle">u64 BE 秒</text><rect class="bl-box bl-str" x="306" y="26" width="156" height="34" rx="5"/><text class="bl-label" x="384.0" y="47" text-anchor="middle">leaf_sha256</text><text class="bl-size" x="384.0" y="18" text-anchor="middle">32 B</text><text class="bl-sub" x="384.0" y="78" text-anchor="middle">証明書の pin</text><rect class="bl-box bl-body" x="466" y="26" width="172.50000000000003" height="34" rx="5"/><text class="bl-label" x="552.25" y="47" text-anchor="middle">session</text><text class="bl-size" x="552.25" y="18" text-anchor="middle">可変</text><text class="bl-sub" x="552.25" y="78" text-anchor="middle">quiche の session blob</text></svg><figcaption>図 1. チケットファイルのレイアウト。長さプレフィクスはなく、残り全部が session</figcaption></figure>
+<table class=""><thead><tr><th>項目</th><th>規定</th></tr></thead><tbody><tr><td>ファイル名</td><td><code>&lt;host_port&gt;.ticket</code>。<code>host_port</code> の <code>:</code> <code>/</code> <code>&#92;</code> <code>[</code> <code>]</code> は <code>_</code> に置換</td></tr><tr><td>書込</td><td>同一ディレクトリの temp(pid + 連番)に書き 0600 にして rename</td></tr><tr><td>TTL</td><td>24 時間。<code>created</code> が未来(5 分超)または期限切れなら破棄</td></tr><tr><td>pin 検査</td><td>接続後の leaf SHA-256 が <code>leaf_sha256</code> と異なれば破棄して警告</td></tr><tr><td>保存条件</td><td><code>zero_rtt = true</code> かつ CA / システムルート検証モード(TOFU / insecure では保存しない)</td></tr><tr><td>旧形式</td><td><code>QFT1</code>、ヘッダなしの blob は読まずに削除</td></tr></tbody></table>
+</section><section id="misc"><h2>その他の規則</h2>
+<table class=""><thead><tr><th>項目</th><th>規定</th></tr></thead><tbody><tr><td>アップロード temp</td><td><code>&lt;final&gt;.qftp.partial</code>(同じディレクトリ)。<code>TempName::is_temp</code> が唯一の判定。Ls 非表示、Get / Rm / Rename / Put の対象名として拒否(<code>PermissionDenied</code>)。起動時に 24 時間超のものを掃除</td></tr><tr><td>Ls カーソル</td><td><code>base64url(最後に返したエントリ名)</code>(ADR-008)。パディングなし。復号不能・ソート順に矛盾は <code>Malformed</code></td></tr><tr><td>永続自己署名</td><td><code>cert.pem</code> / <code>key.pem</code>(ECDSA P-256、有効期間 1 年、SAN = localhost + bind アドレス)。期限切れ・解析不能なら再生成し、fingerprint をログに出す</td></tr><tr><td>履歴</td><td>1 行 1 コマンド、UTF-8、最大 10,000 行(超過は古い順に削除)。失敗したコマンドも記録</td></tr><tr><td>設定の秘密</td><td>config.toml に鍵を書く仕組みはない(パスのみ)。<code>--check-config</code> の出力にもパスだけが載る</td></tr></tbody></table>
+</section></main></body></html>

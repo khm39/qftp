@@ -7,11 +7,11 @@
 | 0 | 新リポジトリ作成、`10-protocol/` を `spec/` として配置、ADR 配置、CI 骨格(fmt / clippy / MSRV / aarch64 クロスビルド / conformance)、**quiche spike**(サーバ側 early data 受理と 1-RTT ゲート、stateless retry、tokio current_thread 上での quiche 駆動、`UdpSocket::try_io` 経由の GSO 送信、`spawn_blocking` 往復コストの粗い計測) | spike の結果を ADR-001 に追記。CI が空ワークスペースで緑 |
 | 1 | `qftp-wire`(型、手書き codec、検証、定数、`tests/conformance.rs`、`examples/gen_vectors.rs`)、fuzz(request / response deser) | 全ベクタで双方向一致。旧フレーム(末尾フィールドなし)を新デコーダが読むケースをベクタ化 |
 | 2 | `qftp-core`(path / user / identity / fs_ops(Ls ページング)/ transfer エンジン / compress / temp)を**ユニットテストのみ**で完成 | 純メモリホストで Get / Put の全経路(再開・圧縮・全失敗分類)をテスト。プロトタイプ評価文書 §9 の G1・G6・G8・G12・G13 が設計どおり |
-| 3 | `qftp-quic` + `qftp-server`(MVP 機能)+ `qftp-e2e`(フィクスチャと e2e) | e2e: Ls ページング、Get / Put 往復、再開 3 種、zstd、mTLS(拒否 / Ambiguous)、retry、0-RTT 拒否、レート制限、接続上限、STOP_SENDING 耐性、graceful shutdown、HOL(大転送中の Ls 応答時間) |
+| 3 | `qftp-quic` + `qftp-server`(MVP 機能)+ `test-util` フィクスチャ + `qftp-server/tests` の e2e | e2e: Ls ページング、Get / Put 往復、再開 3 種、zstd、mTLS(拒否 / Ambiguous)、retry、0-RTT 拒否、レート制限、接続上限、STOP_SENDING 耐性、graceful shutdown、HOL(大転送中の Ls 応答時間) |
 | 4 | `qftp-client-core` + `qftp-client`(REPL / one-shot MVP) | クイックスタート(自己署名 + TOFU、ls / get / put / quit)が動く。終了コード規約の e2e。TOFU が one-shot でも効く |
-| 5 | 再帰転送、mget、双方向 bwlimit、`qftp-admin`、metrics / systemd / Docker / release、ベンチ(`qftp-e2e/benches`) | プロトタイプの機能一覧と等価(sync / watch / put-multi / Web を除く) |
-| 6 | sync / watch(`--checksum` と put-multi は廃止推奨) | 各コマンドの e2e。`.qftpignore` 互換 |
-| 7 | Web ブリッジ(wtransport、ADR-006 確定済み)+ SPA(WASM 共有の評価) | ブラウザ e2e(Playwright)。再開・圧縮・Cd がネイティブと同一 |
+| 5 | 再帰転送、mget、双方向 bwlimit、`qftp-admin`(トークン生成・SHA-256 保存)、metrics / systemd / Docker / release(手書き workflow)、ベンチ(`qftp-server/benches`) | プロトタイプの機能一覧と等価(sync / watch / put-multi / Web を除く) |
+| 6 | sync / watch(`--checksum` と put-multi は作らない、ADR-010) | 各コマンドの e2e。`.qftpignore` 互換 |
+| 7 | Web ブリッジ(wtransport、ADR-006 確定済み)+ SPA(WASM 共有の評価) | ブリッジ自クレートの `tests/` とブラウザ e2e(Playwright)。再開・圧縮・Cd がネイティブと同一 |
 
 ## フェーズ間の依存
 

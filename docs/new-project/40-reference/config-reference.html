@@ -1,0 +1,144 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>設定リファレンス</title><style>
+:root{--text:#1b2430;--muted:#5c6b7f;--border:#e3e8ef;--bg:#fff;--soft:#f3f5f9;--page:#e9edf3;--accent:#165e83;--accent-soft:#e3eef4;--warn:#bc4425;--warn-soft:#faeee9;--ok:#2f7d4f;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--max:960px;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--text:#dde5ee;--muted:#8fa0b5;--border:#2a3543;--bg:#151c26;--soft:#1c2532;--page:#0e131a;--accent:#7cb8d9;--accent-soft:#1b3040;--warn:#e8926f;--warn-soft:#33221b;--ok:#7fc79b}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic","Meiryo",system-ui,sans-serif;font-size:14.5px;line-height:1.85;color:var(--text);background:var(--page);counter-reset:sec}
+main{max-width:var(--max);margin:40px auto;padding:48px 56px;background:var(--bg);border:1px solid var(--border);border-radius:14px}
+header.doc{border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:32px}
+header.doc .kind{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.12em;color:var(--accent);background:var(--accent-soft);padding:3px 12px;border-radius:999px;margin-bottom:12px}
+header.doc h1{margin:0;font-size:28px;line-height:1.35}
+header.doc .meta{margin-top:10px;font-size:12px;color:var(--muted)}
+nav.toc{font-size:13px;border:1px solid var(--border);background:var(--soft);border-radius:12px;padding:12px 16px;margin-bottom:32px}
+nav.toc ol{margin:6px 0 0;padding-left:22px}nav.toc a{color:var(--muted);text-decoration:none}nav.toc a:hover{color:var(--accent)}
+@media (min-width:1400px){nav.toc{position:fixed;top:40px;left:max(16px,calc(50% - var(--max)/2 - 260px));width:236px;max-height:calc(100vh - 80px);overflow-y:auto;margin:0;background:transparent;border:none}}
+section{margin:0 0 44px;scroll-margin-top:24px}
+section>h2{counter-increment:sec;display:flex;gap:12px;align-items:baseline;font-size:20px;margin:0 0 16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+section>h2::before{content:counter(sec);font-family:var(--mono);font-size:12.5px;color:var(--accent);background:var(--accent-soft);border-radius:8px;padding:1px 10px}
+h3{font-size:15px;margin:26px 0 8px}
+p{margin:0 0 10px}
+table{border-collapse:separate;border-spacing:0;width:100%;margin:12px 0;font-size:13px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+th,td{border-bottom:1px solid var(--border);padding:7px 11px;text-align:left;vertical-align:top}th+th,td+td{border-left:1px solid var(--border)}tr:last-child td{border-bottom:none}
+th{background:var(--soft);font-weight:600;font-size:12px;color:var(--muted)}
+table.prim td:nth-child(3){width:300px}
+code{font-family:var(--mono);font-size:12.5px;background:var(--soft);border:1px solid var(--border);padding:0 5px;border-radius:5px}
+figure.diagram{margin:14px 0;padding:12px;background:var(--soft);border:1px solid var(--border);border-radius:12px;overflow-x:auto}
+figure.diagram svg{display:block;margin:0 auto;max-width:100%;height:auto}
+figcaption{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+td figure.diagram{margin:0;padding:6px;background:transparent;border:none}
+.sq-life{stroke:var(--border);stroke-width:1.5;stroke-dasharray:4 4}
+.sq-actor{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}
+.sq-actor-text{fill:var(--accent);font-size:13px;font-weight:700}
+.sq-line{stroke:var(--text);stroke-width:1.4;fill:none}.sq-dash{stroke-dasharray:6 4;stroke:var(--muted)}
+.sq-arrowhead{fill:var(--text)}
+.sq-text{fill:var(--text);font-size:12px;font-family:var(--mono)}
+.sq-note{fill:var(--bg);stroke:var(--border);stroke-width:1}.sq-note-warn{fill:var(--warn-soft);stroke:var(--warn)}
+.sq-sep{stroke:var(--border);stroke-dasharray:2 4}.sq-sep-text{fill:var(--muted);font-size:11px}
+.bl-box{stroke:var(--border);stroke-width:1.2;fill:var(--bg)}
+.bl-hdr{fill:#fde8c7}.bl-body{fill:var(--bg)}.bl-int{fill:#dbeafe}.bl-tag{fill:#fce7f3}.bl-len{fill:#fef3c7}.bl-str{fill:#dcfce7}.bl-disc{fill:#ede9fe}.bl-enum{fill:#e0f2fe}.bl-opt{fill:#fce7f3}.bl-seq{fill:#fef3c7}
+@media (prefers-color-scheme:dark){.bl-hdr{fill:#4a3319}.bl-int{fill:#1e3a5f}.bl-tag{fill:#4a1d3a}.bl-len{fill:#4a3a10}.bl-str{fill:#14432a}.bl-disc{fill:#2e2560}.bl-enum{fill:#0f3a52}.bl-opt{fill:#4a1d3a}.bl-seq{fill:#4a3a10}}
+.bl-label{fill:var(--text);font-size:12px;font-family:var(--mono);font-weight:600}.bl-size{fill:var(--muted);font-size:10.5px;font-family:var(--mono)}.bl-sub{fill:var(--muted);font-size:10.5px}
+.hx-wrap{overflow-x:auto;margin:8px 0}
+table.hx{font-family:var(--mono);font-size:12px}table.hx caption{caption-side:top;text-align:left;font-family:inherit;font-size:12.5px;color:var(--muted);padding:6px 4px}
+table.hx td.hx-off{color:var(--muted);text-align:right;width:70px}table.hx td.hx-hex{white-space:nowrap;letter-spacing:.02em}
+tr.hx-disc td.hx-hex{background:#ede9fe}tr.hx-len td.hx-hex{background:#fef3c7}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#dcfce7}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#fce7f3}tr.hx-enum td.hx-hex{background:#e0f2fe}tr.hx-int td.hx-hex{background:#dbeafe}
+@media (prefers-color-scheme:dark){tr.hx-disc td.hx-hex{background:#2e2560}tr.hx-len td.hx-hex{background:#4a3a10}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#14432a}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#4a1d3a}tr.hx-enum td.hx-hex{background:#0f3a52}tr.hx-int td.hx-hex{background:#1e3a5f}}
+details.vec{border:1px solid var(--border);border-radius:10px;padding:6px 12px;margin:8px 0;background:var(--bg)}details.vec summary{cursor:pointer;font-size:13px;color:var(--accent)}
+.callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:0 10px 10px 0;margin:12px 0}.callout.warn{border-color:var(--warn);background:var(--warn-soft)}
+.legend{border:1px solid var(--border);border-radius:10px;padding:10px 14px;background:var(--soft)}.legend ul{margin:6px 0 0;padding-left:20px}
+.chip{display:inline-block;font-family:var(--mono);font-size:11px;padding:0 6px;border-radius:5px;border:1px solid var(--border)}.chip-be{background:#fde8c7;color:#7a4a00}.chip-le{background:#dbeafe;color:#1e3a5f}
+@media print{body{background:#fff;font-size:10.5pt}main{margin:0;padding:0;border:none;max-width:none}nav.toc{display:none}section{page-break-inside:avoid}details.vec{page-break-inside:avoid}details.vec[open]>summary{font-weight:700}figure.diagram{overflow:visible}}
+@media (max-width:720px){main{margin:0;padding:24px 16px;border:none;border-radius:0}}
+
+pre.code{background:var(--soft);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55;margin:10px 0}pre.code code{background:none;border:none;padding:0}
+td.k{white-space:nowrap}.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--border);background:var(--soft);color:var(--muted);margin-left:4px}
+</style></head><body><main>
+<header class="doc"><div class="kind">参照文書</div><h1>設定リファレンス</h1><div class="meta">作成日: 2026-09-03 / 対象: qftp-server、qftp-client、qftp-admin、qftp-web-bridge の設定ファイルとフラグ対応</div></header>
+<nav class='toc'><b>目次</b><ol><li><a href="#precedence">優先順位と読み込み規則</a></li><li><a href="#server">qftp-server: server.toml</a></li><li><a href="#client">qftp-client: config.toml</a></li><li><a href="#admin">qftp-admin / qftp-web-bridge</a></li></ol></nav><section id="precedence"><h2>優先順位と読み込み規則</h2>
+<table class=""><thead><tr><th>プログラム</th><th>既定の設定ファイル</th><th>優先順位(高 → 低)</th></tr></thead><tbody><tr><td>qftp-server</td><td><code>/etc/qftp/server.toml</code>(<code>--config</code> で上書き。ファイルがなければ既定値のみ)</td><td>CLI フラグ &gt; 設定ファイル &gt; 組込既定</td></tr><tr><td>qftp-client</td><td><code>~/.qftp/config.toml</code>(<code>--config</code>)</td><td>CLI フラグ &gt; コマンドライン URL &gt; <code>[host.alias]</code> の明示キー &gt; <code>[host.alias].endpoint</code> &gt; <code>[defaults]</code> &gt; 組込既定</td></tr><tr><td>qftp-admin</td><td><code>/etc/qftp/users.toml</code>、<code>/etc/qftp/tokens.toml</code>(<code>--users</code>、<code>--tokens</code>)</td><td>CLI フラグのみ</td></tr><tr><td>qftp-web-bridge(Phase 7)</td><td><code>/etc/qftp/web-bridge.toml</code></td><td>サーバと同じ</td></tr></tbody></table>
+<table class=""><thead><tr><th>規則</th><th>内容</th></tr></thead><tbody><tr><td>未知キー</td><td>エラー(<code>deny_unknown_fields</code>)。綴り間違いを黙って無視しない</td></tr><tr><td>パス</td><td><code>~/</code> を展開。相対パスは設定ファイルのディレクトリ基準ではなく<strong>プロセスの cwd 基準</strong>(systemd では絶対パスを使う)</td></tr><tr><td>サイズ表記</td><td>整数(バイト)または文字列 <code>&quot;10M&quot;</code>(K / M / G = 10 の累乗、Ki / Mi / Gi = 2 の累乗)</td></tr><tr><td>時間表記</td><td>文字列 <code>&quot;30s&quot;</code>、<code>&quot;5m&quot;</code>、<code>&quot;1h&quot;</code></td></tr><tr><td>環境変数</td><td><code>RUST_LOG</code>(tracing フィルタ、設定の <code>log.level</code> より優先)、<code>HOME</code> / <code>XDG_STATE_HOME</code>(既定パス)。設定値を環境変数で上書きする仕組みは持たない</td></tr><tr><td><code>--check-config</code></td><td>ファイルとフラグを読んで検証し、正規化した有効設定を TOML で stdout に出力して終了(0 = OK、1 = エラー)。秘密は含まない</td></tr></tbody></table>
+</section><section id="server"><h2>qftp-server: server.toml</h2>
+<pre class="code"><code># /etc/qftp/server.toml — 全キーを既定値つきで示す(省略可能)
+bind = &quot;127.0.0.1:4433&quot;          # UDP。必須ではないが本番では 0.0.0.0 / [::] を明示
+root = &quot;/srv/qftp&quot;               # 必須。canonicalize される
+users = &quot;/etc/qftp/users.toml&quot;   # 省略時は anonymous(read-only)のみ
+require_retry = false
+metrics_bind = &quot;127.0.0.1:9090&quot;  # 省略時は無効
+shutdown_timeout = &quot;30s&quot;
+
+[tls]
+cert = &quot;/etc/qftp/server.crt&quot;    # self_signed = false のとき必須
+key = &quot;/etc/qftp/server.key&quot;     # owner-only(0600 / 0400)かつ euid 所有
+client_ca = &quot;/etc/qftp/ca.crt&quot;   # 指定すると mTLS 必須
+self_signed = false
+self_signed_persistent = false   # self_signed = true のときのみ有効
+state_dir = &quot;$XDG_STATE_HOME/qftp/self-signed&quot;
+
+[limits]
+max_connections = 64
+max_connections_per_ip = 8
+initial_rate_rps = 50.0
+initial_rate_burst = 100.0
+request_rate_rps = 50.0
+request_rate_burst = 100.0
+max_file_size = &quot;1Gi&quot;
+blocking_threads = 0             # 0 = CPU 数 × 2
+max_streams_bidi = 4
+idle_timeout = &quot;30s&quot;
+half_open_timeout = &quot;5s&quot;
+ls_page_entries = 10000
+ls_page_bytes = &quot;1Mi&quot;
+
+[log]
+format = &quot;text&quot;                  # &quot;text&quot; | &quot;json&quot;
+level = &quot;info&quot;                   # RUST_LOG が優先</code></pre>
+<table class=""><thead><tr><th>キー</th><th>型</th><th>既定</th><th>検証 / 備考</th><th>対応フラグ</th></tr></thead><tbody><tr><td><code>bind</code></td><td>SocketAddr</td><td><code>127.0.0.1:4433</code></td><td>起動直後に解釈(TLS 生成前)</td><td><code>--bind</code></td></tr><tr><td><code>root</code></td><td>path</td><td>必須</td><td>存在するディレクトリ。canonicalize</td><td><code>--root</code></td></tr><tr><td><code>users</code></td><td>path</td><td>なし</td><td>ファイル形式リファレンス参照。読めなければ起動失敗</td><td><code>--users</code></td></tr><tr><td><code>require_retry</code></td><td>bool</td><td>false</td><td></td><td><code>--require-retry</code></td></tr><tr><td><code>metrics_bind</code></td><td>SocketAddr</td><td>なし</td><td>非 loopback は警告</td><td><code>--metrics-bind</code></td></tr><tr><td><code>shutdown_timeout</code></td><td>duration</td><td>30s</td><td>graceful の上限</td><td><code>--shutdown-timeout</code></td></tr><tr><td><code>tls.cert</code> / <code>tls.key</code></td><td>path</td><td>必須(自己署名でない場合)</td><td>PEM。鍵は group / other ビットなし、euid 所有(root 除く)</td><td><code>--cert</code> / <code>--key</code></td></tr><tr><td><code>tls.client_ca</code></td><td>path</td><td>なし</td><td>PEM バンドル。指定で mTLS 必須</td><td><code>--client-ca</code></td></tr><tr><td><code>tls.self_signed</code></td><td>bool</td><td>false</td><td><code>cert</code> / <code>key</code> と同時指定はエラー(プロトタイプは黙って自己署名を優先していた)</td><td><code>--self-signed</code></td></tr><tr><td><code>tls.self_signed_persistent</code></td><td>bool</td><td>false</td><td><code>self_signed = true</code> が必要</td><td><code>--self-signed-persistent</code></td></tr><tr><td><code>tls.state_dir</code></td><td>path</td><td><code>$XDG_STATE_HOME/qftp/self-signed</code>(なければ <code>~/.local/state/qftp/self-signed</code>)</td><td>0700 で作成</td><td><code>--self-signed-state-dir</code></td></tr><tr><td><code>limits.max_connections</code></td><td>u32 ≥ 1</td><td>64</td><td></td><td><code>--max-connections</code></td></tr><tr><td><code>limits.max_connections_per_ip</code></td><td>u32 ≥ 1</td><td>8</td><td>IPv4 /32、IPv6 /64</td><td><code>--max-connections-per-ip</code></td></tr><tr><td><code>limits.initial_rate_rps</code> / <code>_burst</code></td><td>f64 &gt; 0</td><td>50 / 100</td><td>Initial 用バケット</td><td><code>--initial-rate-rps</code> / <code>--initial-rate-burst</code></td></tr><tr><td><code>limits.request_rate_rps</code> / <code>_burst</code></td><td>f64 &gt; 0</td><td>50 / 100</td><td>要求用バケット</td><td><code>--request-rate-rps</code> / <code>--request-rate-burst</code></td></tr><tr><td><code>limits.max_file_size</code></td><td>size</td><td>1 GiB</td><td>≥ 1</td><td><code>--max-file-size</code></td></tr><tr><td><code>limits.blocking_threads</code></td><td>u32</td><td>0(= CPU × 2)</td><td>tokio <code>max_blocking_threads</code></td><td><code>--blocking-threads</code></td></tr><tr><td><code>limits.max_streams_bidi</code></td><td>u32 ≥ 1</td><td>4</td><td>QUIC transport parameter</td><td><code>--max-streams-bidi</code></td></tr><tr><td><code>limits.idle_timeout</code></td><td>duration</td><td>30s</td><td></td><td><code>--idle-timeout</code></td></tr><tr><td><code>limits.half_open_timeout</code></td><td>duration</td><td>5s</td><td>未確立接続の破棄</td><td><code>--half-open-timeout</code></td></tr><tr><td><code>limits.ls_page_entries</code> / <code>ls_page_bytes</code></td><td>u32 / size</td><td>10000 / 1 MiB</td><td>1 ページの上限(entries ≤ 100000)</td><td><code>--ls-page-entries</code> / <code>--ls-page-bytes</code></td></tr><tr><td><code>log.format</code></td><td>enum</td><td>text</td><td><code>text</code> | <code>json</code></td><td><code>--log-format</code></td></tr><tr><td><code>log.level</code></td><td>string</td><td>info</td><td>tracing の EnvFilter 構文。<code>RUST_LOG</code> が優先</td><td><code>--log-level</code></td></tr></tbody></table>
+</section><section id="client"><h2>qftp-client: config.toml</h2>
+<pre class="code"><code># ~/.qftp/config.toml
+[defaults]
+compress = true
+bwlimit = &quot;0&quot;                      # 0 = 無制限。上下双方向
+tofu = false                       # true で --trust-on-first-use 相当
+tofu_accept_new = false            # 非対話でも初回 pin を自動受理
+zero_rtt = true
+ticket_dir = &quot;~/.qftp/session-tickets&quot;
+known_hosts = &quot;~/.qftp/known_hosts&quot;
+history = &quot;~/.qftp_history&quot;
+fail_fast = true                   # batch / -e
+connect_timeout = &quot;8s&quot;             # アドレスごとのハンドシェイク予算
+
+[host.work]
+endpoint = &quot;qftps://files.work.example:4433/data&quot;   # user@ / :port / /path を含められる
+host = &quot;files.work.example&quot;        # endpoint より優先
+port = 4433
+server_name = &quot;files.work.example&quot; # SNI とホスト名検証
+ca = &quot;~/.qftp/work-ca.pem&quot;
+client_cert = &quot;~/.qftp/work-cert.pem&quot;
+client_key = &quot;~/.qftp/work-key.pem&quot;
+initial_path = &quot;/data&quot;
+insecure = false
+tofu = false
+compress = true
+bwlimit = &quot;10M&quot;</code></pre>
+<table class=""><thead><tr><th>キー</th><th>型</th><th>既定</th><th>備考</th></tr></thead><tbody><tr><td><code>[defaults].compress</code></td><td>bool</td><td>true</td><td><code>--no-compress</code> で false</td></tr><tr><td><code>[defaults].bwlimit</code></td><td>size/s</td><td>0</td><td><code>--bwlimit</code></td></tr><tr><td><code>[defaults].tofu</code> / <code>tofu_accept_new</code></td><td>bool</td><td>false / false</td><td><code>-T</code> / <code>--tofu-accept-new</code></td></tr><tr><td><code>[defaults].zero_rtt</code></td><td>bool</td><td>true</td><td><code>--no-zero-rtt</code> で false</td></tr><tr><td><code>[defaults].ticket_dir</code> / <code>known_hosts</code> / <code>history</code></td><td>path</td><td><code>~/.qftp/…</code></td><td>対応フラグあり</td></tr><tr><td><code>[defaults].fail_fast</code></td><td>bool</td><td>true</td><td><code>--no-fail-fast</code></td></tr><tr><td><code>[defaults].connect_timeout</code></td><td>duration</td><td>8s</td><td>最後のアドレスは QUIC idle に委ねる</td></tr><tr><td><code>[host.*].endpoint</code></td><td>URL</td><td>なし</td><td><code>qftp://</code> / <code>qftps://</code>。パスワード付きは拒否。<code>user@</code> は将来用に保持</td></tr><tr><td><code>[host.*].host</code> / <code>port</code> / <code>server_name</code></td><td>string / u16 / string</td><td>endpoint から</td><td>明示キーが endpoint に勝つ</td></tr><tr><td><code>[host.*].ca</code> / <code>client_cert</code> / <code>client_key</code></td><td>path</td><td>なし</td><td>cert と key は対で必須</td></tr><tr><td><code>[host.*].initial_path</code></td><td>string</td><td>なし</td><td>接続後に <code>Cd</code></td></tr><tr><td><code>[host.*].insecure</code></td><td>bool</td><td>false</td><td>true にできるだけで、CLI から false に戻す手段はない(<code>--insecure</code> は true のみ)</td></tr><tr><td><code>[host.*].tofu</code> / <code>compress</code> / <code>bwlimit</code></td><td></td><td><code>[defaults]</code></td><td>エイリアス単位の上書き</td></tr></tbody></table>
+<p><strong>解決の例</strong>: <code>qftp-client --bwlimit 1M work</code> は、<code>[defaults]</code> → <code>[host.work].endpoint</code>(host / port / server_name / initial_path)→ <code>[host.work]</code> の明示キー → フラグ <code>--bwlimit</code> の順に上書きされ、最終的に <code>bwlimit = 1M</code>、<code>initial_path = /data</code> になります。</p>
+</section><section id="admin"><h2>qftp-admin / qftp-web-bridge</h2>
+<table class=""><thead><tr><th>プログラム</th><th>フラグ</th><th>既定</th></tr></thead><tbody><tr><td>qftp-admin</td><td><code>--users &lt;path&gt;</code></td><td><code>/etc/qftp/users.toml</code></td></tr><tr><td>qftp-admin</td><td><code>--tokens &lt;path&gt;</code></td><td><code>/etc/qftp/tokens.toml</code></td></tr><tr><td>qftp-admin</td><td><code>--mode &lt;octal&gt;</code></td><td>0600(書込後のファイルモード)</td></tr></tbody></table>
+<pre class="code"><code># /etc/qftp/web-bridge.toml(Phase 7)
+bind = &quot;0.0.0.0:4433&quot;
+http_bind = &quot;127.0.0.1:8080&quot;      # 開発用 SPA 配信。省略時は無効
+root = &quot;/srv/qftp&quot;
+users = &quot;/etc/qftp/users.toml&quot;
+tokens = &quot;/etc/qftp/tokens.toml&quot;  # 省略時は anonymous(read-only)のみ
+allowed_origins = [&quot;https://files.example.com&quot;]   # [] = 未設定、[&quot;*&quot;] = 全許可
+
+[tls]
+cert = &quot;/etc/qftp/server.crt&quot;
+key = &quot;/etc/qftp/server.key&quot;
+
+[limits]
+max_sessions = 256
+max_streams_per_session = 64
+auth_timeout = &quot;10s&quot;
+auth_failures_per_ip = 10         # 1 分あたり
+max_file_size = &quot;1Gi&quot;</code></pre>
+</section></main></body></html>

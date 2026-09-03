@@ -1,0 +1,112 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CLI リファレンス</title><style>
+:root{--text:#1b2430;--muted:#5c6b7f;--border:#e3e8ef;--bg:#fff;--soft:#f3f5f9;--page:#e9edf3;--accent:#165e83;--accent-soft:#e3eef4;--warn:#bc4425;--warn-soft:#faeee9;--ok:#2f7d4f;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--max:960px;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--text:#dde5ee;--muted:#8fa0b5;--border:#2a3543;--bg:#151c26;--soft:#1c2532;--page:#0e131a;--accent:#7cb8d9;--accent-soft:#1b3040;--warn:#e8926f;--warn-soft:#33221b;--ok:#7fc79b}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic","Meiryo",system-ui,sans-serif;font-size:14.5px;line-height:1.85;color:var(--text);background:var(--page);counter-reset:sec}
+main{max-width:var(--max);margin:40px auto;padding:48px 56px;background:var(--bg);border:1px solid var(--border);border-radius:14px}
+header.doc{border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:32px}
+header.doc .kind{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.12em;color:var(--accent);background:var(--accent-soft);padding:3px 12px;border-radius:999px;margin-bottom:12px}
+header.doc h1{margin:0;font-size:28px;line-height:1.35}
+header.doc .meta{margin-top:10px;font-size:12px;color:var(--muted)}
+nav.toc{font-size:13px;border:1px solid var(--border);background:var(--soft);border-radius:12px;padding:12px 16px;margin-bottom:32px}
+nav.toc ol{margin:6px 0 0;padding-left:22px}nav.toc a{color:var(--muted);text-decoration:none}nav.toc a:hover{color:var(--accent)}
+@media (min-width:1400px){nav.toc{position:fixed;top:40px;left:max(16px,calc(50% - var(--max)/2 - 260px));width:236px;max-height:calc(100vh - 80px);overflow-y:auto;margin:0;background:transparent;border:none}}
+section{margin:0 0 44px;scroll-margin-top:24px}
+section>h2{counter-increment:sec;display:flex;gap:12px;align-items:baseline;font-size:20px;margin:0 0 16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+section>h2::before{content:counter(sec);font-family:var(--mono);font-size:12.5px;color:var(--accent);background:var(--accent-soft);border-radius:8px;padding:1px 10px}
+h3{font-size:15px;margin:26px 0 8px}
+p{margin:0 0 10px}
+table{border-collapse:separate;border-spacing:0;width:100%;margin:12px 0;font-size:13px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+th,td{border-bottom:1px solid var(--border);padding:7px 11px;text-align:left;vertical-align:top}th+th,td+td{border-left:1px solid var(--border)}tr:last-child td{border-bottom:none}
+th{background:var(--soft);font-weight:600;font-size:12px;color:var(--muted)}
+table.prim td:nth-child(3){width:300px}
+code{font-family:var(--mono);font-size:12.5px;background:var(--soft);border:1px solid var(--border);padding:0 5px;border-radius:5px}
+figure.diagram{margin:14px 0;padding:12px;background:var(--soft);border:1px solid var(--border);border-radius:12px;overflow-x:auto}
+figure.diagram svg{display:block;margin:0 auto;max-width:100%;height:auto}
+figcaption{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+td figure.diagram{margin:0;padding:6px;background:transparent;border:none}
+.sq-life{stroke:var(--border);stroke-width:1.5;stroke-dasharray:4 4}
+.sq-actor{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}
+.sq-actor-text{fill:var(--accent);font-size:13px;font-weight:700}
+.sq-line{stroke:var(--text);stroke-width:1.4;fill:none}.sq-dash{stroke-dasharray:6 4;stroke:var(--muted)}
+.sq-arrowhead{fill:var(--text)}
+.sq-text{fill:var(--text);font-size:12px;font-family:var(--mono)}
+.sq-note{fill:var(--bg);stroke:var(--border);stroke-width:1}.sq-note-warn{fill:var(--warn-soft);stroke:var(--warn)}
+.sq-sep{stroke:var(--border);stroke-dasharray:2 4}.sq-sep-text{fill:var(--muted);font-size:11px}
+.bl-box{stroke:var(--border);stroke-width:1.2;fill:var(--bg)}
+.bl-hdr{fill:#fde8c7}.bl-body{fill:var(--bg)}.bl-int{fill:#dbeafe}.bl-tag{fill:#fce7f3}.bl-len{fill:#fef3c7}.bl-str{fill:#dcfce7}.bl-disc{fill:#ede9fe}.bl-enum{fill:#e0f2fe}.bl-opt{fill:#fce7f3}.bl-seq{fill:#fef3c7}
+@media (prefers-color-scheme:dark){.bl-hdr{fill:#4a3319}.bl-int{fill:#1e3a5f}.bl-tag{fill:#4a1d3a}.bl-len{fill:#4a3a10}.bl-str{fill:#14432a}.bl-disc{fill:#2e2560}.bl-enum{fill:#0f3a52}.bl-opt{fill:#4a1d3a}.bl-seq{fill:#4a3a10}}
+.bl-label{fill:var(--text);font-size:12px;font-family:var(--mono);font-weight:600}.bl-size{fill:var(--muted);font-size:10.5px;font-family:var(--mono)}.bl-sub{fill:var(--muted);font-size:10.5px}
+.hx-wrap{overflow-x:auto;margin:8px 0}
+table.hx{font-family:var(--mono);font-size:12px}table.hx caption{caption-side:top;text-align:left;font-family:inherit;font-size:12.5px;color:var(--muted);padding:6px 4px}
+table.hx td.hx-off{color:var(--muted);text-align:right;width:70px}table.hx td.hx-hex{white-space:nowrap;letter-spacing:.02em}
+tr.hx-disc td.hx-hex{background:#ede9fe}tr.hx-len td.hx-hex{background:#fef3c7}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#dcfce7}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#fce7f3}tr.hx-enum td.hx-hex{background:#e0f2fe}tr.hx-int td.hx-hex{background:#dbeafe}
+@media (prefers-color-scheme:dark){tr.hx-disc td.hx-hex{background:#2e2560}tr.hx-len td.hx-hex{background:#4a3a10}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#14432a}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#4a1d3a}tr.hx-enum td.hx-hex{background:#0f3a52}tr.hx-int td.hx-hex{background:#1e3a5f}}
+details.vec{border:1px solid var(--border);border-radius:10px;padding:6px 12px;margin:8px 0;background:var(--bg)}details.vec summary{cursor:pointer;font-size:13px;color:var(--accent)}
+.callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:0 10px 10px 0;margin:12px 0}.callout.warn{border-color:var(--warn);background:var(--warn-soft)}
+.legend{border:1px solid var(--border);border-radius:10px;padding:10px 14px;background:var(--soft)}.legend ul{margin:6px 0 0;padding-left:20px}
+.chip{display:inline-block;font-family:var(--mono);font-size:11px;padding:0 6px;border-radius:5px;border:1px solid var(--border)}.chip-be{background:#fde8c7;color:#7a4a00}.chip-le{background:#dbeafe;color:#1e3a5f}
+@media print{body{background:#fff;font-size:10.5pt}main{margin:0;padding:0;border:none;max-width:none}nav.toc{display:none}section{page-break-inside:avoid}details.vec{page-break-inside:avoid}details.vec[open]>summary{font-weight:700}figure.diagram{overflow:visible}}
+@media (max-width:720px){main{margin:0;padding:24px 16px;border:none;border-radius:0}}
+
+pre.code{background:var(--soft);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55;margin:10px 0}pre.code code{background:none;border:none;padding:0}
+td.k{white-space:nowrap}.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--border);background:var(--soft);color:var(--muted);margin-left:4px}
+</style></head><body><main>
+<header class="doc"><div class="kind">参照文書</div><h1>CLI リファレンス</h1><div class="meta">作成日: 2026-09-03 / 対象: qftp-server、qftp-client、qftp-admin</div></header>
+<nav class='toc'><b>目次</b><ol><li><a href="#conventions">共通規約</a></li><li><a href="#server">qftp-server</a></li><li><a href="#client-global">qftp-client: 起動形態とグローバルフラグ</a></li><li><a href="#oneshot">qftp-client: one-shot サブコマンド</a></li><li><a href="#repl">qftp-client: REPL コマンド</a></li><li><a href="#output">出力形式</a></li><li><a href="#admin">qftp-admin</a></li></ol></nav><section id="conventions"><h2>共通規約</h2>
+<table class=""><thead><tr><th>規約</th><th>内容</th></tr></thead><tbody><tr><td>出力先</td><td>結果(一覧、統計、<code>--json</code>)は stdout。診断・警告・進捗バーは stderr。進捗バーは stderr が TTY のときだけ</td></tr><tr><td>終了コード</td><td>sysexits 準拠(下表)。すべての経路(REPL / one-shot / batch)で同じ対応</td></tr><tr><td>エラー文言</td><td><code>qftp: &lt;動詞&gt; &lt;対象&gt;: &lt;理由&gt;</code>。理由は <code>ErrorCode</code> の名前と、あれば details(<code>InvalidRange: offset 10 &gt; size 5</code>)。サーバの <code>message</code> は <code>-v</code> のときだけ付記</td></tr><tr><td>リモートパス</td><td><code>qftp://[user@]host[:port]/path</code>、または <code>alias:/path</code>(<code>:</code> 以降省略時は <code>/</code>)。エイリアスは設定ファイルの <code>[host.*]</code></td></tr><tr><td>ローカルパス</td><td>REPL では <code>lcd</code> で変えたローカル cwd 基準。<code>~/</code> 展開。glob は <code>put</code> / <code>mput</code> のローカル引数のみ(クォートで抑止)</td></tr><tr><td>クォート</td><td>REPL 行はシェル風に分割: 空白区切り、<code>'…'</code>、<code>&quot;…&quot;</code>、<code>&#92;</code> エスケープ。<code>!</code> 行は分割せず丸ごとシェルへ</td></tr><tr><td>非 Unix</td><td>起動時に <code>qftp: unsupported platform</code> で終了コード 70(ADR-011)</td></tr></tbody></table>
+<h3>終了コード</h3>
+<table class=""><thead><tr><th>コード</th><th>名前</th><th>いつ</th></tr></thead><tbody><tr><td>0</td><td>OK</td><td>すべて成功</td></tr><tr><td>64</td><td>EX_USAGE</td><td>引数 / URL / 設定ファイルの誤り、未知エイリアス、サーバの <code>Malformed</code></td></tr><tr><td>65</td><td>EX_DATAERR</td><td>転送失敗、サーバの 4xx / 5xx(下記以外)、チェックサム不一致、プロトコルエラー、batch の失敗あり</td></tr><tr><td>69</td><td>EX_UNAVAILABLE</td><td>接続不能(全アドレス失敗、ALPN 不一致、アイドル切断)</td></tr><tr><td>70</td><td>EX_SOFTWARE</td><td>内部エラー、非対応プラットフォーム</td></tr><tr><td>74</td><td>EX_IOERR</td><td>ローカルファイル / 設定書込の I/O エラー</td></tr><tr><td>77</td><td>EX_NOPERM</td><td><code>Unauthorized</code>、<code>PermissionDenied</code>、mTLS 拒否(close 0x101)、TOFU 不一致</td></tr></tbody></table>
+</section><section id="server"><h2>qftp-server</h2>
+<pre class="code"><code>qftp-server [--config &lt;path&gt;] [フラグ…]
+qftp-server --check-config [--config &lt;path&gt;] [フラグ…]
+qftp-server --generate-completions &lt;bash|zsh|fish|powershell&gt;
+qftp-server --version | --long-version</code></pre>
+<p>フラグは設定リファレンスのキーと 1:1 で対応します(例: <code>limits.max_connections</code> → <code>--max-connections</code>)。フラグは設定ファイルの値を上書きします。終了コード: 0 正常終了(シグナルによる graceful を含む)、1 設定 / 起動失敗、2 実行時致命エラー(bind 喪失など)。</p>
+<table class=""><thead><tr><th>シグナル</th><th>動作</th></tr></thead><tbody><tr><td>SIGTERM / SIGINT</td><td>graceful shutdown(新規拒否 → 転送完了待ち → <code>shutdown_timeout</code> で強制)</td></tr><tr><td>SIGHUP</td><td>将来: users.toml 再読込。MVP では無視</td></tr></tbody></table>
+</section><section id="client-global"><h2>qftp-client: 起動形態とグローバルフラグ</h2>
+<pre class="code"><code>qftp-client [フラグ…] [TARGET]                       # REPL(TARGET 省略時は 127.0.0.1:4433)
+qftp-client [フラグ…] -e &quot;&lt;cmd&gt;&quot; [-e &quot;&lt;cmd&gt;&quot;…] TARGET  # コマンド列を実行して終了
+qftp-client [フラグ…] --batch TARGET &lt; script          # stdin から 1 行 1 コマンド(非 TTY なら自動)
+qftp-client [フラグ…] &lt;SUBCOMMAND&gt; …                   # one-shot</code></pre>
+<table class=""><thead><tr><th>フラグ</th><th>引数</th><th>意味</th></tr></thead><tbody><tr><td><code>--config</code></td><td>path</td><td>設定ファイル(既定 <code>~/.qftp/config.toml</code>)</td></tr><tr><td><code>--host</code></td><td>host[:port]</td><td>接続先を上書き(IPv6 は <code>[::1]:4433</code>)</td></tr><tr><td><code>--server-name</code></td><td>name</td><td>SNI とホスト名検証の名前</td></tr><tr><td><code>--ca</code></td><td>path</td><td>CA バンドル。指定時は TOFU 無効</td></tr><tr><td><code>--insecure</code></td><td></td><td>証明書検証なし(開発用)。警告を出す</td></tr><tr><td><code>-T</code>, <code>--trust-on-first-use</code></td><td></td><td>TOFU。初回は対話で確認、非対話では拒否</td></tr><tr><td><code>--tofu-accept-new</code></td><td></td><td>非対話でも初回 pin を自動受理</td></tr><tr><td><code>--known-hosts</code></td><td>path</td><td>既定 <code>~/.qftp/known_hosts</code></td></tr><tr><td><code>--no-zero-rtt</code></td><td></td><td>チケットの再開を使わない(保存もしない)</td></tr><tr><td><code>--session-ticket-dir</code></td><td>path</td><td>既定 <code>~/.qftp/session-tickets</code></td></tr><tr><td><code>--client-cert</code> / <code>--client-key</code></td><td>path</td><td>mTLS(対で必須)</td></tr><tr><td><code>--bwlimit</code></td><td>rate</td><td>上下双方向の帯域上限(<code>1M</code>、<code>512Ki</code>)</td></tr><tr><td><code>--no-compress</code></td><td></td><td>zstd を使わない(Get の accept_encoding を空に、Put を Identity に)</td></tr><tr><td><code>--json</code></td><td></td><td>one-shot の結果を 1 行 JSON で stdout に出す(スキーマは §6)</td></tr><tr><td><code>-q</code> / <code>-v</code>(重ね可)</td><td></td><td>警告のみ / info / debug / trace</td></tr><tr><td><code>-e</code>, <code>--execute</code></td><td>cmd</td><td>REPL コマンドを実行して終了(反復可)</td></tr><tr><td><code>--batch</code></td><td></td><td>stdin から実行</td></tr><tr><td><code>--fail-fast</code> / <code>--no-fail-fast</code></td><td></td><td>batch / -e で最初の失敗で止める(既定 on)</td></tr><tr><td><code>--history</code></td><td>path</td><td>既定 <code>~/.qftp_history</code></td></tr><tr><td><code>--generate-completions</code></td><td>shell</td><td></td></tr></tbody></table>
+</section><section id="oneshot"><h2>qftp-client: one-shot サブコマンド</h2>
+<table class=""><thead><tr><th>サブコマンド</th><th>引数</th><th>オプション</th><th>動作</th></tr></thead><tbody><tr><td><code>ls</code></td><td>REMOTE</td><td><code>-l</code>(詳細)、<code>-a</code>(temp を含めない、常に)</td><td>全ページを取得して表示</td></tr><tr><td><code>stat</code></td><td>REMOTE</td><td></td><td>1 件のメタデータ</td></tr><tr><td><code>get</code></td><td>REMOTE [LOCAL]</td><td><code>-r</code>(Phase 5)、<code>-n/--no-clobber</code>、<code>-f/--force</code>、<code>-i/--interactive</code>、<code>--dry-run</code></td><td>LOCAL 省略時はリモートの basename。既存があれば上書き規則に従い、規則が「再開」なら自動再開</td></tr><tr><td><code>put</code></td><td>LOCAL… REMOTE</td><td>同上</td><td>REMOTE が <code>/</code> で終わる、または LOCAL が複数ならディレクトリ扱い。partial があれば再開</td></tr><tr><td><code>mkdir</code> / <code>rmdir</code> / <code>rm</code></td><td>REMOTE</td><td></td><td></td></tr><tr><td><code>rename</code></td><td>FROM TO</td><td></td><td>同一ホスト(同一 alias または同一 host:port)必須</td></tr><tr><td><code>chmod</code></td><td>MODE REMOTE</td><td></td><td>8 進</td></tr><tr><td><code>quota</code></td><td>REMOTE(ホストのみ)</td><td></td><td></td></tr><tr><td><code>sync</code>(Phase 6)</td><td>LOCAL_DIR REMOTE</td><td><code>--delete</code>、<code>--dry-run</code></td><td>ローカル → リモート一方向。<code>.qftpignore</code>。<code>--checksum</code> はない(ADR-010)</td></tr><tr><td><code>watch</code>(Phase 6)</td><td>LOCAL_DIR REMOTE</td><td><code>--debounce &lt;dur&gt;</code></td><td>変更を反映(Mkdir を含む)。再接続バックオフ 1→30 s</td></tr></tbody></table>
+<h3>上書き規則(get / put 共通)</h3>
+<table class=""><thead><tr><th>指定</th><th>既存ローカル(get)/ 既存リモート(put)</th><th>動作</th></tr></thead><tbody><tr><td><code>-n</code></td><td>あり</td><td>スキップ(終了コード 0、stderr に skipped)。put は <code>no_clobber=true</code> をワイヤにも載せる</td></tr><tr><td><code>-f</code></td><td>あり</td><td>0 から上書き(get はローカル削除、put は offset 0)</td></tr><tr><td><code>-i</code> または TTY</td><td>あり</td><td><code>overwrite / resume / skip?</code> を尋ねる。resume は長さが小さいときのみ提示</td></tr><tr><td>指定なし・非 TTY</td><td>あり</td><td>再開(get: ローカル長から、put: partial から)。再開できない(既存が完全 / 同サイズ)ならスキップ</td></tr><tr><td>任意</td><td>なし</td><td>転送</td></tr></tbody></table>
+</section><section id="repl"><h2>qftp-client: REPL コマンド</h2>
+<table class=""><thead><tr><th>コマンド</th><th>構文</th><th>動作</th></tr></thead><tbody><tr><td><code>ls</code> / <code>dir</code></td><td><code>ls [-l] [path]</code></td><td>全ページ取得。<code>-l</code> で mode / uid / gid / mtime を表示</td></tr><tr><td><code>cd</code></td><td><code>cd [path]</code></td><td>省略は <code>/</code></td></tr><tr><td><code>pwd</code></td><td></td><td>仮想絶対パス</td></tr><tr><td><code>get</code></td><td><code>get [-r] [-n|-f] &lt;remote&gt; [local]</code></td><td>one-shot と同じ規則。既定は確認(TTY)</td></tr><tr><td><code>put</code> / <code>mput</code></td><td><code>put [-r] [-n|-f] &lt;local-glob&gt;… [remote]</code></td><td>複数一致時は remote をディレクトリ扱い(1 つの remote ファイルへ順に上書きしない)</td></tr><tr><td><code>mget</code></td><td><code>mget &lt;remote-glob&gt; [local-dir]</code></td><td>glob は最後の要素のみ。ディレクトリはスキップ</td></tr><tr><td><code>mkdir</code> / <code>rmdir</code> / <code>rm</code> / <code>delete</code></td><td><code>&lt;path&gt;</code></td><td></td></tr><tr><td><code>rename</code> / <code>mv</code></td><td><code>&lt;from&gt; &lt;to&gt;</code></td><td></td></tr><tr><td><code>chmod</code></td><td><code>&lt;octal&gt; &lt;path&gt;</code></td><td></td></tr><tr><td><code>stat</code></td><td><code>&lt;path&gt;</code></td><td></td></tr><tr><td><code>quota</code></td><td></td><td></td></tr><tr><td><code>lcd</code> / <code>lpwd</code> / <code>lls</code> / <code>lmkdir</code></td><td></td><td>ローカル側(プロセスの cwd は変えない)</td></tr><tr><td><code>!</code></td><td><code>!cmd…</code> / <code>!</code></td><td><code>$SHELL -c</code>(ローカル cwd で)。単独 <code>!</code> は対話シェル</td></tr><tr><td><code>stats</code></td><td></td><td>セッション統計(上下バイト、ファイル数、失敗数、平均速度)</td></tr><tr><td><code>help</code> / <code>?</code></td><td>[cmd]</td><td></td></tr><tr><td><code>quit</code> / <code>exit</code></td><td></td><td><code>Quit</code> を送って終了</td></tr></tbody></table>
+<p>未知コマンドと引数不足は stderr に使い方を出し、REPL では続行、batch / <code>-e</code> では <code>fail_fast</code> に従います。転送中の Ctrl-C は現在のストリームを reset して <code>Quit</code> を送り、65 で終了します。</p>
+</section><section id="output"><h2>出力形式</h2>
+<h3>ls(既定)</h3>
+<pre class="code"><code>-rw-r--r--   1024  2026-09-03 12:34  report.pdf
+drwxr-xr-x      -  2026-09-03 12:00  docs/
+lrwxrwxrwx      -  2026-09-03 12:00  link -&gt; (symlink)</code></pre>
+<p>列: mode(FileType を先頭 1 文字に反映)、サイズ(ディレクトリは <code>-</code>)、mtime(ローカル時刻、<code>YYYY-MM-DD HH:MM</code>)、名前(ディレクトリは <code>/</code> 付き)。<code>-l</code> で uid / gid とナノ秒を追加。エントリ名は端末エスケープを除去してから表示。</p>
+<h3>stat</h3>
+<pre class="code"><code>  path:  /docs/report.pdf
+  type:  regular
+  size:  1024
+  mode:  0644
+ mtime:  2026-09-03T12:34:56.123456789Z
+   uid:  1000   gid: 1000</code></pre>
+<h3>--json(one-shot)</h3>
+<table class=""><thead><tr><th>サブコマンド</th><th>出力(1 行)</th></tr></thead><tbody><tr><td>ls</td><td><code>{"entries":[{"name":"a","type":"regular","size":1,"mtime":"…","mode":420,"uid":0,"gid":0}],"truncated":false}</code></td></tr><tr><td>stat</td><td><code>{"type":"regular","size":1024,"mtime":"…","mode":420,"uid":0,"gid":0}</code></td></tr><tr><td>get / put</td><td><code>{"ok":true,"bytes":1024,"resumed_from":0,"encoding":"zstd","verified":true,"seconds":0.42}</code></td></tr><tr><td>quota</td><td><code>{"used_bytes":1,"file_count":2,"limit_bytes":null}</code></td></tr><tr><td>失敗時(全共通)</td><td><code>{"ok":false,"code":404,"error":"NotFound","details":null,"exit":65}</code></td></tr></tbody></table>
+<h3>ErrorCode → 終了コード</h3>
+<table class=""><thead><tr><th>ErrorCode</th><th>終了コード</th></tr></thead><tbody><tr><td>Malformed</td><td>64</td></tr><tr><td>Unauthorized、PermissionDenied</td><td>77</td></tr><tr><td>NotFound、Unsupported、AlreadyExists、FileTooLarge、InvalidRange、NotADirectory、IsADirectory、ChecksumMismatch、UploadOverflow、UploadTruncated、QuotaExceeded、DecodeError</td><td>65</td></tr><tr><td>RateLimited(再試行後も失敗)</td><td>65</td></tr><tr><td>Internal、Unknown(5xx)</td><td>65</td></tr><tr><td>Unknown(4xx)</td><td>65</td></tr></tbody></table>
+</section><section id="admin"><h2>qftp-admin</h2>
+<pre class="code"><code>qftp-admin [--users &lt;path&gt;] [--tokens &lt;path&gt;] [--mode &lt;octal&gt;] &lt;SUBCOMMAND&gt;
+  init-users
+  add-user &lt;name&gt; [--home &lt;path&gt;] [--read=&lt;bool&gt;] [--write] [--delete] [--mkdir] [--rmdir] [--rename] [--chmod] [--quota &lt;size&gt;]
+  remove-user &lt;name&gt;
+  list-users [--json]
+  set-permissions &lt;name&gt; [--read &lt;bool&gt;] … [--chmod &lt;bool&gt;]
+  set-quota &lt;name&gt; (--bytes &lt;size&gt; | --unlimited)
+  set-anonymous (--home &lt;path&gt; [--read=&lt;bool&gt;] … | --remove)
+  token add &lt;user&gt; [--label &lt;text&gt;]        # 平文トークンを 1 回だけ stdout に出す
+  token revoke (&lt;label&gt; | --user &lt;user&gt; --all)
+  token list [--json]
+  check                                     # 両ファイルをサーバと同じ検証器で検証
+  generate-completions &lt;shell&gt;</code></pre>
+<p>終了コード: 0 / 64 usage / 65 検証失敗(重複、未知ユーザ、home の入れ子など)/ 74 I/O。書込は同一ディレクトリの temp に書いて fsync し rename、モードは <code>--mode</code>(既定 0600)。</p>
+</section></main></body></html>

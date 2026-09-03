@@ -1,27 +1,27 @@
 # 新リポジトリのレイアウト案
 
-## クレート構成(8 クレート)
+## クレート構成(7 クレート)
 
 | # | クレート | 種別 | 役割 | 依存(qftp 内) |
 |---|---|---|---|---|
 | 1 | `qftp-wire` | lib | ワイヤ型、手書き codec、フィールド検証、定数。`tests/conformance.rs` でゴールデンベクタを検証し、`examples/gen_vectors.rs` でベクタを再生成する | なし |
 | 2 | `qftp-core` | lib | パスサンドボックス、ユーザ / ACL / クォータ、identity 抽出、メタデータ操作(Ls ページング)、sans-I/O 転送エンジン、zstd、temp 名規則、掃除 | wire |
 | 3 | `qftp-quic` | lib | quiche 設定、TLS モード、stateless retry、SCID 導出、0-RTT ポリシー、tokio(current_thread)上の quiche ドライバ、quiche ストリーム上のフレーム送受信、GSO、接続上限・レートバケット | wire |
-| 4 | `qftp-server` | lib + bin | 設定、受付、コネクション / ストリーム dispatch、転送エンジンのホスト(ファイル I/O は `spawn_blocking`)、メトリクス、シャットダウン。`run(config)` を公開 | core, quic |
+| 4 | `qftp-server` | lib + bin | 設定、受付、コネクション / ストリーム dispatch、転送エンジンのホスト(ファイル I/O は `spawn_blocking`)、メトリクス、シャットダウン。`run(config)` を公開。`test-util` feature でプロセス内フィクスチャを公開し、`tests/` に e2e、`benches/` に criterion ベンチ(`test = false`)を置く(ADR-007) | core, quic(dev: client-core, rcgen, criterion) |
 | 5 | `qftp-client-core` | lib | Session API、サーバ信頼ポリシー(CA / TOFU / insecure)、セッションチケット、設定解決、再開ロジック、クライアント側エンジンのホスト | core, quic |
 | 6 | `qftp-client` | bin | CLI、REPL、one-shot、出力整形と終了コード。Phase 6: sync / watch | client-core |
 | 7 | `qftp-admin` | bin | users.toml / tokens.toml 編集 | core |
-| 8 | `qftp-e2e` | lib + tests + benches(`publish = false`) | プロセス内フィクスチャ(lib)、e2e テスト(`tests/`)、criterion ベンチ(`benches/`、`test = false` で `cargo test` から除外) | server, client-core |
 
-補助: `fuzz/`(cargo-fuzz、ワークスペース内、`publish = false`。stable では `cargo check` のみ)。Phase 7 で `qftp-web-bridge`(bin)を 9 番目として追加する。
+補助: `fuzz/`(cargo-fuzz、ワークスペース内、`publish = false`。stable では `cargo check` のみ)。Phase 7 で `qftp-web-bridge`(bin、自クレートの `tests/` に e2e)を 8 番目として追加する。
 
 ### 統合した(作らない)クレート
 
 | 当初案 | 統合先 | 理由 |
 |---|---|---|
 | `qftp-conformance` | `qftp-wire` の `tests/` と `examples/` | 依存が wire だけで、ベクタ検証は wire のテストそのもの。examples は dev-dependencies(serde_json)を使えるので生成バイナリも置ける |
-| `qftp-testkit` | `qftp-e2e` の lib | フィクスチャの利用者は e2e とベンチだけ |
-| `qftp-bench` | `qftp-e2e` の `benches/` | 同じフィクスチャを使う。`cargo test` から除外する設定を 1 箇所で管理できる |
+| `qftp-testkit` | `qftp-server` の `test-util` feature | フィクスチャの利用者は server の tests と benches だけ |
+| `qftp-bench` | `qftp-server` の `benches/` | 同じフィクスチャを使う。`[[bench]] test = false` で `cargo test` から除外 |
+| `qftp-e2e` | `qftp-server` の `tests/` | 結合テストは対象クレートの `tests/` に置く慣習に従う(ADR-007)。3 バイナリ以上を跨ぐ・フィクスチャが数千行になった時点で再検討 |
 
 ### 分けたままにするクレート
 
@@ -56,17 +56,16 @@ qftp/
 │   ├── qftp-quic/
 │   │   └── src/{lib,config,tls,retry,scid,zero_rtt,driver,framing,egress,limits}.rs
 │   ├── qftp-server/
-│   │   └── src/{lib,main,config,accept,connection,dispatch,host,metrics,health,shutdown}.rs
+│   │   ├── src/{lib,main,config,accept,connection,dispatch,host,metrics,health,shutdown}.rs
+│   │   ├── src/test_util/{mod,fixture,certs,fs}.rs   # feature = "test-util"
+│   │   ├── tests/*.rs                                # e2e(client-core を dev-dependency)
+│   │   └── benches/throughput.rs                    # harness = false, test = false
 │   ├── qftp-client-core/
 │   │   └── src/{lib,session,trust,tickets,config,resume,host,options}.rs
 │   ├── qftp-client/
 │   │   └── src/{main,cli,oneshot,output}.rs  src/repl/{mod,parser,commands,completer}.rs
-│   ├── qftp-admin/
-│   │   └── src/main.rs
-│   └── qftp-e2e/
-│       ├── src/{lib,server_fixture,client,certs,fs}.rs
-│       ├── tests/*.rs
-│       └── benches/throughput.rs
+│   └── qftp-admin/
+│       └── src/main.rs
 ├── fuzz/
 ├── examples/
 │   ├── systemd/qftp-server.service
@@ -79,11 +78,9 @@ qftp/
 ## 依存方向(上位 → 下位のみ)
 
 ```
-qftp-wire ◀── qftp-core ◀──┬── qftp-server ◀──────────┐
-    ▲            ▲         │                          ├── qftp-e2e
-    └── qftp-quic ◀────────┴── qftp-client-core ◀─────┘
-                                     ▲
-                                     └── qftp-client
+qftp-wire ◀── qftp-core ◀──┬── qftp-server (tests/ は dev-dep で client-core を使う)
+    ▲            ▲         │
+    └── qftp-quic ◀────────┴── qftp-client-core ◀── qftp-client
 qftp-core ◀── qftp-admin
 qftp-wire, qftp-core ◀── fuzz
 ```
@@ -95,6 +92,7 @@ qftp-wire, qftp-core ◀── fuzz
 - `qftp-quic` はファイルシステムを知らない。
 - tokio はネイティブ側では `current_thread` ランタイムで使い、接続状態を複数スレッドで共有しない。
 - バイナリの `main` は「設定を読む → ライブラリの `run` を呼ぶ」だけにする。
+- 非 Unix では起動時に明示的にエラー終了する(ADR-011)。
 
 ## モジュール骨子
 
@@ -106,15 +104,15 @@ qftp-wire, qftp-core ◀── fuzz
 | `qftp-server` | `config`、`accept`、`connection`、`dispatch`、`host`、`metrics`、`health`、`shutdown` |
 | `qftp-client-core` | `session`、`trust`、`tickets`、`config`、`resume`、`host`、`options` |
 | `qftp-client` | `cli`、`repl::{parser, commands, completer}`、`oneshot`、`output`、Phase 6: `sync`、`watch` |
-| `qftp-e2e` | `server_fixture`(プロセス内 `run`)、`client`(Session ラッパ)、`certs`(rcgen)、`fs`(一時ディレクトリ、乱数ファイル) |
+| `qftp-server::test_util`(feature) | `fixture`(プロセス内 `run`、ポート自動割当、停止)、`certs`(rcgen: CA / サーバ / クライアント)、`fs`(一時ディレクトリ、乱数ファイル、破損 partial) |
 
 ## CI 構成
 
-- `check`: fmt、clippy `-D warnings`、build、`cargo test --workspace`(ベンチは `test = false` で除外)、`cargo run -p qftp-wire --example gen-vectors -- spec/test-vectors` → `git diff --exit-code`。
+- `check`: fmt、clippy `-D warnings`、build、`cargo test --workspace`(e2e は `qftp-server/tests` として実行、ベンチは `test = false` で除外)、`cargo run -p qftp-wire --example gen-vectors -- spec/test-vectors` → `git diff --exit-code`。
 - `msrv`: 宣言 MSRV での build + test。
 - `cross`: aarch64-unknown-linux-gnu の build。
 - `macos`: build + test。
 - `deny`: advisories / licenses / sources / bans。
 - `fuzz-check`: stable で `cargo check -p qftp-fuzz`。
 - `fuzz`(定期、nightly): 各ターゲット 180 s、corpus キャッシュ。
-- `release`(タグ): test → 4 ターゲット tarball + sha256 → deb → GitHub Release。
+- `release`(タグ): 手書き workflow(ADR-013)。test → 4 ターゲット tarball + sha256 → deb → GitHub Release。

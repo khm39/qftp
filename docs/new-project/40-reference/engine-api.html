@@ -1,0 +1,257 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>転送エンジン API 仕様</title><style>
+:root{--text:#1b2430;--muted:#5c6b7f;--border:#e3e8ef;--bg:#fff;--soft:#f3f5f9;--page:#e9edf3;--accent:#165e83;--accent-soft:#e3eef4;--warn:#bc4425;--warn-soft:#faeee9;--ok:#2f7d4f;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--max:960px;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--text:#dde5ee;--muted:#8fa0b5;--border:#2a3543;--bg:#151c26;--soft:#1c2532;--page:#0e131a;--accent:#7cb8d9;--accent-soft:#1b3040;--warn:#e8926f;--warn-soft:#33221b;--ok:#7fc79b}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic","Meiryo",system-ui,sans-serif;font-size:14.5px;line-height:1.85;color:var(--text);background:var(--page);counter-reset:sec}
+main{max-width:var(--max);margin:40px auto;padding:48px 56px;background:var(--bg);border:1px solid var(--border);border-radius:14px}
+header.doc{border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:32px}
+header.doc .kind{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.12em;color:var(--accent);background:var(--accent-soft);padding:3px 12px;border-radius:999px;margin-bottom:12px}
+header.doc h1{margin:0;font-size:28px;line-height:1.35}
+header.doc .meta{margin-top:10px;font-size:12px;color:var(--muted)}
+nav.toc{font-size:13px;border:1px solid var(--border);background:var(--soft);border-radius:12px;padding:12px 16px;margin-bottom:32px}
+nav.toc ol{margin:6px 0 0;padding-left:22px}nav.toc a{color:var(--muted);text-decoration:none}nav.toc a:hover{color:var(--accent)}
+@media (min-width:1400px){nav.toc{position:fixed;top:40px;left:max(16px,calc(50% - var(--max)/2 - 260px));width:236px;max-height:calc(100vh - 80px);overflow-y:auto;margin:0;background:transparent;border:none}}
+section{margin:0 0 44px;scroll-margin-top:24px}
+section>h2{counter-increment:sec;display:flex;gap:12px;align-items:baseline;font-size:20px;margin:0 0 16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+section>h2::before{content:counter(sec);font-family:var(--mono);font-size:12.5px;color:var(--accent);background:var(--accent-soft);border-radius:8px;padding:1px 10px}
+h3{font-size:15px;margin:26px 0 8px}
+p{margin:0 0 10px}
+table{border-collapse:separate;border-spacing:0;width:100%;margin:12px 0;font-size:13px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+th,td{border-bottom:1px solid var(--border);padding:7px 11px;text-align:left;vertical-align:top}th+th,td+td{border-left:1px solid var(--border)}tr:last-child td{border-bottom:none}
+th{background:var(--soft);font-weight:600;font-size:12px;color:var(--muted)}
+table.prim td:nth-child(3){width:300px}
+code{font-family:var(--mono);font-size:12.5px;background:var(--soft);border:1px solid var(--border);padding:0 5px;border-radius:5px}
+figure.diagram{margin:14px 0;padding:12px;background:var(--soft);border:1px solid var(--border);border-radius:12px;overflow-x:auto}
+figure.diagram svg{display:block;margin:0 auto;max-width:100%;height:auto}
+figcaption{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+td figure.diagram{margin:0;padding:6px;background:transparent;border:none}
+.sq-life{stroke:var(--border);stroke-width:1.5;stroke-dasharray:4 4}
+.sq-actor{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}
+.sq-actor-text{fill:var(--accent);font-size:13px;font-weight:700}
+.sq-line{stroke:var(--text);stroke-width:1.4;fill:none}.sq-dash{stroke-dasharray:6 4;stroke:var(--muted)}
+.sq-arrowhead{fill:var(--text)}
+.sq-text{fill:var(--text);font-size:12px;font-family:var(--mono)}
+.sq-note{fill:var(--bg);stroke:var(--border);stroke-width:1}.sq-note-warn{fill:var(--warn-soft);stroke:var(--warn)}
+.sq-sep{stroke:var(--border);stroke-dasharray:2 4}.sq-sep-text{fill:var(--muted);font-size:11px}
+.bl-box{stroke:var(--border);stroke-width:1.2;fill:var(--bg)}
+.bl-hdr{fill:#fde8c7}.bl-body{fill:var(--bg)}.bl-int{fill:#dbeafe}.bl-tag{fill:#fce7f3}.bl-len{fill:#fef3c7}.bl-str{fill:#dcfce7}.bl-disc{fill:#ede9fe}.bl-enum{fill:#e0f2fe}.bl-opt{fill:#fce7f3}.bl-seq{fill:#fef3c7}
+@media (prefers-color-scheme:dark){.bl-hdr{fill:#4a3319}.bl-int{fill:#1e3a5f}.bl-tag{fill:#4a1d3a}.bl-len{fill:#4a3a10}.bl-str{fill:#14432a}.bl-disc{fill:#2e2560}.bl-enum{fill:#0f3a52}.bl-opt{fill:#4a1d3a}.bl-seq{fill:#4a3a10}}
+.bl-label{fill:var(--text);font-size:12px;font-family:var(--mono);font-weight:600}.bl-size{fill:var(--muted);font-size:10.5px;font-family:var(--mono)}.bl-sub{fill:var(--muted);font-size:10.5px}
+.hx-wrap{overflow-x:auto;margin:8px 0}
+table.hx{font-family:var(--mono);font-size:12px}table.hx caption{caption-side:top;text-align:left;font-family:inherit;font-size:12.5px;color:var(--muted);padding:6px 4px}
+table.hx td.hx-off{color:var(--muted);text-align:right;width:70px}table.hx td.hx-hex{white-space:nowrap;letter-spacing:.02em}
+tr.hx-disc td.hx-hex{background:#ede9fe}tr.hx-len td.hx-hex{background:#fef3c7}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#dcfce7}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#fce7f3}tr.hx-enum td.hx-hex{background:#e0f2fe}tr.hx-int td.hx-hex{background:#dbeafe}
+@media (prefers-color-scheme:dark){tr.hx-disc td.hx-hex{background:#2e2560}tr.hx-len td.hx-hex{background:#4a3a10}tr.hx-str td.hx-hex,tr.hx-bytes td.hx-hex{background:#14432a}tr.hx-tag td.hx-hex,tr.hx-bool td.hx-hex{background:#4a1d3a}tr.hx-enum td.hx-hex{background:#0f3a52}tr.hx-int td.hx-hex{background:#1e3a5f}}
+details.vec{border:1px solid var(--border);border-radius:10px;padding:6px 12px;margin:8px 0;background:var(--bg)}details.vec summary{cursor:pointer;font-size:13px;color:var(--accent)}
+.callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:0 10px 10px 0;margin:12px 0}.callout.warn{border-color:var(--warn);background:var(--warn-soft)}
+.legend{border:1px solid var(--border);border-radius:10px;padding:10px 14px;background:var(--soft)}.legend ul{margin:6px 0 0;padding-left:20px}
+.chip{display:inline-block;font-family:var(--mono);font-size:11px;padding:0 6px;border-radius:5px;border:1px solid var(--border)}.chip-be{background:#fde8c7;color:#7a4a00}.chip-le{background:#dbeafe;color:#1e3a5f}
+@media print{body{background:#fff;font-size:10.5pt}main{margin:0;padding:0;border:none;max-width:none}nav.toc{display:none}section{page-break-inside:avoid}details.vec{page-break-inside:avoid}details.vec[open]>summary{font-weight:700}figure.diagram{overflow:visible}}
+@media (max-width:720px){main{margin:0;padding:24px 16px;border:none;border-radius:0}}
+
+pre.code{background:var(--soft);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55;margin:10px 0}pre.code code{background:none;border:none;padding:0}
+td.k{white-space:nowrap}.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--border);background:var(--soft);color:var(--muted);margin-left:4px}
+</style></head><body><main>
+<header class="doc"><div class="kind">参照文書</div><h1>転送エンジン API 仕様</h1><div class="meta">作成日: 2026-09-03 / 対象: qftp-core::transfer / 前提: 機能設計書「転送エンジン」、ADR-002 / ADR-005 / ADR-009</div></header>
+<nav class='toc'><b>目次</b><ol><li><a href="#scope">位置づけと設計原則</a></li><li><a href="#types">共通の型</a></li><li><a href="#get-server">GetServer</a></li><li><a href="#put-server">PutServer</a></li><li><a href="#client">GetClient / PutClient</a></li><li><a href="#host">ホスト契約</a></li></ol></nav><section id="scope"><h2>位置づけと設計原則</h2>
+<p><code>qftp-core::transfer</code> の公開 API を定義します。機能設計書(転送エンジン)の規則を型と契約に落としたもので、実装は本書の型名・意味に従います。名前の変更は本書の改訂を伴います。</p>
+<table class=""><thead><tr><th>原則</th><th>内容</th></tr></thead><tbody><tr><td>sans-I/O</td><td>エンジンはソケット・ファイル・時計に触れない。入力は <code>Event</code>、出力は <code>Vec&lt;Cmd&gt;</code> のみ</td></tr><tr><td>決定的</td><td>同じ Event 列には同じ Cmd 列を返す。乱数・時刻を使わない(テストはスクリプトで再現できる)</td></tr><tr><td>単一所有</td><td>1 エンジン = 1 ストリーム = 1 転送。<code>Send + 'static</code> だが内部同期なし。ホストが逐次に呼ぶ</td></tr><tr><td>宣言サイズを信用しない</td><td><code>size</code> / <code>plaintext_size</code> は事前拒否にだけ使い、バッファ確保には使わない。バッファはチャンク単位</td></tr><tr><td>会計はコマンドで</td><td>クォータの増減は <code>Cmd::Account</code> で通知し、ホストが <code>User</code> に反映する。エンジンは共有状態を持たない</td></tr></tbody></table>
+</section><section id="types"><h2>共通の型</h2>
+<pre class="code"><code>use bytes::Bytes;
+use qftp_wire::{Encoding, ErrorResponse, HashAlgorithm, Response};
+
+/// ファイル I/O 要求の相関 ID。エンジンが採番し、完了イベントで返る。
+pub type IoId = u32;
+
+/// ホスト → エンジン
+pub enum Event {
+    /// ストリームから受信した本体 / トレーラのバイト列(空は禁止)
+    Bytes(Bytes),
+    /// ピアが FIN を送った(Bytes より後に 1 回だけ)
+    Fin,
+    /// 送信可能バイト数の「現在値」(差分ではない)。増減のたびに通知
+    SendCapacity(usize),
+    /// ReadFile の完了。data.len() &lt; 要求 len は EOF を意味する
+    ReadDone { id: IoId, data: Bytes },
+    ReadFailed { id: IoId, error: IoError },
+    WriteDone { id: IoId },
+    WriteFailed { id: IoId, error: IoError },
+    CommitDone,
+    CommitFailed(IoError),
+    /// 接続断・シャットダウン。以後ホストは他の Event を送らない
+    Cancel,
+}
+
+/// エンジン → ホスト
+pub enum Cmd {
+    /// 制御フレームを送る(FileReady / Ok / Err)。FIN は立てない
+    Respond(Response),
+    /// 本体またはトレーラを送る。fin は最後のバイトに立てる
+    Send { data: Bytes, fin: bool },
+    /// 本体送出後に失敗した Get の通知(アプリケーションエラーコード)
+    ResetStream(u64),
+    /// pos から最大 len バイト読む
+    ReadFile { id: IoId, pos: u64, len: usize },
+    /// 現在位置に追記する(順序はエンジンが保証)
+    WriteFile { id: IoId, data: Bytes },
+    /// temp を final に原子的に rename し、mode を適用する
+    Commit { mode: u32 },
+    /// 後始末。keep_partial = true は再開用に temp を残す
+    Abort { keep_partial: bool },
+    /// クォータ会計(ホストが User に反映)
+    Account(Accounting),
+    /// 終了。以後エンジンは Event を受け付けない
+    Done(Outcome),
+}
+
+pub struct Accounting {
+    /// in_flight から解放する予約バイト
+    pub release_reserved: u64,
+    /// used_bytes に加算(正)または減算(負)
+    pub used_delta: i64,
+    /// file_count の増減
+    pub file_delta: i32,
+}
+
+pub enum Outcome {
+    Completed { plaintext_bytes: u64 },
+    Failed(ErrorResponse),
+    Cancelled,
+}
+
+/// io::ErrorKind の写し。エンジンは種類だけ見る(NotFound / PermissionDenied / StorageFull / Other)
+pub enum IoError { NotFound, PermissionDenied, StorageFull, Other }
+
+/// 共通の実装定義パラメータ
+pub struct Limits {
+    pub max_file_size: u64,      // 既定 1 GiB
+    pub read_chunk: usize,       // 既定 256 KiB
+    pub write_chunk: usize,      // 既定 64 KiB
+    pub max_inflight_writes: u32,// 既定 4
+    pub zstd_level: i32,         // 既定 3(送信側のみ)
+}</code></pre>
+<p>ストリームのアプリケーションエラーコード(<code>ResetStream</code>)は実装定義で、参照実装は <code>0x51</code>(読み取り失敗)、<code>0x52</code>(サーバ側ファイル縮小)、<code>0x53</code>(取り消し)を使います。</p>
+</section><section id="get-server"><h2>GetServer</h2>
+<pre class="code"><code>pub struct GetParams {
+    pub offset: u64,
+    pub length: Option&lt;u64&gt;,
+    pub accept_encoding: Vec&lt;Encoding&gt;,
+    /// ホストが open + fstat 済み(regular file であること)
+    pub file_len: u64,
+    /// 送信側ポリシー(拡張子ヒューリスティク等)。false なら Identity
+    pub compressible: bool,
+    pub limits: Limits,
+}
+
+pub struct GetServer { /* 非公開 */ }
+
+impl GetServer {
+    /// 検証に失敗した場合は Err(ErrorResponse)。ホストは Respond(Err) を送り、ストリームを閉じる。
+    /// 成功時の Vec&lt;Cmd&gt; は [Respond(FileReady), ReadFile{..}] から始まる。
+    pub fn start(p: GetParams) -&gt; Result&lt;(GetServer, Vec&lt;Cmd&gt;), ErrorResponse&gt;;
+    pub fn on_event(&amp;mut self, ev: Event) -&gt; Vec&lt;Cmd&gt;;
+    pub fn state(&amp;self) -&gt; GetState;
+}
+
+pub enum GetState { Prefix, Body, Trailer, Done, Failed }</code></pre>
+<h3>開始時の検証(順序どおり)</h3>
+<table class=""><thead><tr><th>条件</th><th>結果</th></tr></thead><tbody><tr><td><code>file_len &gt; limits.max_file_size</code></td><td><code>FileTooLarge</code></td></tr><tr><td><code>offset &gt; file_len</code></td><td><code>InvalidRange</code> + <code>Range { offset, file_size }</code></td></tr><tr><td><code>bytes = min(length, file_len - offset)</code></td><td>本体長。<code>length</code> 未指定は EOF まで</td></tr><tr><td><code>encoding</code></td><td><code>compressible &amp;&amp; bytes ≥ 1024 &amp;&amp; accept_encoding.contains(Zstd)</code> なら Zstd、それ以外 Identity</td></tr><tr><td>FileReady</td><td><code>size = bytes</code>、<code>total_size = file_len</code>、<code>checksum_follows = true</code>(常に)、<code>plaintext_size = bytes</code>(Zstd)/ 0(Identity)</td></tr></tbody></table>
+<h3>状態表</h3>
+<table class=""><thead><tr><th>状態</th><th>受け付ける Event</th><th>動作 / 発行する Cmd</th><th>遷移</th></tr></thead><tbody><tr><td>Prefix(offset &gt; 0)</td><td>ReadDone</td><td>データをハッシュに畳む。残りがあれば次の ReadFile、なければ Body へ(初回の本体 ReadFile を発行)</td><td>Prefix / Body</td></tr><tr><td>Prefix</td><td>ReadDone が短い(EOF)</td><td>ファイル縮小。<code>Respond(Err InvalidRange)</code>、<code>Done(Failed)</code></td><td>Failed</td></tr><tr><td>Body</td><td>ReadDone</td><td>ハッシュ更新 → (Zstd なら符号化) → 送信待ちバッファへ。SendCapacity の範囲で <code>Send</code>。バッファが read_chunk 未満なら次の ReadFile</td><td>Body / Trailer</td></tr><tr><td>Body</td><td>SendCapacity(n)</td><td>待ちバッファから n バイトまで <code>Send</code></td><td></td></tr><tr><td>Body</td><td>ReadDone が短い</td><td>ファイル縮小。<code>ResetStream(0x52)</code>、<code>Done(Failed)</code></td><td>Failed</td></tr><tr><td>Body</td><td>ReadFailed</td><td><code>ResetStream(0x51)</code>、<code>Done(Failed)</code></td><td>Failed</td></tr><tr><td>Trailer</td><td>SendCapacity</td><td>トレーラ(digest_len バイト)を <code>Send{fin:true}</code>。送り切ったら <code>Done(Completed)</code></td><td>Done</td></tr><tr><td>任意</td><td>Cancel</td><td><code>Done(Cancelled)</code></td><td>Done</td></tr></tbody></table>
+<p>Identity で <code>bytes == 0</code> のときは本体フェーズを飛ばし、トレーラだけを送ります。Zstd で 0 のときは空の zstd フレームを送ってからトレーラを送ります。<code>Send</code> の合計は常に <code>SendCapacity</code> の現在値以下で、ホストは <code>Send</code> を必ず全量受理します。</p>
+</section><section id="put-server"><h2>PutServer</h2>
+<pre class="code"><code>pub struct PutParams {
+    pub req: PutRequest,          // qftp_wire::Request::Put のフィールド
+    /// ホストが lstat した既存 partial の長さ(なければ None)
+    pub temp_len: Option&lt;u64&gt;,
+    pub quota: QuotaView,         // { used: u64, in_flight: u64, limit: Option&lt;u64&gt; }
+    pub limits: Limits,
+}
+
+pub struct PutServer { /* 非公開 */ }
+
+impl PutServer {
+    /// 検証失敗時は Err((ErrorResponse, Vec&lt;Cmd&gt;))。Vec&lt;Cmd&gt; は後始末(Abort/Account)を含む。
+    /// 成功時の Vec&lt;Cmd&gt; は予約の Account と、再開なら ReadFile(プレフィクス)から始まる。
+    pub fn start(p: PutParams) -&gt; Result&lt;(PutServer, Vec&lt;Cmd&gt;), (ErrorResponse, Vec&lt;Cmd&gt;)&gt;;
+    pub fn on_event(&amp;mut self, ev: Event) -&gt; Vec&lt;Cmd&gt;;
+    pub fn state(&amp;self) -&gt; PutState;
+}
+
+pub enum PutState { Rehash, Body, Trailer, Verify, Committing, Done, Failed }</code></pre>
+<h3>開始時の検証(順序どおり)</h3>
+<table class=""><thead><tr><th>条件</th><th>結果</th></tr></thead><tbody><tr><td><code>hash_algorithm</code> が未対応、<code>encoding</code> が未対応</td><td><code>Unsupported</code></td></tr><tr><td><code>offset &gt; 0</code> または <code>encoding != Identity</code> で、<code>checksum == None &amp;&amp; !checksum_trailer</code></td><td><code>Unsupported</code>(検証必須形)</td></tr><tr><td><code>encoding == Zstd &amp;&amp; size != plaintext_size</code></td><td><code>Malformed</code></td></tr><tr><td><code>checksum</code> の長さが digest_len と異なる</td><td><code>Malformed</code></td></tr><tr><td><code>offset + size &gt; max_file_size</code></td><td><code>FileTooLarge</code></td></tr><tr><td><code>offset &gt; 0 &amp;&amp; temp_len != Some(offset)</code></td><td><code>InvalidRange</code> + <code>Range { offset, file_size: temp_len.unwrap_or(0) }</code></td></tr><tr><td><code>quota.used + quota.in_flight + size &gt; limit</code></td><td><code>QuotaExceeded</code>。fresh なら <code>Abort{keep_partial:false}</code></td></tr><tr><td>成功</td><td><code>Account { release_reserved: 0, used_delta: 0 }</code> は出さず、ホストが予約 <code>size</code> を in_flight に加える前提(<code>QuotaView</code> は予約前の値)。エンジンは終了時に必ず <code>release_reserved = size</code> を返す</td></tr></tbody></table>
+<p><code>no_clobber</code> の既存検査と <code>UploadClaim</code> は<strong>ホストの責務</strong>(パス解決と同じ段階)で、エンジンは claim 済み・temp open 済みで開始されます。</p>
+<h3>状態表</h3>
+<table class=""><thead><tr><th>状態</th><th>Event</th><th>動作 / Cmd</th><th>遷移</th></tr></thead><tbody><tr><td>Rehash(offset &gt; 0)</td><td>ReadDone</td><td>プレフィクスをハッシュ。残りがあれば次の ReadFile。到着した Bytes は内部バッファに保留(上限 write_chunk × max_inflight_writes、超過分はホストの受信を止める <code>SendCapacity</code> 相当がないため、エンジンは保留を許容し続ける)</td><td>Rehash / Body</td></tr><tr><td>Rehash</td><td>ReadDone が短い / ReadFailed</td><td><code>Respond(Err InvalidRange)</code>、<code>Abort{keep_partial:true}</code>、Account、Done</td><td>Failed</td></tr><tr><td>Body</td><td>Bytes</td><td>本体 / トレーラ / 超過に分類。本体は(Zstd なら復号し)平文カウンタを更新、<code>WriteFile</code> を発行(in-flight ≤ max_inflight_writes、超えたら内部に溜める)。超過は <code>UploadOverflow</code> + <code>Upload{received,declared}</code></td><td>Body / Trailer / Failed</td></tr><tr><td>Body</td><td>Bytes(Zstd 不正 / 窓超過)</td><td><code>DecodeError</code></td><td>Failed</td></tr><tr><td>Body</td><td>Fin(本体不足)</td><td><code>UploadTruncated</code> + Upload details</td><td>Failed</td></tr><tr><td>Body / Trailer</td><td>WriteDone</td><td>in-flight を減らし、溜めた書込を発行</td><td></td></tr><tr><td>Body / Trailer</td><td>WriteFailed</td><td><code>Internal</code>(StorageFull も Internal)。temp は残す</td><td>Failed</td></tr><tr><td>Trailer</td><td>Bytes</td><td>digest_len まで蓄積。超過は <code>UploadOverflow</code></td><td>Trailer / Verify</td></tr><tr><td>Trailer</td><td>Fin(不足)</td><td><code>UploadTruncated</code></td><td>Failed</td></tr><tr><td>Verify</td><td>(全 WriteDone 到着後)</td><td>ダイジェスト解決(トレーラ &gt; ヘッダ &gt; なし)。不一致は <code>ChecksumMismatch</code>、<code>Abort{keep_partial:false}</code>、返金。一致なら <code>Commit{mode}</code></td><td>Committing / Failed</td></tr><tr><td>Committing</td><td>CommitDone</td><td><code>Account { release_reserved: size, used_delta: +size, file_delta: +1 (fresh) }</code>、<code>Respond(Ok)</code>、<code>Done(Completed)</code></td><td>Done</td></tr><tr><td>Committing</td><td>CommitFailed</td><td><code>Internal</code>。temp は残す</td><td>Failed</td></tr><tr><td>任意</td><td>Cancel</td><td><code>Abort{keep_partial:true}</code>、書けた分を used に計上、予約解放、<code>Done(Cancelled)</code></td><td>Done</td></tr></tbody></table>
+<h3>失敗時の後始末(Cmd の組)</h3>
+<table class=""><thead><tr><th>失敗</th><th>Abort</th><th>Account</th><th>Respond</th></tr></thead><tbody><tr><td>開始時検証失敗(fresh)</td><td>keep_partial=false</td><td>なし</td><td>Err</td></tr><tr><td>開始時検証失敗(再開)</td><td>keep_partial=true</td><td>なし</td><td>Err</td></tr><tr><td>UploadTruncated / Cancel / WriteFailed / CommitFailed</td><td>keep_partial=true</td><td>release_reserved=size、used_delta=+書けたバイト</td><td>Err(Cancel 以外)</td></tr><tr><td>UploadOverflow / DecodeError / ChecksumMismatch / Malformed</td><td>keep_partial=false</td><td>release_reserved=size、used_delta=−offset(再開プレフィクスの返金)</td><td>Err</td></tr></tbody></table>
+</section><section id="client"><h2>GetClient / PutClient</h2>
+<pre class="code"><code>pub struct GetClientParams {
+    pub path: String,
+    /// ローカル既存 regular file の長さ(なければ 0)。再開 offset になる
+    pub local_len: u64,
+    pub accept_zstd: bool,
+    pub limits: Limits,
+}
+pub enum ClientEvent {
+    Bytes(Bytes), Fin, SendCapacity(usize),
+    ReadDone { id: IoId, data: Bytes },   // ローカルプレフィクスの読み取り
+    WriteDone { id: IoId }, WriteFailed { id: IoId, error: IoError },
+    ResetReceived(u64), Cancel,
+}
+pub enum ClientCmd {
+    Send { data: Bytes, fin: bool },      // 要求フレーム / Put 本体
+    ReadLocal { id: IoId, pos: u64, len: usize },
+    WriteLocal { id: IoId, data: Bytes }, // Get の本体書込(追記)
+    TruncateLocal(u64),                   // 再開失敗時の 0 リセット等
+    DeleteLocal,                          // トレーラ不一致・短い本体
+    ResetStream(u64),
+    Done(ClientOutcome),
+}
+pub enum ClientOutcome {
+    Completed { plaintext_bytes: u64, verified: bool },
+    Failed(ErrorResponse),                // サーバの Err
+    ProtocolError(&amp;&#x27;static str),          // FileReady 不整合など
+    StalePartial,                         // 呼び出し側が 0 から 1 回再試行
+    UnsupportedEncoding,                  // Put: Identity で 1 回再送
+    Cancelled,
+}
+impl GetClient { pub fn start(p: GetClientParams) -&gt; (GetClient, Vec&lt;ClientCmd&gt;); pub fn on_event(&amp;mut self, ev: ClientEvent) -&gt; Vec&lt;ClientCmd&gt;; }
+
+pub struct PutClientParams {
+    pub path: String, pub local_len: u64, pub mode: u32,
+    /// Stat で得た partial 長(0 &lt; p ≤ local_len のときだけ Some)
+    pub resume_from: Option&lt;u64&gt;,
+    pub no_clobber: bool, pub compress: bool, pub limits: Limits,
+}
+impl PutClient { pub fn start(p: PutClientParams) -&gt; (PutClient, Vec&lt;ClientCmd&gt;); pub fn on_event(&amp;mut self, ev: ClientEvent) -&gt; Vec&lt;ClientCmd&gt;; }</code></pre>
+<h3>GetClient の検査</h3>
+<table class=""><thead><tr><th>検査</th><th>結果</th></tr></thead><tbody><tr><td><code>FileReady.encoding</code> が Unknown、または accept していないコーデック</td><td><code>ProtocolError</code>、DeleteLocal(0 から)</td></tr><tr><td>Zstd で <code>size != plaintext_size</code>、または <code>plaintext_size &gt; max_file_size</code></td><td><code>ProtocolError</code></td></tr><tr><td><code>offset + size != total_size</code>(length 未指定時)</td><td><code>ProtocolError</code></td></tr><tr><td>再開なのに <code>checksum_follows == false</code></td><td><code>ProtocolError</code></td></tr><tr><td>サーバの <code>Err(InvalidRange)</code> で offset &gt; 0</td><td><code>StalePartial</code>(呼び出し側が DeleteLocal 後に 0 から再試行)</td></tr><tr><td>本体途中の Fin、トレーラ不一致、復号失敗</td><td>DeleteLocal、<code>Failed</code></td></tr><tr><td><code>checksum_follows == false</code>(fresh)</td><td>受理するが <code>verified = false</code></td></tr></tbody></table>
+<h3>PutClient の振る舞い</h3>
+<table class=""><thead><tr><th>局面</th><th>動作</th></tr></thead><tbody><tr><td>開始</td><td><code>Send</code>(Put フレーム)。<code>encoding = Zstd</code> は <code>compress &amp;&amp; (local_len - offset) ≥ 1024 &amp;&amp; 既圧縮でない</code>。<code>checksum_trailer = true</code>、<code>checksum = None</code></td></tr><tr><td>再開</td><td><code>ReadLocal</code> で <code>[0, offset)</code> をハッシュ、その後 offset から本体を <code>ReadLocal</code> → (符号化) → <code>Send</code>(SendCapacity の範囲)</td></tr><tr><td>応答の並行監視(ADR-009)</td><td>本体送信中に <code>Bytes</code>(応答フレーム)を受けたら復号。<code>Err</code> なら <code>ResetStream(0x53)</code>、<code>Done(Failed)</code>。<code>Unsupported</code> かつ Zstd なら <code>Done(UnsupportedEncoding)</code></td></tr><tr><td>再開時の <code>ChecksumMismatch</code> / <code>InvalidRange</code></td><td><code>Done(StalePartial)</code></td></tr><tr><td>完了</td><td>トレーラ + fin を送り、<code>Ok</code> を受けて <code>Done(Completed)</code></td></tr></tbody></table>
+</section><section id="host"><h2>ホスト契約</h2>
+<table class=""><thead><tr><th>#</th><th>契約</th></tr></thead><tbody><tr><td>H1</td><td>ホストは 1 エンジンの <code>on_event</code> / <code>start</code> を同一タスク上で逐次に呼ぶ。返された <code>Vec&lt;Cmd&gt;</code> は<strong>順序どおり</strong>に実行する</td></tr><tr><td>H2</td><td><code>Event::Bytes</code> と <code>Event::Fin</code> はストリームの到着順。空の Bytes は送らない。Fin の後に Bytes を送らない</td></tr><tr><td>H3</td><td><code>SendCapacity(n)</code> は「今すぐ受理できるバイト数」の現在値。最初の値は <code>start</code> 直後に必ず 1 回送る。値が変わるたび(quiche の <code>stream_capacity</code> が増えたとき)に送る</td></tr><tr><td>H4</td><td><code>Cmd::Send</code> のデータは全量受理する。受理できない場合はホストの側でバッファし、以後 <code>SendCapacity</code> を 0 として報告し、バッファが空になってから実際の値を報告する</td></tr><tr><td>H5</td><td><code>ReadFile</code> / <code>WriteFile</code> は完了順が要求順と同じでなくてよいが、<strong>WriteFile の適用順は要求順</strong>(ホストは単一ワーカーまたは順序保証キューで実行する)。完了イベントの <code>id</code> は要求の id</td></tr><tr><td>H6</td><td><code>ReadDone.data.len() &lt; len</code> は EOF。エラーは <code>ReadFailed</code> で返し、panic させない</td></tr><tr><td>H7</td><td><code>Commit</code> は rename(temp → final)+ mode 適用 + 祖先 symlink 再検査 + <code>no_clobber</code> 再検査をホストが行い、いずれかの失敗を <code>CommitFailed</code> で返す</td></tr><tr><td>H8</td><td><code>Abort</code> はホストが temp を削除(keep_partial=false)または保持する。<code>Account</code> は <code>User</code> の atomics に反映する。どちらもエンジンからの順序で実行</td></tr><tr><td>H9</td><td>接続断・シャットダウン・ストリーム reset 受信時は <code>Cancel</code> を 1 回送り、返された Cmd を実行してからエンジンを破棄する</td></tr><tr><td>H10</td><td><code>Done</code> の後にエンジンへ Event を送らない。送った場合エンジンは無視する(debug ビルドでは assert)</td></tr><tr><td>H11</td><td>エンジンが <code>Respond(Err)</code> を返したら、ホストはそれをフレームとして送り、続く <code>Done(Failed)</code> まで Cmd を処理してストリームを FIN で閉じる</td></tr></tbody></table>
+<h3>quiche ホスト(サーバ)の擬似コード</h3>
+<pre class="code"><code>// dispatch: ストリームごとの状態 = Engine + 送信待ちバッファ + in-flight I/O
+loop {
+    // 1. 受信: readable なストリームごとに stream_recv → Event::Bytes / Fin
+    for sid in conn.readable() { while let Ok((n, fin)) = conn.stream_recv(sid, &amp;mut buf) {
+        cmds.extend(engine.on_event(Event::Bytes(buf[..n].into())));
+        if fin { cmds.extend(engine.on_event(Event::Fin)); } } }
+    // 2. I/O 完了: spawn_blocking の JoinHandle を select して Event::ReadDone 等
+    // 3. 送信余地: writable なストリームで stream_capacity が変わったら Event::SendCapacity
+    // 4. Cmd 実行
+    for c in cmds.drain(..) { match c {
+        Cmd::Send{data,fin} =&gt; { conn.stream_send(sid, &amp;data, fin)?; }      // H4: 全量受理
+        Cmd::ReadFile{id,pos,len} =&gt; { spawn_blocking(move || read_at(file, pos, len)) }
+        Cmd::WriteFile{id,data} =&gt; { write_queue.push(id,data) }           // H5: 順序キュー
+        Cmd::Respond(r) =&gt; send_message(conn, sid, &amp;r)?,
+        Cmd::Account(a) =&gt; user.apply(a),
+        Cmd::Done(o) =&gt; { metrics.record(o); streams.remove(sid); }
+        ... } }
+    // 5. quiche のタイマーと egress(GSO)
+}</code></pre>
+<h3>テスト用ホスト</h3>
+<p><code>qftp-core/tests/engine_*.rs</code> は純メモリのホスト(<code>ScriptHost</code>)でエンジンを駆動します。ファイルは <code>Vec&lt;u8&gt;</code>、ストリームは <code>VecDeque&lt;Bytes&gt;</code>、送信余地は任意の数列を与えられます。各テストは「Event 列 → 期待 Cmd 列」の表で書き、状態表の全遷移を網羅します(e2e テスト仕様 CORE-* を参照)。</p>
+</section></main></body></html>

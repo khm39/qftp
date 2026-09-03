@@ -1,6 +1,6 @@
 # qftp 新規プロジェクト 設計パッケージ
 
-作成日: 2026-09-03 / 更新: 2026-09-03(クレート構成を 12 → 8 に整理、ADR-006 を wtransport で確定、ADR-001/005 を tokio current_thread に変更、プロトコル図解版 HTML を追加)
+作成日: 2026-09-03 / 更新: 2026-09-03(クレート構成を 12 → 8 に整理、ADR-006 を wtransport で確定、ADR-001/005 を tokio current_thread に変更、プロトコル図解版 HTML を追加、ADR-007〜013 を確定、40-reference/ を追加)
 
 本パッケージは、QUIC 上のファイル転送プロトコル **qftp/1** の実装を新規リポジトリで起こすための設計一式です。**このパッケージだけで自己完結**しており、プロトタイプのリポジトリを参照する必要はありません。
 
@@ -8,10 +8,11 @@
 
 | ディレクトリ | 内容 | 状態 |
 |---|---|---|
-| `00-background/` | `prototype-assessment.md`(プロトタイプの挙動棚卸しと問題一覧)、`decisions.md`(ADR-001〜006) | 完成 |
+| `00-background/` | `prototype-assessment.md`(プロトタイプの挙動棚卸しと問題一覧)、`decisions.md`(ADR-001〜013) | 完成 |
 | `10-protocol/` | ワイヤプロトコル仕様(正本)。README / qftp-protocol / wire-format / error-codes / versioning / security-model / protocol-changelog、`test-vectors/`。**`qftp-protocol-guide.html`**(図解版: シーケンス図・バイト配置図・ベクタの注釈つきダンプ。非規範) | 完成(凍結済み仕様の移植 + 図解版) |
 | `20-design/` | 設計書(HTML、ブラウザで開く。印刷対応) | 骨組み + 判明分を記入 |
-| `30-plan/` | `roadmap.md`(フェーズと完了条件)、`repository-layout.md`(リポジトリ構成と 8 クレート) | 完成 |
+| `30-plan/` | `roadmap.md`(フェーズと完了条件)、`repository-layout.md`(リポジトリ構成と 7 クレート) | 完成 |
+| `40-reference/` | 実装レベルの参照文書(HTML): 転送エンジン API、設定、CLI、ファイル形式、e2e テスト仕様 | 完成(初版) |
 
 ## 設計書一覧(`20-design/`)
 
@@ -37,12 +38,12 @@
 2. ネイティブサーバ / クライアントの QUIC スタックは **quiche**、ランタイムは **tokio(current_thread)**(ADR-001)。
 3. Get / Put の転送エンジンは **sans-I/O の状態機械**として 1 実装し、quiche ループ・ブリッジ・テストが共有する(ADR-002)。
 4. ワイヤ符号化は手書き codec(ADR-003)。ディスク I/O は tokio のブロッキングプールへ(ADR-005)。
-5. クレートは 8 つ(wire / core / quic / server / client-core / client / admin / e2e)+ fuzz。conformance・testkit・bench は独立クレートにしない。
+5. クレートは 7 つ(wire / core / quic / server / client-core / client / admin)+ fuzz。conformance は wire の tests、e2e とベンチは server の tests / benches(ADR-007)。
 6. MVP はサーバ + CLI クライアント。再帰転送・admin は Phase 5、sync / watch は Phase 6、Web は Phase 7。
 
 ## 未決事項
 
-- Phase 0 の quiche spike の結果(early data ゲート、tokio-quiche の可否)。
+設計上の未決事項は 2026-09-03 にすべて決定済みです(ADR-007〜013)。残るのは運用主体が決める数値と、Phase 0 の spike で確定する技術項目です。
+
+- Phase 0 の quiche spike の結果(early data ゲート、tokio current_thread 上の駆動構造、`try_io` 経由の GSO)。
 - 運用 SLO・体制・バックアップ方針(運用設計書)。
-- sync `--checksum` と `put-multi` の存廃(推奨: 前者はフラグ削除、後者は廃止)。
-- リリース方式(手書き workflow か cargo-dist)。
