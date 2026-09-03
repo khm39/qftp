@@ -138,18 +138,15 @@ an unbounded `DirListing` frame:
   applies per page, and a server **SHOULD** also split a page that would
   exceed a soft byte budget (~1 MiB in the reference server).
 
-**Reference implementation status (qftp/1.0): pagination is reserved but
-not yet implemented.** The `cursor` and `next_cursor` fields are part of
-the frozen wire format and the protocol contract above is normative for
-future servers, but the reference server in this repository does **not**
-split listings: it always replies with `next_cursor = None` and ignores
-any `cursor` a client sends. Its single-page cap is therefore an absolute
-limit — a directory with more than 100000 listable entries is **refused**
-with an `Internal` error (`ErrorCode::Internal`) rather than silently
-truncated, and is currently unlistable until a client/server that
-implements the loop above is shipped. Clients should still implement the
-`next_cursor` loop for forward compatibility; against this server the loop
-simply terminates after the first page.
+**Reference implementation (implementation-defined).** The reference
+server sorts entries by name (byte order) and closes a page at 10000
+entries or roughly 1 MiB of encoded entries, whichever comes first. Its
+cursor is the base64url encoding (no padding) of the last name returned;
+the next page starts strictly after that name. A cursor that does not
+decode, or that is not consistent with the sort order, is refused with
+`ErrorCode::Malformed`. The 100000-entry figure above is the
+**decoder-side** per-page cap that every implementation enforces on
+receipt; it is not the reference server's page size.
 
 #### Directory and file metadata
 
@@ -339,8 +336,9 @@ in [versioning.md](versioning.md).
 The server enables QUIC 0-RTT. A client that holds a fresh session
 ticket from a previous connect can send application data in its first
 flight, skipping the 1-RTT TLS handshake. The reference client stores
-tickets per host (mode 0600, 24h TTL) and silently falls back to a
-1-RTT handshake on rejection.
+tickets per host (mode 0600, 24h TTL) and uses them to resume the TLS
+session only: it sends **no** application data as early data, and
+silently falls back to a 1-RTT handshake on rejection.
 
 ### Replay protection
 
@@ -360,15 +358,19 @@ primitive (reflected downloads against a spoofed source IP). `Ls` is
 refused for the same reason: a single `DirListing` page may carry up
 to the 100000-entry cap — a multi-MiB frame, bounded only by the
 16 MiB frame cap — so a replayed 0-RTT `Ls` is a reflection primitive
-of the same order as `Get`. `Quota` is likewise refused as an
-amplification-hardening measure. The allow list therefore keeps only
-small fixed-size replies. The cost is one extra round trip on the
+of the same order as `Get`. `Quota` is refused because its
+reply depends on the resolved identity (the quota is per user), which
+early data does not yet have; it is a small reply but is excluded
+conservatively. The allow list therefore keeps only small fixed-size,
+identity-independent replies. The cost is one extra round trip on the
 first request of a session; subsequent requests run at 1-RTT either
 way. A request refused this way **MUST** be retried by the client
 **immediately** after the handshake completes — with no backoff, since
-the refusal is solely about 0-RTT, not the operation itself (the
-reference client does so transparently; see the retryability table in
-[error-codes.md](error-codes.md)).
+the refusal is solely about 0-RTT, not the operation itself (see the
+retryability table in [error-codes.md](error-codes.md)). The reference
+client resumes the TLS session from a stored ticket but sends **no**
+application data as early data, so it never receives this refusal; the
+rule applies to clients that do.
 
 ### Identity gate on early data
 
@@ -407,10 +409,13 @@ Two layers, both **implementation-defined** in their exact limits:
 1. **Per-IP connection rate limit**, checked on every Initial. Initials
    that fail it are dropped silently.
 2. **Per-request rate limit** on established connections, checked when a
-   `Request` frame is decoded. A denied request gets
-   `ErrorCode::RateLimited` and the stream ends.
+   `Request` frame is decoded and keyed by the peer's IP. A denied
+   request gets `ErrorCode::RateLimited` (with `RetryAfter` details) and
+   the stream ends.
 
-(The reference server defaults both to a token bucket of 50 requests/s
+(The reference server keeps the two layers in **separate** per-IP
+token-bucket sets, so a chatty established client cannot lock out new
+connections from its own address; each set defaults to 50 requests/s
 with a burst of 100.)
 
 ## Connection ID derivation
@@ -437,7 +442,7 @@ sections above.)
 ### Transport parameters
 
 These are the QUIC transport parameters the **reference native server
-and client** apply (`qftp-common`'s `apply_common_config`). They are
+and client** apply (the `qftp-quic` transport configuration). They are
 not negotiated by qftp beyond the QUIC handshake itself, and another
 implementation **MAY** choose different values.
 
@@ -445,7 +450,7 @@ implementation **MAY** choose different values.
 |---|---|---|
 | `initial_max_streams_bidi` | `4` | Max concurrent client-initiated bidi streams. The reference client opens one at a time. |
 | `max_idle_timeout` | `30 s` | Connection is closed if idle this long. |
-| `initial_max_stream_data` (bidi local/remote) | `16 MiB` | Per-stream QUIC flow-control window; sized for gigabit-BDP, not user buffering (the user-space chunk is 64 KiB). |
+| `initial_max_stream_data` (bidi local/remote) | `16 MiB` | Per-stream QUIC flow-control window; sized for gigabit-BDP, not user buffering (user-space chunks are 64 KiB to 256 KiB; see the transfer-engine limits). |
 | `initial_max_data` | `64 MiB` | Per-connection flow-control window (`4 × 16 MiB`). |
 | Pacing | **off** | The reference disables quiche's pacer; back-pressure is via the flow-control window and the congestion controller. |
 | Keepalive | **none** | The native endpoints send no keepalive; an idle connection times out at `max_idle_timeout`.¹ |
@@ -477,6 +482,21 @@ pointer, not a redefinition.
 - The **maximum path depth** (number of components) is
   implementation-defined, in addition to any limit the server's OS
   imposes on path/component length.
+
+### Other reference-implementation constants
+
+The following values are used by the reference implementation. They are
+**implementation-defined**; another implementation MAY choose others,
+but interoperating peers do not need to agree on them.
+
+| Item | Reference value |
+|---|---|
+| Initial packet DCID length accepted | 8 to 20 bytes (Initials outside this range are dropped) |
+| Stateless retry token | HMAC-SHA256 over the peer address and original DCID, tag ≥ 20 bytes, valid for 60 s |
+| zstd compression level (sender-local) | 3 |
+| `mode` applied by `Put` and `Chmod` | masked to `0o777`; setuid, setgid and sticky bits are stripped |
+| Stale upload temp sweep | temps older than 24 h are removed at server start |
+| Compressible-file heuristic | by file extension; already-compressed formats are sent as `Identity` |
 
 ### File size limit
 

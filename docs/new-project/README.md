@@ -8,12 +8,12 @@ QUIC 上のファイル転送プロトコル **qftp/1** と、そのリファレ
 
 | ディレクトリ | 内容 |
 |---|---|
-| `00-background/` | `decisions.md`: 設計を縛る決定(ADR-001〜013)。状況・決定・理由・帰結の形式 |
+| `00-background/` | `decisions.md`: 設計を縛る決定(ADR-001〜015)。状況・決定・理由・帰結の形式 |
 | `10-protocol/` | ワイヤプロトコル仕様(正本)。README / qftp-protocol / wire-format / error-codes / versioning / security-model / protocol-changelog、`test-vectors/`。**`qftp-protocol-guide.html`**(図解版: シーケンス図・バイト配置図・ベクタの注釈つきダンプ。非規範) |
 | `20-design/` | 設計書(HTML)。アーキテクチャ、機能(転送エンジン / サーバ / クライアント / Web ブリッジ)、シーケンス(接続確立 / Get / Put)、運用 |
 | `30-repository/` | `repository-layout.md`: クレート構成(7 + fuzz)、依存方向、ディレクトリ、モジュール骨子、CI 構成 |
 | `40-reference/` | 実装契約(HTML): 転送エンジン API、設定、CLI、ファイル形式、テスト仕様 |
-| `tools/` | 図解版と参照文書の生成器(Python)。仕様を改訂したときの再生成に使う |
+| `tools/` | 設計書・参照文書・図解版の生成器(Python 3、標準ライブラリのみ)。`QFTP_DESIGN_ROOT` 未設定時はパッケージ自身を出力先にする |
 
 ## 機能の区分
 
@@ -38,18 +38,18 @@ QUIC 上のファイル転送プロトコル **qftp/1** と、そのリファレ
 | `sequence-connection-setup.html` | シーケンス設計書: 接続確立 | 全項目 |
 | `sequence-get-transfer.html` | シーケンス設計書: Get | 全項目 |
 | `sequence-put-transfer.html` | シーケンス設計書: Put | 全項目 |
-| `operations-qftp-server.html` | 運用設計書 | SLO / 体制 / バックアップ頻度 / キャパシティ実測は未記入(運用主体が決める値) |
+| `operations-qftp-server.html` | 運用設計書 | 運用主体が決める項目(体制、SLO / SLA / エラーバジェット、ダッシュボード、通知先、連絡フロー、ポストモーテム、保管期間、RTO / RPO、証跡、現状使用率、成長率)は未記入 |
 
 管理 CLI は機能設計書を持たず、CLI リファレンスとファイル形式リファレンスで規定します。画面設計書(Web クライアント)は未作成で、Web 区分の設計時にテンプレートから作成します。
 
-「未記入」項目は各 HTML 内で赤い枠で表示されます。項目を埋める際は、HTML 末尾の `<script id="design-doc-meta">` の JSON(`answers`)がソース・オブ・トゥルースです(同じキーで本文と JSON の両方を更新してください)。
+「未記入」項目は各 HTML 内で赤い枠で表示されます。設計書の正本は `tools/<module>.py` の `ANSWERS`(セクション ID.項目 ID → HTML)で、HTML 末尾の JSON はそこから生成した写しです。
 
 ## 文書間の役割分担と更新規則
 
 - 正本の優先順位: `10-protocol/` の Markdown 仕様書 > 参照文書(`40-reference/`) > 設計書(`20-design/`) > 図解版。食い違いは上位が勝ちます。
 - 設計書は「目的・スコープ・判断・リスク」を持ち、契約(型・設定キー・CLI・ファイル形式)は参照文書にだけ書きます。設計書からはリンクで参照します。
 - 図解版 `10-protocol/qftp-protocol-guide.html` は非規範です。バイト列の例は `tools/guide.py` がベクタから機械生成しますが、本文は手書きです。Markdown 仕様書を改訂したら図解版の該当節も更新し、`python3 tools/guide.py` で再生成してください。
-- 参照文書と設計書は `tools/` の生成器から生成します。HTML を直接編集せず、生成器を編集して再生成してください(`python3 tools/build.py <module>…`、`python3 tools/ref_*.py`)。
+- 参照文書と設計書は `tools/` の生成器から生成します。HTML を直接編集せず、生成器を編集して再生成してください(`python3 tools/build.py architecture feature_engine …`、`python3 tools/ref_engine.py` など。テンプレートは `tools/templates/` に同梱)。
 
 ## 主要な決定(要約)
 
@@ -64,4 +64,4 @@ QUIC 上のファイル転送プロトコル **qftp/1** と、そのリファレ
 
 - 実装の順序・工程・完了条件。
 - 運用主体が決める数値(SLO、体制、バックアップ頻度、キャパシティ)。運用設計書では未記入のままにしています。
-- 実装前に実機で確認すべき技術項目(tokio current_thread 上の quiche 駆動、`try_io` 経由の GSO、`spawn_blocking` の往復コスト)は ADR-001 / ADR-005 の帰結に列挙しています。
+- 実装前に実機で確認すべき技術項目は ADR-001 の帰結に列挙しています。

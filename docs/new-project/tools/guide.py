@@ -1,7 +1,8 @@
 import json, html
 from svg import seq, bytes_layout, hexdump, figure, esc
 import wire
-BASE="/tmp/claude-0/-home-user-qftp/96263040-8562-5047-8304-4e5f08fbf7fd/scratchpad/qftp-design/10-protocol"
+from theme import ROOT
+BASE=f"{ROOT}/10-protocol"
 VEC={}
 for f,kind in [("requests.json","Request"),("responses.json","Response"),("error-codes.json","Response")]:
     for v in json.load(open(f"{BASE}/test-vectors/{f}"))["vectors"]: VEC[v["name"]]=(kind,v)
@@ -118,7 +119,8 @@ REQ_RESP={"Ls":"DirListing","Cd":"Ok","Pwd":"Path","Get":"FileReady + 本体","P
 rows=[[i,f"<code>{n}</code>",req_fields(f),REQ_DESC[n],f"<code>{REQ_RESP[n]}</code>"] for i,(n,f) in enumerate(wire.REQ)]
 reqtab=table(["判別子","Request","フィールド(ワイヤ順)","意味","成功応答"],rows)
 RESP_DESC={"Ok":"成功(本体なし)","Err":"失敗。<code>ErrorResponse</code> を 1 つ","DirListing":"一覧 1 ページ + 次ページのカーソル","Path":"仮想絶対パス","FileStat":"メタデータ","FileReady":"Get の応答ヘッダ。直後に本体が続く","QuotaInfo":"使用量・ファイル数・上限"}
-rows=[[i,f"<code>{n}</code>",req_fields(f),RESP_DESC[n]] for i,(n,f) in enumerate(wire.RESP)]
+UNNAMED={"Err":"<em>(ErrorResponse)</em>","Path":"<em>(string)</em>","FileStat":"<em>(FileStat)</em>"}
+rows=[[i,f"<code>{n}</code>",UNNAMED.get(n,req_fields(f)),RESP_DESC[n]] for i,(n,f) in enumerate(wire.RESP)]
 resptab=table(["判別子","Response","フィールド(ワイヤ順)","意味"],rows)
 
 def layout_of(fields, first=("disc",4,"判別子","bl-disc")):
@@ -194,7 +196,7 @@ sec("structures","共通データ構造", f"""
 
 # ---------- 7 error codes ----------
 RETRY={429:"バックオフ付きで再試行(<code>RetryAfter</code> があればその時間以上待つ)",500:"バックオフ付きで再試行(5xx 全般)",405:"0-RTT 拒否由来なら<strong>即時</strong>再試行。それ以外は再試行禁止"}
-MEAN={400:"フレームまたはペイロードが復号できない",401:"認証失敗、またはユーザ未設定",403:"ACL またはファイルシステム権限で拒否",404:"パスが存在しない",405:"この文脈では非対応(0-RTT で来た変更操作など)",409:"宛先が存在し、存在しないことが要件(<code>no_clobber</code>)",413:"サーバの最大ファイルサイズ超過",416:"再開 offset(または Get 範囲)が不正",420:"ディレクトリが必要だが通常ファイル",421:"通常ファイルが必要だがディレクトリ",422:"転送バイトのハッシュ検証失敗",423:"宣言 <code>size</code> より多く送られた",424:"宣言 <code>size</code>(またはトレーラ)に届く前に FIN",429:"接続内の要求レート制限",430:"ストレージクォータ超過",431:"圧縮本体が復号できない(不正フレーム、窓超過)",500:"サーバ側 I/O エラー等"}
+MEAN={400:"フレームまたはペイロードが復号できない",401:"認証失敗、またはユーザ未設定",403:"ACL またはファイルシステム権限で拒否",404:"パスが存在しない",405:"この文脈では非対応(0-RTT で来た要求、未対応の hash_algorithm / encoding など)",409:"宛先が存在し、存在しないことが要件(<code>no_clobber</code>)",413:"サーバの最大ファイルサイズ超過",416:"再開 offset(または Get 範囲)が不正",420:"ディレクトリが必要だが通常ファイル",421:"通常ファイルが必要だがディレクトリ",422:"転送バイトのハッシュ検証失敗",423:"宣言 <code>size</code> より多く送られた",424:"宣言 <code>size</code>(またはトレーラ)に届く前に FIN",429:"接続内の要求レート制限",430:"ストレージクォータ超過",431:"圧縮本体が復号できない(不正フレーム、窓超過)",500:"サーバ側 I/O エラー等"}
 rows=[[c,f"<code>{wire.CODES[c]}</code>","client" if c<500 else "server",MEAN[c],RETRY.get(c,"再試行禁止(同じ要求は同じ結果)")] for c in sorted(wire.CODES)]
 sec("errors","エラーコード", f"""
 <p><code>ErrorResponse.code</code> は HTTP に似た<strong>数値ステータス</strong>(u32 LE)です。先頭の桁が分類を表し、未知のコードでも桁だけで再試行の可否を判断できます。</p>
@@ -335,7 +337,8 @@ sec("zero-rtt","0-RTT セッション再開", f"""
 <h3>ゲート 1: 再生安全性(要求種別)</h3>
 {table(["Request","0-RTT","理由"],[
  ["<code>Cd</code> <code>Pwd</code> <code>Stat</code> <code>Quit</code>","許可","読み取り専用・冪等・応答が小さく固定長"],
- ["<code>Ls</code> <code>Get</code> <code>Quota</code>","拒否","応答が大きくなり得る(反射増幅の道具になる)"],
+ ["<code>Ls</code> <code>Get</code>","拒否","応答が大きくなり得る(反射増幅の道具になる)"],
+ ["<code>Quota</code>","拒否","応答が identity(ユーザ)に依存する。小さな応答だが保守的に除外"],
  ["<code>Put</code> <code>Rm</code> <code>Mkdir</code> <code>Rmdir</code> <code>Rename</code> <code>Chmod</code>","拒否","再生で副作用が起きる"],
 ])}
 <h3>ゲート 2: identity gate(サーバ設定)</h3>
@@ -357,9 +360,9 @@ rseq=seq(["クライアント","サーバ"],[
 sec("retry","stateless retry・レート制限・接続 ID", f"""
 {rseq}
 {table(["項目","規定","参照実装(実装定義)"],[
- ["retry","最初の Initial に retry を要求してよい(MAY)。トークンは送信元アドレスと元の DCID にコミットする","<code>&quot;qftp1&quot; || 発行時刻 || IP || port || dcid_len || dcid || HMAC-SHA256[..16]</code>、有効 60 秒、タグは 20 バイト以上を推奨"],
+ ["retry","最初の Initial に retry を要求してよい(MAY)。トークンは送信元アドレスと元の DCID にコミットする","<code>&quot;qftp1&quot; || 発行時刻 || IP || port || dcid_len || dcid || HMAC-SHA256[..32]</code>、有効 60 秒(タグは 20 バイト以上)"],
  ["接続レート制限","Initial ごとに送信元 IP で検査。超過は黙って破棄","トークンバケット 50 req/s、バースト 100"],
- ["要求レート制限","確立済み接続で <code>Request</code> 復号時に検査。超過は <code>RateLimited</code> + <code>RetryAfter</code>","同上(新設計では Initial 用と要求用を別バケットにする)"],
+ ["要求レート制限","確立済み接続で <code>Request</code> 復号時に per-IP で検査。超過は <code>RateLimited</code> + <code>RetryAfter</code>","Initial 用とは別のバケット群。同じく 50 req/s、バースト 100"],
  ["サーバ接続 ID","クライアントの DCID から決定的に導出する(SHOULD)。再送 Initial が同じ接続に収束する","<code>HMAC-SHA256(プロセス寿命の seed, client_dcid)</code> を CID 長に切り詰め"],
 ])}
 """)
@@ -386,7 +389,7 @@ sec("limits","実装定義パラメータと上限", f"""
 <h3>フィールド上限(SHOULD)</h3>
 {table(["対象","上限"],[["フレーム長","16 MiB"],["<code>path</code> / <code>from</code> / <code>to</code> / 各 <code>DirEntry.name</code>","4,096 バイト"],["<code>ErrorResponse.message</code>","1,024 バイト"],["<code>DirListing.entries</code>","100,000 件 / ページ(約 1 MiB で分割推奨)"],["最大ファイルサイズ","実装定義(参照実装 1 GiB、超過は <code>FileTooLarge</code>)"]])}
 <h3>QUIC トランスポートパラメータ(参照実装)</h3>
-{table(["パラメータ","値","備考"],[["<code>initial_max_streams_bidi</code>","4","参照クライアントは 1 本ずつ使う"],["<code>max_idle_timeout</code>","30 s",""],["<code>initial_max_stream_data</code>","16 MiB","ギガビット級 BDP 向け。ユーザ空間のチャンクは 64 KiB"],["<code>initial_max_data</code>","64 MiB","4 × 16 MiB"],["pacing","off","フロー制御と輻輳制御でバックプレッシャ"],["keepalive","なし","ブリッジのみ 15 s"],["active migration","無効",""]])}
+{table(["パラメータ","値","備考"],[["<code>initial_max_streams_bidi</code>","4","参照クライアントは 1 本ずつ使う"],["<code>max_idle_timeout</code>","30 s",""],["<code>initial_max_stream_data</code>","16 MiB","ギガビット級 BDP 向け。ユーザ空間のチャンクは 64 KiB〜256 KiB(転送エンジンの Limits)"],["<code>initial_max_data</code>","64 MiB","4 × 16 MiB"],["pacing","off","フロー制御と輻輳制御でバックプレッシャ"],["keepalive","なし","ブリッジのみ 15 s"],["active migration","無効",""]])}
 <h3>その他の実装定義</h3>
 {table(["項目","内容"],[["パス","UTF-8 前提。非 UTF-8 の扱い、大文字小文字、正規化、最大深さは実装定義"],["retry トークン形式、接続 ID 導出、レート制限の値","<a href='#retry'>§13</a>"],["partial の名前","<code>&lt;final&gt;.qftp.partial</code>(参照実装)"],["圧縮の既定オン / オフと既圧縮判定","送信側ポリシー"]])}
 """)
@@ -397,15 +400,18 @@ for f,kind in [("requests.json","Request"),("responses.json","Response"),("error
     for v in json.load(open(f"{BASE}/test-vectors/{f}"))["vectors"]:
         allv.append(details(f'<code>{f}</code> / <code>{v["name"]}</code>: {esc(v["description"])}',dump(v["name"])))
 sec("vectors","付録: 全ゴールデンベクタの注釈つきダンプ", f"""
-<p>本書の生成器が <code>test-vectors/</code> の全 {len(allv)} ベクタを仕様(§3〜§6)どおりに復号したものです。生成時に「フレームを最後まで消費できること」を検査しており、1 件でも失敗すれば本書は生成されません。他言語実装のデバッグ時に、期待バイト列との突き合わせに使ってください。</p>
+<p>本書の生成器が <code>test-vectors/</code> の全 {len(allv)} ベクタを仕様(§3〜§6)どおりに復号したものです。生成時に「フレームをちょうど最後まで消費できること」を厳密に検査しており(versioning.md の寛容デコードは対象外)、1 件でも失敗すれば本書は生成されません。他言語実装のデバッグ時に、期待バイト列との突き合わせに使ってください。</p>
 {"".join(allv)}
 """)
 
 # ---------- assemble ----------
 from theme import CSS
 
-toc="<nav class='toc'><b>目次</b><ol>"+"".join(f'<li><a href="#{i}">{t}</a></li>' for i,t,_ in S)+"</ol></nav>"
-body="".join(f'<section id="{i}"><h2>{t}</h2>{h}</section>' for i,t,h in S)
+toc="<nav class='toc'><b>目次</b><div><a href=\"#about\">本書について</a></div><ol>"+"".join(f'<li><a href="#{i}">{t}</a></li>' for i,t,_ in S if i!="about")+"</ol></nav>"
+def _sec(i,t,h):
+    cls=' class="nonum"' if i=="about" else ''
+    return f'<section id="{i}"{cls}><h2>{t}</h2>{h}</section>'
+body="".join(_sec(i,t,h) for i,t,h in S)
 doc=f"""<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>qftp/1 プロトコル解説(図解版)</title><style>{CSS}</style></head><body><main>
 <header class="doc"><div class="kind">プロトコル解説(図解版)</div><h1>qftp/1 プロトコル解説</h1><div class="meta">作成日: 2026-09-03 / 対象ワイヤ: qftp/1(2026-05-30 凍結)/ バイト列の例は test-vectors から機械生成</div></header>
 {toc}{body}

@@ -1,5 +1,6 @@
 from theme import page, table, code
-OUT="/tmp/claude-0/-home-user-qftp/96263040-8562-5047-8304-4e5f08fbf7fd/scratchpad/qftp-design/40-reference/config-reference.html"
+from theme import ROOT
+OUT=f"{ROOT}/40-reference/config-reference.html"
 S=[]
 S.append(("precedence","優先順位と読み込み規則",f"""
 {table(["プログラム","既定の設定ファイル","優先順位(高 → 低)"],[
@@ -42,7 +43,7 @@ initial_rate_burst = 100.0
 request_rate_rps = 50.0
 request_rate_burst = 100.0
 max_file_size = "1Gi"
-blocking_threads = 0             # 0 = CPU 数 × 2
+blocking_threads = 0             # 0 = CPU 数 × 2(有効値はログと /metrics の qftp_blocking_threads で確認)
 max_streams_bidi = 4
 idle_timeout = "30s"
 half_open_timeout = "5s"
@@ -126,10 +127,10 @@ S.append(("admin","qftp-admin / qftp-web-bridge",f"""
 {table(["プログラム","フラグ","既定"],[
  ["qftp-admin","<code>--users &lt;path&gt;</code>","<code>/etc/qftp/users.toml</code>"],
  ["qftp-admin","<code>--tokens &lt;path&gt;</code>","<code>/etc/qftp/tokens.toml</code>"],
- ["qftp-admin","<code>--mode &lt;octal&gt;</code>","0600(書込後のファイルモード)"],
+ ["qftp-admin","<code>--mode &lt;octal&gt;</code>","0640(書込後のファイルモード。サーバ実行ユーザのグループが読める)"],
 ])}
 {code('''# /etc/qftp/web-bridge.toml(Web 区分)
-bind = "0.0.0.0:4433"
+bind = "0.0.0.0:4434"             # サーバ(4433)と同一ホストで併走できるよう別ポート
 http_bind = "127.0.0.1:8080"      # 開発用 SPA 配信。省略時は無効
 root = "/srv/qftp"
 users = "/etc/qftp/users.toml"

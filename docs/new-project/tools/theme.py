@@ -1,4 +1,5 @@
-import html
+import html, os
+ROOT=os.environ.get('QFTP_DESIGN_ROOT', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CSS=r"""
 :root{--text:#1b2430;--muted:#5c6b7f;--border:#e3e8ef;--bg:#fff;--soft:#f3f5f9;--page:#e9edf3;--accent:#165e83;--accent-soft:#e3eef4;--warn:#bc4425;--warn-soft:#faeee9;--ok:#2f7d4f;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--max:960px;color-scheme:light dark}
 @media (prefers-color-scheme:dark){:root{--text:#dde5ee;--muted:#8fa0b5;--border:#2a3543;--bg:#151c26;--soft:#1c2532;--page:#0e131a;--accent:#7cb8d9;--accent-soft:#1b3040;--warn:#e8926f;--warn-soft:#33221b;--ok:#7fc79b}}
@@ -62,6 +63,7 @@ def page(title, kind, meta, sections, out):
     body="".join(f'<section id="{i}"><h2>{t}</h2>{h}</section>' for i,t,h in sections)
     doc=f"""<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(title)}</title><style>{CSS}
 pre.code{{background:var(--soft);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55;margin:10px 0}}pre.code code{{background:none;border:none;padding:0}}
+section.nonum>h2{{counter-increment:none}}section.nonum>h2::before{{display:none}}
 td.k{{white-space:nowrap}}.tag{{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--border);background:var(--soft);color:var(--muted);margin-left:4px}}
 </style></head><body><main>
 <header class="doc"><div class="kind">{html.escape(kind)}</div><h1>{html.escape(title)}</h1><div class="meta">{meta}</div></header>

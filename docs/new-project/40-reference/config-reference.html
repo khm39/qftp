@@ -50,6 +50,7 @@ details.vec{border:1px solid var(--border);border-radius:10px;padding:6px 12px;m
 @media (max-width:720px){main{margin:0;padding:24px 16px;border:none;border-radius:0}}
 
 pre.code{background:var(--soft);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55;margin:10px 0}pre.code code{background:none;border:none;padding:0}
+section.nonum>h2{counter-increment:none}section.nonum>h2::before{display:none}
 td.k{white-space:nowrap}.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--border);background:var(--soft);color:var(--muted);margin-left:4px}
 </style></head><body><main>
 <header class="doc"><div class="kind">参照文書</div><h1>設定リファレンス</h1><div class="meta">作成日: 2026-09-03 / 対象: qftp-server、qftp-client、qftp-admin、qftp-web-bridge の設定ファイルとフラグ対応</div></header>
@@ -81,7 +82,7 @@ initial_rate_burst = 100.0
 request_rate_rps = 50.0
 request_rate_burst = 100.0
 max_file_size = &quot;1Gi&quot;
-blocking_threads = 0             # 0 = CPU 数 × 2
+blocking_threads = 0             # 0 = CPU 数 × 2(有効値はログと /metrics の qftp_blocking_threads で確認)
 max_streams_bidi = 4
 idle_timeout = &quot;30s&quot;
 half_open_timeout = &quot;5s&quot;
@@ -122,9 +123,9 @@ bwlimit = &quot;10M&quot;</code></pre>
 <table class=""><thead><tr><th>キー</th><th>型</th><th>既定</th><th>備考</th></tr></thead><tbody><tr><td><code>[defaults].compress</code></td><td>bool</td><td>true</td><td><code>--no-compress</code> で false</td></tr><tr><td><code>[defaults].bwlimit</code></td><td>size/s</td><td>0</td><td><code>--bwlimit</code></td></tr><tr><td><code>[defaults].tofu</code> / <code>tofu_accept_new</code></td><td>bool</td><td>false / false</td><td><code>-T</code> / <code>--tofu-accept-new</code></td></tr><tr><td><code>[defaults].zero_rtt</code></td><td>bool</td><td>true</td><td><code>--no-zero-rtt</code> で false</td></tr><tr><td><code>[defaults].ticket_dir</code> / <code>known_hosts</code> / <code>history</code></td><td>path</td><td><code>~/.qftp/…</code></td><td>対応フラグあり</td></tr><tr><td><code>[defaults].fail_fast</code></td><td>bool</td><td>true</td><td><code>--no-fail-fast</code></td></tr><tr><td><code>[defaults].connect_timeout</code></td><td>duration</td><td>8s</td><td>最後のアドレスは QUIC idle に委ねる</td></tr><tr><td><code>[host.*].endpoint</code></td><td>URL</td><td>なし</td><td><code>qftp://</code> / <code>qftps://</code>。パスワード付きは拒否。<code>user@</code> は将来用に保持</td></tr><tr><td><code>[host.*].host</code> / <code>port</code> / <code>server_name</code></td><td>string / u16 / string</td><td>endpoint から</td><td>明示キーが endpoint に勝つ</td></tr><tr><td><code>[host.*].ca</code> / <code>client_cert</code> / <code>client_key</code></td><td>path</td><td>なし</td><td>cert と key は対で必須</td></tr><tr><td><code>[host.*].initial_path</code></td><td>string</td><td>なし</td><td>接続後に <code>Cd</code></td></tr><tr><td><code>[host.*].insecure</code></td><td>bool</td><td>false</td><td>true にできるだけで、CLI から false に戻す手段はない(<code>--insecure</code> は true のみ)</td></tr><tr><td><code>[host.*].tofu</code> / <code>compress</code> / <code>bwlimit</code></td><td></td><td><code>[defaults]</code></td><td>エイリアス単位の上書き</td></tr></tbody></table>
 <p><strong>解決の例</strong>: <code>qftp-client --bwlimit 1M work</code> は、<code>[defaults]</code> → <code>[host.work].endpoint</code>(host / port / server_name / initial_path)→ <code>[host.work]</code> の明示キー → フラグ <code>--bwlimit</code> の順に上書きされ、最終的に <code>bwlimit = 1M</code>、<code>initial_path = /data</code> になります。</p>
 </section><section id="admin"><h2>qftp-admin / qftp-web-bridge</h2>
-<table class=""><thead><tr><th>プログラム</th><th>フラグ</th><th>既定</th></tr></thead><tbody><tr><td>qftp-admin</td><td><code>--users &lt;path&gt;</code></td><td><code>/etc/qftp/users.toml</code></td></tr><tr><td>qftp-admin</td><td><code>--tokens &lt;path&gt;</code></td><td><code>/etc/qftp/tokens.toml</code></td></tr><tr><td>qftp-admin</td><td><code>--mode &lt;octal&gt;</code></td><td>0600(書込後のファイルモード)</td></tr></tbody></table>
+<table class=""><thead><tr><th>プログラム</th><th>フラグ</th><th>既定</th></tr></thead><tbody><tr><td>qftp-admin</td><td><code>--users &lt;path&gt;</code></td><td><code>/etc/qftp/users.toml</code></td></tr><tr><td>qftp-admin</td><td><code>--tokens &lt;path&gt;</code></td><td><code>/etc/qftp/tokens.toml</code></td></tr><tr><td>qftp-admin</td><td><code>--mode &lt;octal&gt;</code></td><td>0640(書込後のファイルモード。サーバ実行ユーザのグループが読める)</td></tr></tbody></table>
 <pre class="code"><code># /etc/qftp/web-bridge.toml(Web 区分)
-bind = &quot;0.0.0.0:4433&quot;
+bind = &quot;0.0.0.0:4434&quot;             # サーバ(4433)と同一ホストで併走できるよう別ポート
 http_bind = &quot;127.0.0.1:8080&quot;      # 開発用 SPA 配信。省略時は無効
 root = &quot;/srv/qftp&quot;
 users = &quot;/etc/qftp/users.toml&quot;

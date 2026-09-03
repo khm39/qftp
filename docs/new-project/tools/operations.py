@@ -19,7 +19,8 @@ ANSWERS={
 <tr><td><code>qftp_zero_rtt_accepted_total</code> / <code>_rejected_total</code></td><td>counter</td><td>early data の受理 / 拒否</td></tr>
 <tr><td><code>qftp_io_queue_depth</code></td><td>gauge</td><td>ブロッキングプール待ち行列(新規)</td></tr>
 <tr><td><code>qftp_transfer_duration_seconds</code></td><td>histogram</td><td>転送所要時間(新規)</td></tr>
-<tr><td><code>qftp_ls_pages_total</code></td><td>counter</td><td>Ls ページ数(新規)</td></tr></table>
+<tr><td><code>qftp_ls_pages_total</code></td><td>counter</td><td>Ls ページ数(新規)</td></tr>
+<tr><td><code>qftp_tls_cert_expiry_seconds</code></td><td>gauge</td><td>サーバ証明書の <code>notAfter</code>(Unix 秒、新規)</td></tr></table>
 <p><b>ログ</b>: JSON(<code>log.format = "json"</code>)。接続 / identity / 要求 / 転送 / シャットダウンの各イベント。<b>ヘルス</b>: <code>/healthz</code>(200 = 受付ループ生存、503 = シャットダウン中)。<b>OS</b>: プロセス RSS、fd 数、UDP 受信ドロップ(<code>/proc/net/udp</code> の drops)、ストレージルートの空き容量。</p>""",
 "monitoring.tools":"<p>Prometheus + Alertmanager を想定(任意のスクレイパで可)。ログは JSON を Loki / Datadog 等へ。ダッシュボードツールは運用主体が選定(未記入)。</p>",
 "monitoring.dashboards":"",
@@ -28,9 +29,9 @@ ANSWERS={
 <tr><td><code>rate(qftp_connections_rejected_caps_total[5m]) &gt; 0</code> が 10 分継続</td><td>中</td><td>接続上限到達(容量不足または攻撃)</td></tr>
 <tr><td><code>rate(qftp_connections_rejected_rate_total[5m])</code> の急増</td><td>中</td><td>Initial フラッド</td></tr>
 <tr><td><code>rate(qftp_requests_failed_total[5m]) / rate(qftp_requests_total[5m]) &gt; 0.2</code></td><td>中</td><td>エラー率上昇(権限設定ミス、ディスク障害)</td></tr>
-<tr><td><code>qftp_io_queue_depth &gt; blocking_threads × 4</code> が 5 分継続</td><td>中</td><td>ディスクが追いつかない</td></tr>
+<tr><td><code>qftp_io_queue_depth</code> &gt; 有効ブロッキングスレッド数(設定 0 のときは CPU × 2)× 4 が 5 分継続</td><td>中</td><td>ディスクが追いつかない</td></tr>
 <tr><td>ストレージ空き &lt; 10 %</td><td>高</td><td>Put が Internal で失敗し始める</td></tr>
-<tr><td>証明書の残り有効期間 &lt; 14 日</td><td>中</td><td>ローテーション期限</td></tr></table>""",
+<tr><td><code>qftp_tls_cert_expiry_seconds - time() &lt; 14d</code></td><td>中</td><td>ローテーション期限</td></tr></table>""",
 "alerting.escalation":"",
 "alerting.silence-rules":"<p>計画メンテ時は Alertmanager の silence を使用。graceful shutdown 中の <code>/healthz</code> 503 は再起動時間(≤ <code>shutdown_timeout</code> + 起動時間)だけ静観。</p>",
 "incident-response.severity-classification":"""<table><tr><th>区分</th><th>基準</th></tr>

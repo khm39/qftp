@@ -74,7 +74,7 @@ padding, alignment, field tags, or separators**. The primitives are:
 | `Option<T>` | 1 tag byte: `0x00` = none (nothing follows), `0x01` = some, followed by the encoding of `T`. A decoder **MUST** reject any other tag value. |
 | `string` | a `u64` little-endian **byte** length `n`, then exactly `n` bytes of **UTF-8**. |
 | `seq<T>` (variable array) | a `u64` little-endian element count `n`, then `n` encodings of `T`. |
-| `[u8; N]` (fixed array) | exactly `N` raw bytes, with **no** length prefix. |
+| `[u8; N]` (fixed array) | exactly `N` raw bytes, with **no** length prefix. *Reserved: no `qftp/1` message currently uses a fixed array (the digest trailer is raw bytes on the stream, outside any frame).* |
 | struct | the encodings of its fields concatenated in declaration order. |
 | positional enum value | the variant discriminant (`u32` LE), then the encodings of that variant's fields (if any) in declaration order. Discriminants are numbered from `0` in declaration order. Used by [`Request`](#request), [`Response`](#response), and [`ErrorDetails`](#errordetails). |
 | numeric enum value | a single `u32` LE **value** (not a positional index). Used by [`ErrorCode`](#errorresponse), [`FileType`](#filetype), [`HashAlgorithm`](#hashalgorithm), and [`Encoding`](#encoding); each carries an explicitly assigned numeric code, and a value a decoder does not recognise is preserved rather than rejected (see those sections and [versioning.md](versioning.md)). |
@@ -88,11 +88,12 @@ with its fields in declaration order, exactly as a standalone struct.
 
 These rules are complete: every message type below is built from them.
 
-> **Implementation note (non-normative).** The reference implementation
-> obtains exactly this encoding from `bincode` 1.x configured with
-> fixed-int encoding and little-endian byte order. The specification,
-> not bincode, is normative: a future reference implementation MAY use
-> any encoder that produces these bytes.
+> **Implementation note (non-normative).** The prototype implementation
+> obtained exactly this encoding from `bincode` 1.x configured with
+> fixed-int encoding and little-endian byte order; the reference
+> implementation uses a hand-written encoder and decoder validated
+> against the golden vectors. The specification, not any library, is
+> normative.
 
 ## Messages
 
@@ -237,7 +238,7 @@ A struct, carried in `Response::DirListing`.
 
 | Field (wire order) | Type |
 |---|---|
-| `name` | `string` (a single path component; **MUST NOT** contain `/`, `\`, or NUL, and **MUST NOT** be `.` or `..`) |
+| `name` | `string` (a single path component; **MUST NOT** contain `/`, `\`, or NUL, and **MUST NOT** be `.` or `..`). The `\` exclusion is a client-safety rule so names can be used on any platform: a server whose filesystem holds such a name **MUST** omit it from listings. |
 | `file_type` | `FileType` (a `u32` LE value; see [`FileType`](#filetype)) |
 | `size` | `u64` |
 | `modified` | `u64` (seconds since the Unix epoch) |
@@ -272,6 +273,7 @@ not. To bound memory against a hostile peer, an implementation
 |---|---|
 | any `path` / `from` / `to`, and each `DirEntry.name` | 4096 bytes (`0x1000`) |
 | `ErrorResponse.message` | 1024 bytes (`0x0400`) |
+| `Request::Ls.cursor`, `Response::DirListing.next_cursor`, `Response::Path` | 4096 bytes (`0x1000`) |
 | `Response::DirListing` element count (its `seq<DirEntry>`) | 100000 entries **per page** |
 
 With pagination ([qftp-protocol.md](qftp-protocol.md)), the 100000-entry
@@ -279,12 +281,10 @@ cap applies to a single `DirListing` page, not to the whole listing; a
 server **SHOULD** additionally split a page that would otherwise exceed
 a soft byte budget (the reference server uses ~1 MiB).
 
-Note that pagination is **reserved but unimplemented** in the reference
-server (see "Ls pagination" in [qftp-protocol.md](qftp-protocol.md)): the
-`Request::Ls.cursor` and `Response::DirListing.next_cursor` fields are
-fixed in the qftp/1.0 wire, but the reference server always emits
-`next_cursor = None` and treats the 100000-entry cap as an absolute
-limit, refusing larger directories with `ErrorCode::Internal`.
+The reference server closes a page at 10000 entries or roughly 1 MiB,
+whichever comes first (see "Ls pagination" in
+[qftp-protocol.md](qftp-protocol.md)); the 100000 figure is the cap a
+receiver enforces on a single page.
 
 ## Body streaming
 
@@ -358,8 +358,8 @@ client -> server : <digest-length trailer>       (only if checksum_trailer == tr
 server -> client : frame( Response::Ok ) | frame( Response::Err( ErrorResponse ) )
 ```
 
-- The client streams exactly `size` body bytes. For `Identity`, these
-  bytes are plaintext.
+- For `Identity`, the client streams exactly `size` plaintext body
+  bytes.
 - For `Zstd`, the client streams one self-contained zstd frame whose
   decoded output is exactly `plaintext_size` bytes, and
   `size == plaintext_size`. The frame end, not `size`, delimits the

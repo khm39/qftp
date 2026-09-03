@@ -86,4 +86,5 @@ if __name__=="__main__":
         doc=json.load(open(f"{base}/{f}"))
         for vec in doc["vectors"]:
             vn,val,rows=decode_frame(vec["wire_hex"],kind)
+            assert bytes.fromhex(vec["wire_hex"])[4:]==bytes.fromhex(vec["payload_hex"]), vec["name"]
             print(f"{f:18} {vec['name']:28} {vn:12} {len(rows):3} rows  {json.dumps(val,ensure_ascii=False)[:90]}")

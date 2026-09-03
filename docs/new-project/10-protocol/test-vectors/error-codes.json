@@ -1,7 +1,7 @@
 {
   "protocol": "qftp/1",
   "kind": "Response",
-  "note": "One Response::Err per ErrorCode with an empty message, so the on-wire discriminant of every code is fixed and validated. wire_hex = 4-byte big-endian length prefix + payload; see spec/wire-format.md for the normative byte layout.",
+  "note": "One Response::Err per ErrorCode with an empty message, so the on-wire numeric value of every code is fixed and validated. wire_hex = 4-byte big-endian length prefix + payload; see wire-format.md for the normative byte layout.",
   "vectors": [
     {
       "name": "err_NotFound",

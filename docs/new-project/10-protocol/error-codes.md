@@ -44,7 +44,7 @@ reassigned. Each code is exercised by a golden vector in
 | `401` | `Unauthorized` | client | Authentication failed or the user is not configured. |
 | `403` | `PermissionDenied` | client | An ACL or filesystem permission check refused the operation. |
 | `404` | `NotFound` | client | Path resolution found no such file or directory. |
-| `405` | `Unsupported` | client | The operation is not supported in the current context (e.g. a mutation arriving as 0-RTT early data; see [qftp-protocol.md](qftp-protocol.md#0-rtt-session-resumption)). |
+| `405` | `Unsupported` | client | The operation is not supported in the current context (e.g. a request refused as 0-RTT early data, or an unsupported hash algorithm or encoding; see [qftp-protocol.md](qftp-protocol.md#0-rtt-session-resumption)). |
 | `409` | `AlreadyExists` | client | The destination exists and the operation requires that it not (e.g. `Put` with `no_clobber`). |
 | `413` | `FileTooLarge` | client | The payload exceeds the server's configured maximum file size. |
 | `416` | `InvalidRange` | client | A resume `offset` (or `Get` range) is not valid for this file. |
@@ -77,7 +77,7 @@ two named exceptions. Clients **MUST** observe the following:
 | All `4xx` except `429` and `405`-from-0-RTT | `MUST_NOT_RETRY` | The request is permanently rejected as sent; retrying it unchanged will fail identically. The client **MUST NOT** retry. |
 | `429` `RateLimited` | `SHOULD_RETRY` | Retry after a backoff with jitter. When `details` carries [`RetryAfter { millis }`](wire-format.md#errordetails), the client **SHOULD** wait at least that long before the first retry. |
 | `500` `Internal` (and any `5xx`) | `SHOULD_RETRY` | Transient; retry after a backoff with jitter. |
-| `405` `Unsupported` returned for a request refused as **0-RTT early data** | retry **immediately** | The refusal is purely because the request arrived as 0-RTT; once the 1-RTT handshake completes, the same request is valid. The client **SHOULD** replay it immediately after the handshake, with no backoff (the reference client does this transparently). See [qftp-protocol.md](qftp-protocol.md#0-rtt-session-resumption). |
+| `405` `Unsupported` returned for a request refused as **0-RTT early data** | retry **immediately** | The refusal is purely because the request arrived as 0-RTT; once the 1-RTT handshake completes, the same request is valid. The client **MUST** replay it immediately after the handshake, with no backoff. (The reference client never sends application data as early data, so it never receives this refusal; the rule applies to clients that do.) See [qftp-protocol.md](qftp-protocol.md#0-rtt-session-resumption). |
 
 `405` `Unsupported` returned for any other reason (a genuinely
 unsupported operation) is `MUST_NOT_RETRY` like the rest of the `4xx`

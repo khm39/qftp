@@ -1,13 +1,14 @@
 from theme import page, table, code
 from svg import bytes_layout
 MAGIC='"QFT2' + chr(92) + '0FP' + chr(92) + 'n"'
-OUT="/tmp/claude-0/-home-user-qftp/96263040-8562-5047-8304-4e5f08fbf7fd/scratchpad/qftp-design/40-reference/file-formats.html"
+from theme import ROOT
+OUT=f"{ROOT}/40-reference/file-formats.html"
 S=[]
 S.append(("paths","ファイルの配置",f"""
 {table(["ファイル","既定パス","所有 / モード","作成者"],[
  ["サーバ設定","<code>/etc/qftp/server.toml</code>","root / 0644","運用者"],
- ["ユーザ定義","<code>/etc/qftp/users.toml</code>","root / 0640(サーバ実行ユーザが読める)","qftp-admin"],
- ["トークン","<code>/etc/qftp/tokens.toml</code>","root / 0640","qftp-admin"],
+ ["ユーザ定義","<code>/etc/qftp/users.toml</code>","root:&lt;サーバ実行ユーザのグループ&gt; / 0640(admin の <code>--mode</code> 既定)","qftp-admin"],
+ ["トークン","<code>/etc/qftp/tokens.toml</code>","同上","qftp-admin"],
  ["永続自己署名","<code>$XDG_STATE_HOME/qftp/self-signed/{cert.pem,key.pem}</code>","サーバ実行ユーザ / dir 0700、key 0600","qftp-server"],
  ["ストレージルート","<code>root</code> 設定値","サーバ実行ユーザ","運用者"],
  ["クライアント設定","<code>~/.qftp/config.toml</code>","利用者 / 0600 推奨","利用者"],
@@ -36,7 +37,7 @@ permissions = { read = true }''')}
  ["<code>permissions</code> の未指定キー","false"],
  ["相対 home に <code>..</code> を含む","エラー"],
  ["home が root の外(canonicalize 後)","エラー"],
- ["2 ユーザの home が同一または入れ子(anonymous を含む)","エラー(クォータカウンタが独立なため)"],
+ ["write 権限を持つ 2 ユーザの home が同一または入れ子(anonymous を含む)","エラー(クォータカウンタが独立なため)。read-only の anonymous の home は他ユーザの home を含んでよい(ADR-015)"],
  ["name の重複","エラー"],
  ["<code>quota_bytes = 0</code>","エラー"],
  ["home が存在しない","サーバ起動時に作成(0750)"],
@@ -47,7 +48,7 @@ S.append(("tokens","tokens.toml",f"""
 {code('''# tokens.toml(qftp-admin token add が生成。手編集は check で検証すること)
 [[tokens]]
 user = "alice"
-label = "laptop"                                   # user 内で一意
+label = "laptop"                                   # user 内で一意(revoke は --user と組で指定)
 sha256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 created = "2026-09-03T00:00:00Z"                   # RFC 3339
 # expires = "2027-09-03T00:00:00Z"                 # 任意''')}
@@ -56,7 +57,7 @@ created = "2026-09-03T00:00:00Z"                   # RFC 3339
  ["保存","<code>sha256(token 文字列の UTF-8)</code> を小文字 hex 64 桁で保存(ADR-012)"],
  ["照合","受信文字列を SHA-256 し、全エントリと定数時間比較(早期終了しない)。一致したエントリの <code>user</code> が users.toml に存在しなければ拒否"],
  ["検証","<code>user</code> の存在、<code>label</code> の一意性、hex の長さ、未知キー"],
- ["失効","エントリ削除(<code>token revoke</code>)または <code>expires</code>。再読込は再起動(将来 SIGHUP)"],
+ ["失効","エントリ削除(<code>token revoke --user &lt;user&gt; &lt;label&gt;</code>)または <code>expires</code>。再読込は再起動(将来 SIGHUP)"],
 ])}
 """))
 S.append(("known-hosts","known_hosts",f"""

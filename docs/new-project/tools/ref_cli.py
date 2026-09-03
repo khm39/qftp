@@ -1,5 +1,6 @@
 from theme import page, table, code
-OUT="/tmp/claude-0/-home-user-qftp/96263040-8562-5047-8304-4e5f08fbf7fd/scratchpad/qftp-design/40-reference/cli-reference.html"
+from theme import ROOT
+OUT=f"{ROOT}/40-reference/cli-reference.html"
 S=[]
 S.append(("conventions","共通規約",f"""
 {table(["規約","内容"],[
@@ -27,7 +28,7 @@ S.append(("server","qftp-server",f"""
 qftp-server --check-config [--config <path>] [フラグ…]
 qftp-server --generate-completions <bash|zsh|fish|powershell>
 qftp-server --version | --long-version''')}
-<p>フラグは設定リファレンスのキーと 1:1 で対応します(例: <code>limits.max_connections</code> → <code>--max-connections</code>)。フラグは設定ファイルの値を上書きします。終了コード: 0 正常終了(シグナルによる graceful を含む)、1 設定 / 起動失敗、2 実行時致命エラー(bind 喪失など)。</p>
+<p>フラグと設定キーの対応表は設定リファレンス §2 にあります(多くは <code>limits.max_connections</code> → <code>--max-connections</code> のように末尾のキー名、一部は <code>tls.state_dir</code> → <code>--self-signed-state-dir</code> のように異なる)。フラグは設定ファイルの値を上書きします。終了コード: 0 正常終了(シグナルによる graceful を含む)、1 設定 / 起動失敗、2 実行時致命エラー(bind 喪失など)。</p>
 {table(["シグナル","動作"],[["SIGTERM / SIGINT","graceful shutdown(新規拒否 → 転送完了待ち → <code>shutdown_timeout</code> で強制)"],["SIGHUP","将来: users.toml 再読込。コア区分では無視"]])}
 """))
 S.append(("client-global","qftp-client: 起動形態とグローバルフラグ",f"""
@@ -60,10 +61,11 @@ qftp-client [フラグ…] <SUBCOMMAND> …                   # one-shot''')}
 """))
 S.append(("oneshot","qftp-client: one-shot サブコマンド",f"""
 {table(["サブコマンド","引数","オプション","動作"],[
- ["<code>ls</code>","REMOTE","<code>-l</code>(詳細)、<code>-a</code>(temp を含めない、常に)","全ページを取得して表示"],
+ ["<code>ls</code>","REMOTE","<code>-l</code>(uid / gid / ナノ秒を追加)","全ページを取得して表示。temp(<code>*.qftp.partial</code>)はサーバが常に非表示"],
+ ["<code>mget</code>","REMOTE_GLOB [LOCAL_DIR]","<code>-n</code>、<code>-f</code>","glob は最後のパス要素のみ。ディレクトリはスキップ"],
  ["<code>stat</code>","REMOTE","","1 件のメタデータ"],
  ["<code>get</code>","REMOTE [LOCAL]","<code>-r</code>(拡張区分)、<code>-n/--no-clobber</code>、<code>-f/--force</code>、<code>-i/--interactive</code>、<code>--dry-run</code>","LOCAL 省略時はリモートの basename。既存があれば上書き規則に従い、規則が「再開」なら自動再開"],
- ["<code>put</code>","LOCAL… REMOTE","同上","REMOTE が <code>/</code> で終わる、または LOCAL が複数ならディレクトリ扱い。partial があれば再開"],
+ ["<code>put</code>","LOCAL… REMOTE","同上","REMOTE が <code>/</code> で終わる、または LOCAL が複数ならディレクトリ扱い。partial があれば再開(<code>-f</code> は Stat を省略して 0 から)"],
  ["<code>mkdir</code> / <code>rmdir</code> / <code>rm</code>","REMOTE","",""],
  ["<code>rename</code>","FROM TO","","同一ホスト(同一 alias または同一 host:port)必須"],
  ["<code>chmod</code>","MODE REMOTE","","8 進"],
@@ -82,7 +84,7 @@ S.append(("oneshot","qftp-client: one-shot サブコマンド",f"""
 """))
 S.append(("repl","qftp-client: REPL コマンド",f"""
 {table(["コマンド","構文","動作"],[
- ["<code>ls</code> / <code>dir</code>","<code>ls [-l] [path]</code>","全ページ取得。<code>-l</code> で mode / uid / gid / mtime を表示"],
+ ["<code>ls</code> / <code>dir</code>","<code>ls [-l] [path]</code>","全ページ取得。既定で mode / サイズ / mtime / 名前、<code>-l</code> で uid / gid / ナノ秒を追加"],
  ["<code>cd</code>","<code>cd [path]</code>","省略は <code>/</code>"],
  ["<code>pwd</code>","","仮想絶対パス"],
  ["<code>get</code>","<code>get [-r] [-n|-f] &lt;remote&gt; [local]</code>","one-shot と同じ規則。既定は確認(TTY)"],
@@ -124,7 +126,7 @@ lrwxrwxrwx      -  2026-09-03 12:00  link -> (symlink)''')}
 <h3>--json(one-shot)</h3>
 {JSONTAB}
 <h3>ErrorCode → 終了コード</h3>
-{table(["ErrorCode","終了コード"],[["Malformed","64"],["Unauthorized、PermissionDenied","77"],["NotFound、Unsupported、AlreadyExists、FileTooLarge、InvalidRange、NotADirectory、IsADirectory、ChecksumMismatch、UploadOverflow、UploadTruncated、QuotaExceeded、DecodeError","65"],["RateLimited(再試行後も失敗)","65"],["Internal、Unknown(5xx)","65"],["Unknown(4xx)","65"]])}
+{table(["ErrorCode","終了コード","再試行"],[["Malformed","64","なし"],["Unauthorized、PermissionDenied","77","なし"],["NotFound、Unsupported、AlreadyExists、FileTooLarge、InvalidRange、NotADirectory、IsADirectory、ChecksumMismatch、UploadOverflow、UploadTruncated、QuotaExceeded、DecodeError","65","なし(StalePartial / UnsupportedEncoding の内部 1 回再試行を除く)"],["RateLimited","65(再試行後も失敗した場合)","<code>RetryAfter</code> 後に 1 回"],["Internal、Unknown(5xx)","65","なし(仕様の SHOULD_RETRY は満たさない。スクリプト側で制御)"],["Unknown(4xx)","65","なし"]])}
 """))
 S.append(("admin","qftp-admin",f"""
 {code('''qftp-admin [--users <path>] [--tokens <path>] [--mode <octal>] <SUBCOMMAND>
@@ -136,10 +138,10 @@ S.append(("admin","qftp-admin",f"""
   set-quota <name> (--bytes <size> | --unlimited)
   set-anonymous (--home <path> [--read=<bool>] … | --remove)
   token add <user> [--label <text>]        # 平文トークンを 1 回だけ stdout に出す
-  token revoke (<label> | --user <user> --all)
+  token revoke --user <user> (<label> | --all)
   token list [--json]
   check                                     # 両ファイルをサーバと同じ検証器で検証
   generate-completions <shell>''')}
-<p>終了コード: 0 / 64 usage / 65 検証失敗(重複、未知ユーザ、home の入れ子など)/ 74 I/O。書込は同一ディレクトリの temp に書いて fsync し rename、モードは <code>--mode</code>(既定 0600)。</p>
+<p>終了コード: 0 / 64 usage / 65 検証失敗(重複、未知ユーザ、home の入れ子など)/ 74 I/O。書込は同一ディレクトリの temp に書いて fsync し rename、モードは <code>--mode</code>(既定 0640。ファイル形式リファレンス §1 の配置に合わせる)。</p>
 """))
 page("CLI リファレンス","参照文書","作成日: 2026-09-03 / 対象: qftp-server、qftp-client、qftp-admin",S,OUT)

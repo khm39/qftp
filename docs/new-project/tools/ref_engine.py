@@ -1,5 +1,6 @@
 from theme import page, table, code
-OUT="/tmp/claude-0/-home-user-qftp/96263040-8562-5047-8304-4e5f08fbf7fd/scratchpad/qftp-design/40-reference/engine-api.html"
+from theme import ROOT
+OUT=f"{ROOT}/40-reference/engine-api.html"
 S=[]
 S.append(("scope","位置づけと設計原則",f"""
 <p><code>qftp-core::transfer</code> の公開 API を定義します。機能設計書(転送エンジン)の規則を型と契約に落としたもので、実装は本書の型名・意味に従います。名前の変更は本書の改訂を伴います。</p>
@@ -20,7 +21,8 @@ pub type IoId = u32;
 
 /// ホスト → エンジン
 pub enum Event {
-    /// ストリームから受信した本体 / トレーラのバイト列(空は禁止)
+    /// ストリームから受信した本体 / トレーラのバイト列(空は禁止)。
+    /// Rehash 中はホストが受信を止める(H2 参照)ので、エンジン内の保留は write_chunk × max_inflight_writes に収まる
     Bytes(Bytes),
     /// ピアが FIN を送った(Bytes より後に 1 回だけ)
     Fin,
@@ -121,15 +123,15 @@ pub enum GetState { Prefix, Body, Trailer, Done, Failed }''')}
 <h3>状態表</h3>
 {table(["状態","受け付ける Event","動作 / 発行する Cmd","遷移"],[
  ["Prefix(offset &gt; 0)","ReadDone","データをハッシュに畳む。残りがあれば次の ReadFile、なければ Body へ(初回の本体 ReadFile を発行)","Prefix / Body"],
- ["Prefix","ReadDone が短い(EOF)","ファイル縮小。<code>Respond(Err InvalidRange)</code>、<code>Done(Failed)</code>","Failed"],
+ ["Prefix","ReadDone が短い(EOF)/ ReadFailed","ファイル縮小・読み取り失敗。FileReady 送出後なので <code>Respond(Err)</code> は使えない(本体と区別できない)。<code>ResetStream(0x52 / 0x51)</code>、<code>Done(Failed)</code>","Failed"],
  ["Body","ReadDone","ハッシュ更新 → (Zstd なら符号化) → 送信待ちバッファへ。SendCapacity の範囲で <code>Send</code>。バッファが read_chunk 未満なら次の ReadFile","Body / Trailer"],
  ["Body","SendCapacity(n)","待ちバッファから n バイトまで <code>Send</code>",""],
  ["Body","ReadDone が短い","ファイル縮小。<code>ResetStream(0x52)</code>、<code>Done(Failed)</code>","Failed"],
  ["Body","ReadFailed","<code>ResetStream(0x51)</code>、<code>Done(Failed)</code>","Failed"],
  ["Trailer","SendCapacity","トレーラ(digest_len バイト)を <code>Send{fin:true}</code>。送り切ったら <code>Done(Completed)</code>","Done"],
- ["任意","Cancel","<code>Done(Cancelled)</code>","Done"],
+ ["任意","Cancel","FileReady 送出後なら <code>ResetStream(0x53)</code>、<code>Done(Cancelled)</code>","Done"],
 ])}
-<p>Identity で <code>bytes == 0</code> のときは本体区分を飛ばし、トレーラだけを送ります。Zstd で 0 のときは空の zstd フレームを送ってからトレーラを送ります。<code>Send</code> の合計は常に <code>SendCapacity</code> の現在値以下で、ホストは <code>Send</code> を必ず全量受理します。</p>
+<p>Identity で <code>bytes == 0</code> のときは本体区分を飛ばし、トレーラだけを送ります。Zstd で 0 のときは仕様上は空の zstd フレームを送りますが、コーデック選択規則(≥ 1024 バイト)により本エンジンでは発生しません。<code>Send</code> の合計は常に <code>SendCapacity</code> の現在値以下で、ホストは <code>Send</code> を必ず全量受理します。</p>
 """))
 S.append(("put-server","PutServer",f"""
 {code('''pub struct PutParams {
@@ -144,7 +146,7 @@ pub struct PutServer { /* 非公開 */ }
 
 impl PutServer {
     /// 検証失敗時は Err((ErrorResponse, Vec<Cmd>))。Vec<Cmd> は後始末(Abort/Account)を含む。
-    /// 成功時の Vec<Cmd> は予約の Account と、再開なら ReadFile(プレフィクス)から始まる。
+    /// 予約(in_flight += size)はホストが start の前に行う。成功時の Vec<Cmd> は再開なら ReadFile(プレフィクス)から始まる。
     pub fn start(p: PutParams) -> Result<(PutServer, Vec<Cmd>), (ErrorResponse, Vec<Cmd>)>;
     pub fn on_event(&mut self, ev: Event) -> Vec<Cmd>;
     pub fn state(&self) -> PutState;
@@ -160,12 +162,12 @@ pub enum PutState { Rehash, Body, Trailer, Verify, Committing, Done, Failed }'''
  ["<code>offset + size &gt; max_file_size</code>","<code>FileTooLarge</code>"],
  ["<code>offset &gt; 0 &amp;&amp; temp_len != Some(offset)</code>","<code>InvalidRange</code> + <code>Range { offset, file_size: temp_len.unwrap_or(0) }</code>"],
  ["<code>quota.used + quota.in_flight + size &gt; limit</code>","<code>QuotaExceeded</code>。fresh なら <code>Abort{keep_partial:false}</code>"],
- ["成功","<code>Account { release_reserved: 0, used_delta: 0 }</code> は出さず、ホストが予約 <code>size</code> を in_flight に加える前提(<code>QuotaView</code> は予約前の値)。エンジンは終了時に必ず <code>release_reserved = size</code> を返す"],
+ ["成功","エンジンは予約を出さない。ホストが <code>start</code> の前に <code>size</code> を in_flight に加える(<code>QuotaView</code> は予約前の値)。エンジンは終了時に必ず <code>release_reserved = size</code> を返す"],
 ])}
 <p><code>no_clobber</code> の既存検査と <code>UploadClaim</code> は<strong>ホストの責務</strong>(パス解決と同じ段階)で、エンジンは claim 済み・temp open 済みで開始されます。</p>
 <h3>状態表</h3>
 {table(["状態","Event","動作 / Cmd","遷移"],[
- ["Rehash(offset &gt; 0)","ReadDone","プレフィクスをハッシュ。残りがあれば次の ReadFile。到着した Bytes は内部バッファに保留(上限 write_chunk × max_inflight_writes、超過分はホストの受信を止める <code>SendCapacity</code> 相当がないため、エンジンは保留を許容し続ける)","Rehash / Body"],
+ ["Rehash(offset &gt; 0)","ReadDone","プレフィクスをハッシュ。残りがあれば次の ReadFile。到着済みの Bytes は内部バッファに保留し、Body に移ったら順に処理する。保留の上限は write_chunk × max_inflight_writes で、ホストは Rehash 中の受信を止める(H2)","Rehash / Body"],
  ["Rehash","ReadDone が短い / ReadFailed","<code>Respond(Err InvalidRange)</code>、<code>Abort{keep_partial:true}</code>、Account、Done","Failed"],
  ["Body","Bytes","本体 / トレーラ / 超過に分類。本体は(Zstd なら復号し)平文カウンタを更新、<code>WriteFile</code> を発行(in-flight ≤ max_inflight_writes、超えたら内部に溜める)。超過は <code>UploadOverflow</code> + <code>Upload{received,declared}</code>","Body / Trailer / Failed"],
  ["Body","Bytes(Zstd 不正 / 窓超過)","<code>DecodeError</code>","Failed"],
@@ -197,7 +199,8 @@ S.append(("client","GetClient / PutClient",f"""
 }
 pub enum ClientEvent {
     Bytes(Bytes), Fin, SendCapacity(usize),
-    ReadDone { id: IoId, data: Bytes },   // ローカルプレフィクスの読み取り
+    ReadDone { id: IoId, data: Bytes },   // ローカルプレフィクス / Put 本体の読み取り
+    ReadFailed { id: IoId, error: IoError },
     WriteDone { id: IoId }, WriteFailed { id: IoId, error: IoError },
     ResetReceived(u64), Cancel,
 }
@@ -233,8 +236,9 @@ impl PutClient { pub fn start(p: PutClientParams) -> (PutClient, Vec<ClientCmd>)
  ["Zstd で <code>size != plaintext_size</code>、または <code>plaintext_size &gt; max_file_size</code>","<code>ProtocolError</code>"],
  ["<code>offset + size != total_size</code>(length 未指定時)","<code>ProtocolError</code>"],
  ["再開なのに <code>checksum_follows == false</code>","<code>ProtocolError</code>"],
- ["サーバの <code>Err(InvalidRange)</code> で offset &gt; 0","<code>StalePartial</code>(呼び出し側が DeleteLocal 後に 0 から再試行)"],
- ["本体途中の Fin、トレーラ不一致、復号失敗","DeleteLocal、<code>Failed</code>"],
+ ["サーバの <code>Err(InvalidRange)</code> で offset &gt; 0、または再開時(offset &gt; 0)のトレーラ不一致","エンジンが <code>DeleteLocal</code> を出し <code>Done(StalePartial)</code>。呼び出し側は 0 から 1 回だけ再試行する"],
+ ["fresh(offset == 0)のトレーラ不一致、本体途中の Fin、復号失敗","DeleteLocal、<code>Failed</code>"],
+ ["Cancel / <code>ResetReceived</code>","ローカルの受信済み分を残す(次回再開)。<code>Done(Cancelled)</code> / <code>Failed</code>"],
  ["<code>checksum_follows == false</code>(fresh)","受理するが <code>verified = false</code>"],
 ])}
 <h3>PutClient の振る舞い</h3>
@@ -249,7 +253,7 @@ impl PutClient { pub fn start(p: PutClientParams) -> (PutClient, Vec<ClientCmd>)
 S.append(("host","ホスト契約",f"""
 {table(["#","契約"],[
  ["H1","ホストは 1 エンジンの <code>on_event</code> / <code>start</code> を同一タスク上で逐次に呼ぶ。返された <code>Vec&lt;Cmd&gt;</code> は<strong>順序どおり</strong>に実行する"],
- ["H2","<code>Event::Bytes</code> と <code>Event::Fin</code> はストリームの到着順。空の Bytes は送らない。Fin の後に Bytes を送らない"],
+ ["H2","<code>Event::Bytes</code> と <code>Event::Fin</code> はストリームの到着順。空の Bytes は送らない。Fin の後に Bytes を送らない。H12 の間は送らない"],
  ["H3","<code>SendCapacity(n)</code> は「今すぐ受理できるバイト数」の現在値。最初の値は <code>start</code> 直後に必ず 1 回送る。値が変わるたび(quiche の <code>stream_capacity</code> が増えたとき)に送る"],
  ["H4","<code>Cmd::Send</code> のデータは全量受理する。受理できない場合はホストの側でバッファし、以後 <code>SendCapacity</code> を 0 として報告し、バッファが空になってから実際の値を報告する"],
  ["H5","<code>ReadFile</code> / <code>WriteFile</code> は完了順が要求順と同じでなくてよいが、<strong>WriteFile の適用順は要求順</strong>(ホストは単一ワーカーまたは順序保証キューで実行する)。完了イベントの <code>id</code> は要求の id"],
@@ -258,7 +262,8 @@ S.append(("host","ホスト契約",f"""
  ["H8","<code>Abort</code> はホストが temp を削除(keep_partial=false)または保持する。<code>Account</code> は <code>User</code> の atomics に反映する。どちらもエンジンからの順序で実行"],
  ["H9","接続断・シャットダウン・ストリーム reset 受信時は <code>Cancel</code> を 1 回送り、返された Cmd を実行してからエンジンを破棄する"],
  ["H10","<code>Done</code> の後にエンジンへ Event を送らない。送った場合エンジンは無視する(debug ビルドでは assert)"],
- ["H11","エンジンが <code>Respond(Err)</code> を返したら、ホストはそれをフレームとして送り、続く <code>Done(Failed)</code> まで Cmd を処理してストリームを FIN で閉じる"],
+ ["H11","<code>Respond</code> は FIN を立てずに送る。<code>Done</code> を受けたらホストがストリームを FIN で閉じる(Ok / Err とも)。<code>Send{fin:true}</code> を出した後の Done では二重に FIN を立てない"],
+ ["H12","Rehash 中(<code>PutState::Rehash</code>)はホストがストリームからの受信を止め(<code>stream_recv</code> を呼ばない)、Body に移ってから再開する。QUIC の流量制御が自然にバックプレッシャになる"],
 ])}
 <h3>quiche ホスト(サーバ)の擬似コード</h3>
 {code('''// dispatch: ストリームごとの状態 = Engine + 送信待ちバッファ + in-flight I/O
@@ -282,5 +287,37 @@ loop {
 }''')}
 <h3>テスト用ホスト</h3>
 <p><code>qftp-core/tests/engine_*.rs</code> は純メモリのホスト(<code>ScriptHost</code>)でエンジンを駆動します。ファイルは <code>Vec&lt;u8&gt;</code>、ストリームは <code>VecDeque&lt;Bytes&gt;</code>、送信余地は任意の数列を与えられます。各テストは「Event 列 → 期待 Cmd 列」の表で書き、状態表の全遷移を網羅します(e2e テスト仕様 CORE-* を参照)。</p>
+"""))
+S.append(("client-core","qftp-client-core の公開型",f"""
+<p>e2e テスト仕様と CLI が参照する <code>qftp-client-core</code> の公開 API を定めます。エンジンのクライアント側状態機械(§5)をこの Session が駆動します。</p>
+{code('''pub enum TrustPolicy {
+    Ca { bundle: Option<PathBuf> },      // None = システムルート。SAN / CN でホスト名検証
+    Tofu { known_hosts: PathBuf, accept_new: bool },
+    Insecure,
+}
+pub enum ConnectError {
+    Unavailable(String),                 // 全アドレス失敗、ALPN 不一致、タイムアウト → exit 69
+    Trust(TrustError),                   // → exit 77
+    Rejected(u64),                       // サーバの close コード(0x101 = identity 拒否)→ exit 77
+}
+pub enum TrustError { Mismatch { host: String, known_hosts: PathBuf }, NewHostRefused, Hostname, Chain }
+
+pub struct Session { /* quiche 接続、ストリーム採番、cwd、統計 */ }
+impl Session {
+    pub fn connect(spec: &ConnectSpec, trust: &TrustPolicy, opts: &Options) -> Result<Session, ConnectError>;
+    pub fn is_resumed(&self) -> bool;                      // 0-RTT チケットで再開したか
+    pub fn request(&mut self, req: Request) -> Result<Response, SessionError>;   // 逐次 1 要求
+    pub fn ls_all(&mut self, path: &str) -> Result<Vec<DirEntry>, SessionError>;  // next_cursor を追う
+    pub fn get(&mut self, remote: &str, local: &Path, opts: &GetOptions) -> Result<TransferReport, TransferError>;
+    pub fn put(&mut self, local: &Path, remote: &str, opts: &PutOptions) -> Result<TransferReport, TransferError>;
+    pub fn quit(self) -> Result<(), SessionError>;          // Quit → Ok → チケット保存
+}
+pub enum SessionError { Server(ErrorResponse), Disconnected, Protocol(&'static str) }
+pub enum TransferError { Server(ErrorResponse), Local(io::Error), Verify, Protocol(&'static str), Disconnected }
+pub struct TransferReport { pub bytes: u64, pub resumed_from: u64, pub encoding: Encoding, pub verified: bool, pub elapsed: Duration }
+pub struct GetOptions { pub overwrite: Overwrite, pub accept_zstd: bool }
+pub struct PutOptions { pub overwrite: Overwrite, pub compress: bool, pub no_clobber: bool, pub mode: u32 }
+pub enum Overwrite { Resume, Force, Skip, Ask(Box<dyn FnMut(&Prompt) -> Choice>) }''')}
+<p><code>get</code> / <code>put</code> は StalePartial と UnsupportedEncoding の 1 回再試行を内部で行い、<code>TransferReport.resumed_from</code> に再開位置を返します。<code>RateLimited</code> は <code>RetryAfter</code> 後に 1 回だけ再試行します。5xx は再試行しません。</p>
 """))
 page("転送エンジン API 仕様","参照文書","作成日: 2026-09-03 / 対象: qftp-core::transfer / 前提: 機能設計書「転送エンジン」、ADR-002 / ADR-005 / ADR-009",S,OUT)

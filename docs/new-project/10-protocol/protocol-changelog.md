@@ -66,7 +66,7 @@ authoritative.
   the earlier "unknown `ErrorCode` = `Malformed`" rule. See
   [error-codes.md](error-codes.md).
 - **Structured error details.** `ErrorResponse` gains an optional
-  `details: Option<ErrorDetails>`, a `u32`-tagged, non-exhaustive enum
+  `details: Option<ErrorDetails>`, a positional `u32`-discriminant enum (adding a variant is a major-version change, see [versioning.md](versioning.md))
   carrying machine-readable context: `Range { offset, file_size }`
   (InvalidRange), `Upload { received, declared }`
   (UploadOverflow/UploadTruncated), and `RetryAfter { millis }`
@@ -94,16 +94,17 @@ authoritative.
   `Identity=0`, `Zstd=1`) is added for opt-in body compression.
   `Request::Get` appends `accept_encoding: seq<Encoding>`, and both
   `Request::Put` and `Response::FileReady` append `encoding: Encoding`
-  plus `plaintext_size: u64`. `Identity` is the default; compressed
-  transfers use `size` for encoded wire bytes and `plaintext_size` for
-  decoded plaintext bytes. The BLAKE3 trailer and resume `offset`
+  plus `plaintext_size: u64`. `Identity` is the default; for
+  compressed transfers `size` equals `plaintext_size` (both count
+  plaintext bytes) and the codec frame, not `size`, delimits the wire
+  body. The BLAKE3 trailer and resume `offset`
   remain plaintext-domain. `ErrorCode::DecodeError` is assigned `431`
   for malformed compressed frames or zstd windows exceeding
   `window_log = 23` (8 MiB).
 
 Compatible refinements landed in the same revision (not new breaks):
 the `Put` FIN/trailer framing was clarified (FIN on the last trailer
-byte when a trailer follows, else on the last body byte; `size == 0`
+byte when a trailer follows, else on the last body byte; `Identity` with `size == 0`
 skips the body phase; a short trailer is `UploadTruncated`, never a
 silent fall-back to the header checksum); resume checksum/`total_size`
 semantics were tightened (a shrink mid-resume is `InvalidRange`;

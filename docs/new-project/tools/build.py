@@ -1,12 +1,14 @@
 import re, json, os, sys, html, importlib
-SK = "/root/.claude/skills/synced/a3bc8980-9c40-45da-a3f1-c79a0b43a0d6_84a5c1bf-12e3-43dd-b79d-0b7691f78c50/design-doc-writer"
-OUT = "/tmp/claude-0/-home-user-qftp/96263040-8562-5047-8304-4e5f08fbf7fd/scratchpad/qftp-design/20-design"
+HERE = os.path.dirname(os.path.abspath(__file__))
+TPL = os.path.join(HERE, "templates")
+ROOT = os.environ.get("QFTP_DESIGN_ROOT", os.path.dirname(HERE))
+OUT = os.path.join(ROOT, "20-design")
 LABELS = {"feature":"機能設計書","screen":"画面設計書","architecture":"アーキテクチャ設計書","sequence":"シーケンス設計書","batch":"バッチ処理設計書","operations":"運用設計書"}
 DATE = "2026-09-03"
 
 def load_spec(doc_type):
     secs=[]
-    for line in open(f"{SK}/references/{doc_type}.md",encoding="utf-8"):
+    for line in open(f"{TPL}/references/{doc_type}.md",encoding="utf-8"):
         m=re.match(r"^## \d+\. (.+?) \(([a-z0-9\-]+)\)\s*$",line)
         if m: secs.append({"id":m.group(2),"name":m.group(1),"fields":[]}); continue
         m=re.match(r"^- (.+?) \(([a-z0-9\-]+)\):",line)
@@ -15,7 +17,7 @@ def load_spec(doc_type):
 
 PLACEHOLDERS={"","未定","TBD","-"}
 def build(doc_type,title,answers,filename):
-    skel=open(f"{SK}/assets/skeleton.html",encoding="utf-8").read()
+    skel=open(f"{TPL}/skeleton.html",encoding="utf-8").read()
     secs=load_spec(doc_type)
     parts=[]; meta={}
     used=set()

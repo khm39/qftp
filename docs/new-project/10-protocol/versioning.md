@@ -112,6 +112,22 @@ Either kind of addition is a documented wire change: each **MUST** be
 recorded in [protocol-changelog.md](protocol-changelog.md) with new
 golden vectors in [`test-vectors/`](test-vectors/).
 
+## Decode defaults for appended fields
+
+The compression schema was folded into `qftp/1` before any release, so
+no deployed peer emits the shorter, pre-compression layouts. A decoder
+is nevertheless permitted to accept those shorter layouts (a frame that
+ends immediately after the last pre-compression field) and **MUST**, if
+it does, substitute exactly these defaults:
+
+| Message | Appended field(s) | Default when absent |
+|---|---|---|
+| `Request::Get` | `accept_encoding` | empty `seq` (Identity only) |
+| `Request::Put` | `encoding`, `plaintext_size` | `Identity`, `0` |
+| `Response::FileReady` | `encoding`, `plaintext_size` | `Identity`, `0` |
+
+Any future append-only revision **MUST** add its defaults to this table.
+
 ## Recording changes
 
 Every change to the bytes on the wire **MUST** be reflected in
