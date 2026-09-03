@@ -26,6 +26,7 @@ these documents are to be interpreted as described in RFC 2119.
 
 | Document | Contents |
 |---|---|
+| [qftp-protocol-guide.html](qftp-protocol-guide.html) | **Illustrated guide (Japanese, HTML).** Sequence diagrams, byte-layout figures, and annotated hex dumps generated from the golden vectors. Non-normative: the Markdown documents below win on any conflict. |
 | [qftp-protocol.md](qftp-protocol.md) | Transport, streams, path resolution, and the semantics of every operation (Get/Put resume, checksums, compression, 0-RTT, retry, rate limiting). The entry point. |
 | [wire-format.md](wire-format.md) | Byte-for-byte encoding of every control message: framing, primitive encodings, and per-message field layouts. |
 | [error-codes.md](error-codes.md) | The `ErrorCode` registry: the on-wire value and meaning of each code, the retryability rules, and the rule for unknown codes. |

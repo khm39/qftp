@@ -1,6 +1,6 @@
 # qftp 新規プロジェクト 設計パッケージ
 
-作成日: 2026-09-03 / 更新: 2026-09-03(クレート構成を 12 → 8 に整理、ADR-006 を wtransport で確定、ADR-001/005 を tokio current_thread に変更)
+作成日: 2026-09-03 / 更新: 2026-09-03(クレート構成を 12 → 8 に整理、ADR-006 を wtransport で確定、ADR-001/005 を tokio current_thread に変更、プロトコル図解版 HTML を追加)
 
 本パッケージは、QUIC 上のファイル転送プロトコル **qftp/1** の実装を新規リポジトリで起こすための設計一式です。**このパッケージだけで自己完結**しており、プロトタイプのリポジトリを参照する必要はありません。
 
@@ -9,7 +9,7 @@
 | ディレクトリ | 内容 | 状態 |
 |---|---|---|
 | `00-background/` | `prototype-assessment.md`(プロトタイプの挙動棚卸しと問題一覧)、`decisions.md`(ADR-001〜006) | 完成 |
-| `10-protocol/` | ワイヤプロトコル仕様(正本)。README / qftp-protocol / wire-format / error-codes / versioning / security-model / protocol-changelog、`test-vectors/` | 完成(凍結済み仕様の移植) |
+| `10-protocol/` | ワイヤプロトコル仕様(正本)。README / qftp-protocol / wire-format / error-codes / versioning / security-model / protocol-changelog、`test-vectors/`。**`qftp-protocol-guide.html`**(図解版: シーケンス図・バイト配置図・ベクタの注釈つきダンプ。非規範) | 完成(凍結済み仕様の移植 + 図解版) |
 | `20-design/` | 設計書(HTML、ブラウザで開く。印刷対応) | 骨組み + 判明分を記入 |
 | `30-plan/` | `roadmap.md`(フェーズと完了条件)、`repository-layout.md`(リポジトリ構成と 8 クレート) | 完成 |
 
