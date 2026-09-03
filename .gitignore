@@ -3,3 +3,6 @@
 # Operator-created secrets for the docker-compose example; only the
 # `.example` template is tracked, never the real tokens (see #311 S14).
 /examples/docker-compose/tokens.toml
+
+# Python bytecode from docs/new-project/tools generators
+__pycache__/
