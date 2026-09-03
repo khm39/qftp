@@ -1,6 +1,6 @@
 # qftp 新規プロジェクト 設計パッケージ
 
-作成日: 2026-09-03
+作成日: 2026-09-03 / 更新: 2026-09-03(クレート構成を 12 → 8 に整理)
 
 本パッケージは、QUIC 上のファイル転送プロトコル **qftp/1** の実装を新規リポジトリで起こすための設計一式です。**このパッケージだけで自己完結**しており、プロトタイプのリポジトリを参照する必要はありません。
 
@@ -11,7 +11,7 @@
 | `00-background/` | `prototype-assessment.md`(プロトタイプの挙動棚卸しと問題一覧)、`decisions.md`(ADR-001〜006) | 完成 |
 | `10-protocol/` | ワイヤプロトコル仕様(正本)。README / qftp-protocol / wire-format / error-codes / versioning / security-model / protocol-changelog、`test-vectors/` | 完成(凍結済み仕様の移植) |
 | `20-design/` | 設計書(HTML、ブラウザで開く。印刷対応) | 骨組み + 判明分を記入 |
-| `30-plan/` | `roadmap.md`(フェーズと完了条件)、`repository-layout.md`(リポジトリ構成とクレート) | 完成 |
+| `30-plan/` | `roadmap.md`(フェーズと完了条件)、`repository-layout.md`(リポジトリ構成と 8 クレート) | 完成 |
 
 ## 設計書一覧(`20-design/`)
 
@@ -37,7 +37,8 @@
 2. ネイティブサーバ / クライアントの QUIC スタックは **quiche + mio**(ADR-001)。
 3. Get / Put の転送エンジンは **sans-I/O の状態機械**として 1 実装し、quiche ループ・ブリッジ・テストが共有する(ADR-002)。
 4. ワイヤ符号化は手書き codec(ADR-003)。ディスク I/O は I/O ワーカープールへ(ADR-005)。
-5. MVP はサーバ + CLI クライアント。再帰転送・admin は Phase 5、sync / watch は Phase 6、Web は Phase 7。
+5. クレートは 8 つ(wire / core / quic / server / client-core / client / admin / e2e)+ fuzz。conformance・testkit・bench は独立クレートにしない。
+6. MVP はサーバ + CLI クライアント。再帰転送・admin は Phase 5、sync / watch は Phase 6、Web は Phase 7。
 
 ## 未決事項
 
