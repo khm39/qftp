@@ -4,7 +4,7 @@
 
 | Phase | 内容 | 完了条件 |
 |---|---|---|
-| 0 | 新リポジトリ作成、`10-protocol/` を `spec/` として配置、ADR 配置、CI 骨格(fmt / clippy / MSRV / aarch64 クロスビルド / conformance)、**quiche spike**(サーバ側 early data 受理と 1-RTT ゲート、stateless retry、GSO、mio + ワーカープールの起床方式、tokio-quiche の可否) | spike の結果を ADR-001 に追記。CI が空ワークスペースで緑 |
+| 0 | 新リポジトリ作成、`10-protocol/` を `spec/` として配置、ADR 配置、CI 骨格(fmt / clippy / MSRV / aarch64 クロスビルド / conformance)、**quiche spike**(サーバ側 early data 受理と 1-RTT ゲート、stateless retry、tokio current_thread 上での quiche 駆動、`UdpSocket::try_io` 経由の GSO 送信、`spawn_blocking` 往復コストの粗い計測) | spike の結果を ADR-001 に追記。CI が空ワークスペースで緑 |
 | 1 | `qftp-wire`(型、手書き codec、検証、定数、`tests/conformance.rs`、`examples/gen_vectors.rs`)、fuzz(request / response deser) | 全ベクタで双方向一致。旧フレーム(末尾フィールドなし)を新デコーダが読むケースをベクタ化 |
 | 2 | `qftp-core`(path / user / identity / fs_ops(Ls ページング)/ transfer エンジン / compress / temp)を**ユニットテストのみ**で完成 | 純メモリホストで Get / Put の全経路(再開・圧縮・全失敗分類)をテスト。プロトタイプ評価文書 §9 の G1・G6・G8・G12・G13 が設計どおり |
 | 3 | `qftp-quic` + `qftp-server`(MVP 機能)+ `qftp-e2e`(フィクスチャと e2e) | e2e: Ls ページング、Get / Put 往復、再開 3 種、zstd、mTLS(拒否 / Ambiguous)、retry、0-RTT 拒否、レート制限、接続上限、STOP_SENDING 耐性、graceful shutdown、HOL(大転送中の Ls 応答時間) |

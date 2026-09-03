@@ -6,8 +6,8 @@
 |---|---|---|---|---|
 | 1 | `qftp-wire` | lib | ワイヤ型、手書き codec、フィールド検証、定数。`tests/conformance.rs` でゴールデンベクタを検証し、`examples/gen_vectors.rs` でベクタを再生成する | なし |
 | 2 | `qftp-core` | lib | パスサンドボックス、ユーザ / ACL / クォータ、identity 抽出、メタデータ操作(Ls ページング)、sans-I/O 転送エンジン、zstd、temp 名規則、掃除 | wire |
-| 3 | `qftp-quic` | lib | quiche 設定、TLS モード、stateless retry、SCID 導出、0-RTT ポリシー、mio イベントループ骨格、quiche ストリーム上のフレーム送受信、GSO、接続上限・レートバケット | wire |
-| 4 | `qftp-server` | lib + bin | 設定、受付、コネクション / ストリーム dispatch、I/O ワーカープール、転送エンジンのホスト、メトリクス、シャットダウン。`run(config)` を公開 | core, quic |
+| 3 | `qftp-quic` | lib | quiche 設定、TLS モード、stateless retry、SCID 導出、0-RTT ポリシー、tokio(current_thread)上の quiche ドライバ、quiche ストリーム上のフレーム送受信、GSO、接続上限・レートバケット | wire |
+| 4 | `qftp-server` | lib + bin | 設定、受付、コネクション / ストリーム dispatch、転送エンジンのホスト(ファイル I/O は `spawn_blocking`)、メトリクス、シャットダウン。`run(config)` を公開 | core, quic |
 | 5 | `qftp-client-core` | lib | Session API、サーバ信頼ポリシー(CA / TOFU / insecure)、セッションチケット、設定解決、再開ロジック、クライアント側エンジンのホスト | core, quic |
 | 6 | `qftp-client` | bin | CLI、REPL、one-shot、出力整形と終了コード。Phase 6: sync / watch | client-core |
 | 7 | `qftp-admin` | bin | users.toml / tokens.toml 編集 | core |
@@ -54,9 +54,9 @@ qftp/
 │   │   └── src/{lib,path,user,identity,fs_ops,compress,temp,sweep}.rs
 │   │       src/transfer/{mod,server,client,event,cmd,accounting}.rs
 │   ├── qftp-quic/
-│   │   └── src/{lib,config,tls,retry,scid,zero_rtt,event_loop,framing,egress,limits}.rs
+│   │   └── src/{lib,config,tls,retry,scid,zero_rtt,driver,framing,egress,limits}.rs
 │   ├── qftp-server/
-│   │   └── src/{lib,main,config,accept,connection,dispatch,io_pool,host,metrics,health,shutdown}.rs
+│   │   └── src/{lib,main,config,accept,connection,dispatch,host,metrics,health,shutdown}.rs
 │   ├── qftp-client-core/
 │   │   └── src/{lib,session,trust,tickets,config,resume,host,options}.rs
 │   ├── qftp-client/
@@ -93,6 +93,7 @@ qftp-wire, qftp-core ◀── fuzz
 - `qftp-wire` は QUIC・tokio・ファイルシステム・blake3 に依存しない。
 - `qftp-core` は quiche を知らない(sans-I/O)。
 - `qftp-quic` はファイルシステムを知らない。
+- tokio はネイティブ側では `current_thread` ランタイムで使い、接続状態を複数スレッドで共有しない。
 - バイナリの `main` は「設定を読む → ライブラリの `run` を呼ぶ」だけにする。
 
 ## モジュール骨子
@@ -101,8 +102,8 @@ qftp-wire, qftp-core ◀── fuzz
 |---|---|
 | `qftp-wire` | `message`(Request / Response / ErrorCode / ErrorDetails / DirEntry / FileStat / FileType / HashAlgorithm / Encoding)、`codec`(`WireEncode` / `WireDecode`、フレーム長プレフィクス、寛容デコード)、`limits`、`validate`(フィールド上限、安全名) |
 | `qftp-core` | `path`(walk_safe / resolve / resolve_parent / recheck)、`user`(schema / directory / quota / claim)、`identity`(x509 → 候補 → 解決)、`fs_ops`(Ls ページング / Stat / Mkdir / Rmdir / Rm / Rename / Chmod / Quota)、`transfer::{server, client, event, cmd, accounting}`、`compress`、`temp`(`TempName`)、`sweep` |
-| `qftp-quic` | `config`(transport parameters、サーバ / クライアント)、`tls`(materials / self_signed / modes)、`retry`、`scid`、`zero_rtt`、`event_loop`(mio、Waker、timers)、`framing`、`egress`(GSO)、`limits` |
-| `qftp-server` | `config`、`accept`、`connection`、`dispatch`、`io_pool`、`host`、`metrics`、`health`、`shutdown` |
+| `qftp-quic` | `config`(transport parameters、サーバ / クライアント)、`tls`(materials / self_signed / modes)、`retry`、`scid`、`zero_rtt`、`driver`(tokio current_thread、UDP 受送信、timers)、`framing`、`egress`(GSO)、`limits` |
+| `qftp-server` | `config`、`accept`、`connection`、`dispatch`、`host`、`metrics`、`health`、`shutdown` |
 | `qftp-client-core` | `session`、`trust`、`tickets`、`config`、`resume`、`host`、`options` |
 | `qftp-client` | `cli`、`repl::{parser, commands, completer}`、`oneshot`、`output`、Phase 6: `sync`、`watch` |
 | `qftp-e2e` | `server_fixture`(プロセス内 `run`)、`client`(Session ラッパ)、`certs`(rcgen)、`fs`(一時ディレクトリ、乱数ファイル) |
