@@ -6,7 +6,7 @@
 
 正本の扱いは次のとおりです。
 
-- **ワイヤプロトコル**は本パッケージの `10-protocol/`(仕様書とゴールデンベクタ)が正本であり、本書 §2 はその要約です。矛盾があれば `10-protocol/` が優先します。
+- **ワイヤプロトコル**は本パッケージの `10-protocol/`(仕様書とゴールデンベクタ)が正本であり、本書はプロトコルを要約しません。
 - **サーバ / クライアント / Web ブリッジの挙動**は正本となる文書が存在しないため、本書がコードから起こした初版の仕様書になります。「実装がそうなっている」ことと「そうあるべき」ことを区別するため、疑わしい挙動は §9 の不整合一覧に分離しました。
 
 ---
@@ -39,81 +39,9 @@
 
 ---
 
-## 2. プロトコル仕様(`10-protocol/` の要約)
+## 2. プロトコル仕様
 
-### 2.1 トランスポート
-
-- UDP + QUIC v1(RFC 9000)、TLS 1.3 必須、ALPN `qftp/1`。バージョン交渉は ALPN そのもので、不一致はハンドシェイク失敗になります。
-- コマンドごとにクライアント発の双方向ストリーム 1 本(ID 0, 4, 8, …)。最初のフレームは必ず `Request`、サーバは `Response` を 1 つ以上返します。
-- `Get` / `Put` の本体バイト列は、制御フレームの直後に**同一ストリーム**へ流れます。
-
-### 2.2 フレーミングと符号化
-
-- フレーム = 4 バイト**ビッグエンディアン**長 + ペイロード。長さ上限 16 MiB。超過は読まずに拒否。
-- ペイロード内の整数はすべて**リトルエンディアン**固定幅。`string` / `seq` は u64 長プレフィクス、`Option` は 1 バイトタグ、`bool` は 0/1 のみ。位置依存(positional)でフィールド名やタグを持ちません。
-- 参照実装は bincode 1.x(fixint, LE)で同一バイト列を得ていますが、仕様上 bincode は非規範です。
-- 位置依存 enum(`Request` / `Response` / `ErrorDetails`)の未知判別子は `Malformed`。数値 enum(`ErrorCode` / `FileType` / `HashAlgorithm` / `Encoding`)の未知値は `Unknown(n)` として保持します。
-- フィールド上限(SHOULD): パス系 4,096 バイト、エラーメッセージ 1,024 バイト、`DirListing` 100,000 エントリ/ページ。
-
-### 2.3 メッセージ一覧
-
-`Request`(判別子順): `Ls{path,cursor}`=0, `Cd{path}`=1, `Pwd`=2, `Get{path,offset,length,accept_encoding}`=3, `Put{path,size,mode,offset,hash_algorithm,checksum,no_clobber,checksum_trailer,encoding,plaintext_size}`=4, `Mkdir`=5, `Rmdir`=6, `Rm`=7, `Rename{from,to}`=8, `Chmod{path,mode}`=9, `Stat`=10, `Quota`=11, `Quit`=12。
-
-`Response`: `Ok`=0, `Err(ErrorResponse)`=1, `DirListing{entries,next_cursor}`=2, `Path(string)`=3, `FileStat`=4, `FileReady{size,total_size,checksum_follows,hash_algorithm,encoding,plaintext_size}`=5, `QuotaInfo{used_bytes,file_count,limit_bytes}`=6。
-
-`DirEntry{name,file_type,size,modified,mtime_nanos,uid,gid,mode}`、`FileStat` は `name` を除いた同形。`ErrorResponse{code:u32,message,details:Option<ErrorDetails>}`、`ErrorDetails` = `Range{offset,file_size}` / `Upload{received,declared}` / `RetryAfter{millis}`。
-
-### 2.4 エラーコード(HTTP 類似の数値)
-
-400 Malformed / 401 Unauthorized / 403 PermissionDenied / 404 NotFound / 405 Unsupported / 409 AlreadyExists / 413 FileTooLarge / 416 InvalidRange / 420 NotADirectory / 421 IsADirectory / 422 ChecksumMismatch / 423 UploadOverflow / 424 UploadTruncated / 429 RateLimited / 430 QuotaExceeded / 431 DecodeError / 500 Internal。
-
-再試行規則: 4xx は再試行禁止、429 と 5xx はバックオフ付き再試行、0-RTT 拒否由来の 405 のみ**即時**再試行。
-
-### 2.5 パス解決(規範)
-
-- ユーザごとのルート(home)が `/` であり、それより上は名前付けできません。
-- コネクション単位の cwd を持ち、`Cd` 成功時のみ変化します。`/` 始まりはルートから、それ以外は cwd から解決。
-- `..` でルートを越える試みは `PermissionDenied`(クランプしない)。
-- **パス中のシンボリックリンクはどの位置でも拒否**(参照実装の保守的選択。`openat2(RESOLVE_BENEATH)` 相当があれば許容可)。
-- `Pwd` の返す `Response::Path` は仮想絶対パスであり、サーバ実パスを露出してはなりません。
-- `Cd` と並行するストリームの解決先は未規定(参照クライアントは逐次実行)。
-
-### 2.6 Get
-
-`Get{path,offset,length,accept_encoding}` → `FileReady` → 本体 → (checksum_follows なら)32 バイト BLAKE3 トレーラ → FIN。
-
-- トレーラは **`[0, offset + body長)` の累積平文ダイジェスト**。再開時は両端が `[0,offset)` を再ハッシュするため、サーバ側ファイルが同サイズで差し替わっても検出できます。再開 Get で `checksum_follows=false` は禁止。
-- `total_size` が `offset` 未満(縮小)は `InvalidRange`。
-- 圧縮: クライアントが `accept_encoding` で優先順に提示し、サーバが 1 つ選択(小さいファイル・既圧縮拡張子は Identity に縮退可)。Zstd の場合、本体は自己終端の単一 zstd フレームで `size == plaintext_size`。
-
-### 2.7 Put
-
-`Put{...}` → 本体 → (checksum_trailer なら)トレーラ → FIN → `Ok` / `Err`。
-
-- 再開: サーバは宛先から決定的に導いた `<name>.qftp.partial` を保持し、クライアントは `Stat` でその長さを得て `offset` に送ります。`offset>0` では partial の長さが `offset` に一致しない場合 `InvalidRange`。
-- チェックサム: ヘッダ `checksum` とストリームトレーラの 2 経路、どちらも**フルファイル**のダイジェスト。トレーラが完全に届けば優先、途中 FIN は `UploadTruncated`(ヘッダへの黙ったフォールバック禁止)。
-- **検証必須の形**: 再開(`offset>0`)と圧縮(`encoding != Identity`)はチェックサムなしを `Unsupported` で拒否。圧縮 Put は `size == plaintext_size` 必須(違反は `Malformed`)。
-- `no_clobber=true` で既存なら `AlreadyExists`。成功時は temp を原子的に rename し `mode` を適用。
-
-### 2.8 圧縮(zstd)
-
-- コーデックは zstd 単独、既定 level 3、`window_log = 23`(8 MiB)を凍結値としてエンコーダ強制・デコーダ上限。辞書なし、転送ごとに独立フレーム、再開時はテール部分のみ独立フレーム。
-- 転送ドメインは常に平文(`offset`、`.partial`、クォータ、トレーラすべて平文基準)。伸長爆弾対策として `plaintext_size` と `MAX_FILE_SIZE` で出力を打ち切り、超過は `UploadOverflow`、不正フレームは `DecodeError`。
-
-### 2.9 0-RTT / retry / レート制限 / 接続 ID
-
-- 0-RTT 許可リストは `Cd` / `Pwd` / `Stat` / `Quit` のみ(小さな固定長応答)。`Ls` / `Get` / `Quota` は増幅対策で拒否、書き込み系は再生対策で拒否。**mTLS 必須または名前付きユーザが設定されたサーバは全 early data を拒否**(identity gate)。
-- stateless retry は任意(参照サーバは `--require-retry`)。トークン形式は実装定義(HMAC)。
-- レート制限は Initial 単位(黙って破棄)と要求単位(`RateLimited` + `RetryAfter`)の 2 層。既定 50 req/s、バースト 100。
-- サーバ SCID は `HMAC-SHA256(seed, client_dcid)` から決定的に導出(再送 Initial の重複接続防止)。
-
-### 2.10 実装定義パラメータ
-
-`initial_max_streams_bidi=4`、`max_idle_timeout=30s`、ストリーム窓 16 MiB、接続窓 64 MiB、pacing off、keepalive なし(ブリッジのみ 15 s)、active migration 無効、最大ファイルサイズ 1 GiB、パスは UTF-8 前提(非 UTF-8 は lossy)。
-
-### 2.11 qftp/2 へ先送りされた項目
-
-自己記述エンコーディング(CBOR / Protobuf 系)、varint、帯域内 capability 交渉、メッセージ層 MAC / 署名マニフェスト、`Copy` / `Symlink` / `Transaction` 操作。
+ワイヤプロトコルは本パッケージの `10-protocol/`(Markdown 仕様書とゴールデンベクタ)が正本で、図解版 `qftp-protocol-guide.html` があります。本書では要約しません。
 
 ---
 
