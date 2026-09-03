@@ -1,0 +1,228 @@
+{
+  "protocol": "qftp/1",
+  "kind": "Response",
+  "note": "One Response::Err per ErrorCode with an empty message, so the on-wire discriminant of every code is fixed and validated. wire_hex = 4-byte big-endian length prefix + payload; see spec/wire-format.md for the normative byte layout.",
+  "vectors": [
+    {
+      "name": "err_NotFound",
+      "description": "Response::Err carrying ErrorCode::NotFound (empty message).",
+      "value": {
+        "Err": {
+          "code": 404,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "0100000094010000000000000000000000",
+      "wire_hex": "000000110100000094010000000000000000000000"
+    },
+    {
+      "name": "err_PermissionDenied",
+      "description": "Response::Err carrying ErrorCode::PermissionDenied (empty message).",
+      "value": {
+        "Err": {
+          "code": 403,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "0100000093010000000000000000000000",
+      "wire_hex": "000000110100000093010000000000000000000000"
+    },
+    {
+      "name": "err_AlreadyExists",
+      "description": "Response::Err carrying ErrorCode::AlreadyExists (empty message).",
+      "value": {
+        "Err": {
+          "code": 409,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "0100000099010000000000000000000000",
+      "wire_hex": "000000110100000099010000000000000000000000"
+    },
+    {
+      "name": "err_NotADirectory",
+      "description": "Response::Err carrying ErrorCode::NotADirectory (empty message).",
+      "value": {
+        "Err": {
+          "code": 420,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000a4010000000000000000000000",
+      "wire_hex": "0000001101000000a4010000000000000000000000"
+    },
+    {
+      "name": "err_IsADirectory",
+      "description": "Response::Err carrying ErrorCode::IsADirectory (empty message).",
+      "value": {
+        "Err": {
+          "code": 421,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000a5010000000000000000000000",
+      "wire_hex": "0000001101000000a5010000000000000000000000"
+    },
+    {
+      "name": "err_FileTooLarge",
+      "description": "Response::Err carrying ErrorCode::FileTooLarge (empty message).",
+      "value": {
+        "Err": {
+          "code": 413,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "010000009d010000000000000000000000",
+      "wire_hex": "00000011010000009d010000000000000000000000"
+    },
+    {
+      "name": "err_UploadOverflow",
+      "description": "Response::Err carrying ErrorCode::UploadOverflow (empty message).",
+      "value": {
+        "Err": {
+          "code": 423,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000a7010000000000000000000000",
+      "wire_hex": "0000001101000000a7010000000000000000000000"
+    },
+    {
+      "name": "err_UploadTruncated",
+      "description": "Response::Err carrying ErrorCode::UploadTruncated (empty message).",
+      "value": {
+        "Err": {
+          "code": 424,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000a8010000000000000000000000",
+      "wire_hex": "0000001101000000a8010000000000000000000000"
+    },
+    {
+      "name": "err_DecodeError",
+      "description": "Response::Err carrying ErrorCode::DecodeError (empty message).",
+      "value": {
+        "Err": {
+          "code": 431,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000af010000000000000000000000",
+      "wire_hex": "0000001101000000af010000000000000000000000"
+    },
+    {
+      "name": "err_ChecksumMismatch",
+      "description": "Response::Err carrying ErrorCode::ChecksumMismatch (empty message).",
+      "value": {
+        "Err": {
+          "code": 422,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000a6010000000000000000000000",
+      "wire_hex": "0000001101000000a6010000000000000000000000"
+    },
+    {
+      "name": "err_RateLimited",
+      "description": "Response::Err carrying ErrorCode::RateLimited (empty message).",
+      "value": {
+        "Err": {
+          "code": 429,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000ad010000000000000000000000",
+      "wire_hex": "0000001101000000ad010000000000000000000000"
+    },
+    {
+      "name": "err_Malformed",
+      "description": "Response::Err carrying ErrorCode::Malformed (empty message).",
+      "value": {
+        "Err": {
+          "code": 400,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "0100000090010000000000000000000000",
+      "wire_hex": "000000110100000090010000000000000000000000"
+    },
+    {
+      "name": "err_Internal",
+      "description": "Response::Err carrying ErrorCode::Internal (empty message).",
+      "value": {
+        "Err": {
+          "code": 500,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000f4010000000000000000000000",
+      "wire_hex": "0000001101000000f4010000000000000000000000"
+    },
+    {
+      "name": "err_Unauthorized",
+      "description": "Response::Err carrying ErrorCode::Unauthorized (empty message).",
+      "value": {
+        "Err": {
+          "code": 401,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "0100000091010000000000000000000000",
+      "wire_hex": "000000110100000091010000000000000000000000"
+    },
+    {
+      "name": "err_InvalidRange",
+      "description": "Response::Err carrying ErrorCode::InvalidRange (empty message).",
+      "value": {
+        "Err": {
+          "code": 416,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000a0010000000000000000000000",
+      "wire_hex": "0000001101000000a0010000000000000000000000"
+    },
+    {
+      "name": "err_Unsupported",
+      "description": "Response::Err carrying ErrorCode::Unsupported (empty message).",
+      "value": {
+        "Err": {
+          "code": 405,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "0100000095010000000000000000000000",
+      "wire_hex": "000000110100000095010000000000000000000000"
+    },
+    {
+      "name": "err_QuotaExceeded",
+      "description": "Response::Err carrying ErrorCode::QuotaExceeded (empty message).",
+      "value": {
+        "Err": {
+          "code": 430,
+          "details": null,
+          "message": ""
+        }
+      },
+      "payload_hex": "01000000ae010000000000000000000000",
+      "wire_hex": "0000001101000000ae010000000000000000000000"
+    }
+  ]
+}
