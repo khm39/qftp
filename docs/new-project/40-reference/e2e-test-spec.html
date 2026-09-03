@@ -54,7 +54,7 @@ td.k{white-space:nowrap}.tag{display:inline-block;font-size:11px;padding:0 7px;b
 </style></head><body><main>
 <header class="doc"><div class="kind">参照文書</div><h1>e2e テスト仕様</h1><div class="meta">作成日: 2026-09-03 / 対象: WIRE / CORE / E2E / CLI の各層の受け入れテスト</div></header>
 <nav class='toc'><b>目次</b><ol><li><a href="#scope">位置づけとフィクスチャ</a></li><li><a href="#wire">WIRE: 符号化</a></li><li><a href="#core">CORE: エンジンとサンドボックス</a></li><li><a href="#e2e">E2E: サーバ + クライアントコア</a></li><li><a href="#cli">CLI: バイナリの振る舞い</a></li><li><a href="#bench">ベンチ(参考、CI 外)</a></li></ol></nav><section id="scope"><h2>位置づけとフィクスチャ</h2>
-<p>本書は自動テストの受け入れ条件です。ID は実装のテスト名(<code>#[test] fn e2e_get_02_resume_prefix()</code> など)に対応させ、CI で全件が緑であることを各フェーズの完了条件とします。</p>
+<p>本書は自動テストの受け入れ条件です。ID は実装のテスト名(<code>#[test] fn e2e_get_02_resume_prefix()</code> など)に対応させ、CI で全件が緑であることを受け入れ条件とします。</p>
 <table class=""><thead><tr><th>層</th><th>場所</th><th>実行方法</th></tr></thead><tbody><tr><td>WIRE</td><td><code>qftp-wire/tests/conformance.rs</code> + proptest</td><td><code>cargo test -p qftp-wire</code></td></tr><tr><td>CORE</td><td><code>qftp-core/tests/</code>(純メモリホスト <code>ScriptHost</code>)</td><td><code>cargo test -p qftp-core</code></td></tr><tr><td>E2E</td><td><code>qftp-server/tests/</code>(<code>test-util</code> フィクスチャ + <code>qftp-client-core</code>)</td><td><code>cargo test -p qftp-server</code></td></tr><tr><td>CLI</td><td><code>qftp-client/tests/</code>(バイナリを subprocess で起動、サーバは test-util)</td><td><code>cargo test -p qftp-client</code></td></tr></tbody></table>
 <pre class="code"><code>// qftp-server::test_util(feature = &quot;test-util&quot;)
 pub struct Fixture { pub addr: SocketAddr, pub root: TempDir, pub ca: Certs, /* … */ }

@@ -1,6 +1,6 @@
 DOC_TYPE="feature"; TITLE="qftp-web-bridge(WebTransport ブリッジ)"; FILENAME="feature-web-bridge.html"
 ANSWERS={
-"overview.name":"<p>qftp-web-bridge: ブラウザから qftp を利用するための WebTransport(HTTP/3)終端。Phase 7。</p>",
+"overview.name":"<p>qftp-web-bridge: ブラウザから qftp を利用するための WebTransport(HTTP/3)終端。Web 区分。</p>",
 "overview.purpose":"<p>クライアント証明書を出せないブラウザに、ベアラトークン認証で同じストレージを公開する。転送エンジンを共有し、ネイティブとの機能差(再開・圧縮・Cd)をなくす。</p>",
 "overview.target-user":"<p>ブラウザ利用者(Chrome / Edge / Firefox。Safari は WebTransport 非対応)。</p>",
 "overview.use-case":"<ol><li>社内ポータルからのファイル取得。</li><li>外部協力者へのアップロード窓口(トークン + origin 制限)。</li></ol>",
@@ -20,7 +20,7 @@ ANSWERS={
 "impact.external-systems":"<p>リバースプロキシ(nginx 等、静的配信のみ。WebTransport は中継されない)。</p>",
 "impact.data-changes":"<p>tokens.toml(ハッシュ形式)。</p>",
 "risks.risks":"<ul><li>quinn 系スタックがワークスペースに残る(MSRV 差、依存重複)。ブリッジをビルドしない構成(feature / 別ワークスペース)を用意して、ネイティブだけの利用者に負担を掛けない。</li><li>ブラウザ側の codec / BLAKE3 / zstd を JS で持つか WASM で共有するかで保守性が大きく変わる。</li></ul>",
-"risks.alternatives":"<ul><li>ブリッジを廃止し、ブラウザ利用は WebDAV 等の別プロダクトに委ねる。</li><li><code>qftp-wire</code> + blake3 + zstd を WASM 化して SPA と共有(推奨、Phase 7 で評価)。</li></ul>",
-"references.docs":"<ul><li><a href=\"feature-transfer-engine.html\">転送エンジン</a>、<a href=\"../40-reference/engine-api.html\">転送エンジン API 仕様</a></li><li><a href=\"../40-reference/file-formats.html#tokens\">tokens.toml の形式</a></li><li>画面設計書は Phase 7 開始時にテンプレートから作成する</li></ul>",
+"risks.alternatives":"<ul><li>ブリッジを廃止し、ブラウザ利用は WebDAV 等の別プロダクトに委ねる。</li><li><code>qftp-wire</code> + blake3 + zstd を WASM 化して SPA と共有(推奨、Web 区分で評価)。</li></ul>",
+"references.docs":"<ul><li><a href=\"feature-transfer-engine.html\">転送エンジン</a>、<a href=\"../40-reference/engine-api.html\">転送エンジン API 仕様</a></li><li><a href=\"../40-reference/file-formats.html#tokens\">tokens.toml の形式</a></li><li>画面設計書は Web 区分の着手時にテンプレートから作成する</li></ul>",
 "references.artifacts":"<p>N/A</p>",
 }

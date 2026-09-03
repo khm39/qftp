@@ -129,7 +129,7 @@ pub enum GetState { Prefix, Body, Trailer, Done, Failed }''')}
  ["Trailer","SendCapacity","トレーラ(digest_len バイト)を <code>Send{fin:true}</code>。送り切ったら <code>Done(Completed)</code>","Done"],
  ["任意","Cancel","<code>Done(Cancelled)</code>","Done"],
 ])}
-<p>Identity で <code>bytes == 0</code> のときは本体フェーズを飛ばし、トレーラだけを送ります。Zstd で 0 のときは空の zstd フレームを送ってからトレーラを送ります。<code>Send</code> の合計は常に <code>SendCapacity</code> の現在値以下で、ホストは <code>Send</code> を必ず全量受理します。</p>
+<p>Identity で <code>bytes == 0</code> のときは本体区分を飛ばし、トレーラだけを送ります。Zstd で 0 のときは空の zstd フレームを送ってからトレーラを送ります。<code>Send</code> の合計は常に <code>SendCapacity</code> の現在値以下で、ホストは <code>Send</code> を必ず全量受理します。</p>
 """))
 S.append(("put-server","PutServer",f"""
 {code('''pub struct PutParams {

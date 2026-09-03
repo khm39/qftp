@@ -27,7 +27,7 @@ Client                                     Server
 12. ◀── trailer(32B) + FIN ────────────────  12. Send(trailer, fin)
 13. hash == trailer ? 確定 : ローカル削除 (65)
 </pre>""",
-"steps.sync-async":"<ul><li>クライアントは要求を送ったあと、FileReady・本体・トレーラを 1 ストリーム上で順次受ける(非同期到着、エンジンは <code>Event::Bytes</code> で処理)。</li><li>サーバのファイル読み取りはブロッキングプールへの非同期要求。</li><li>クライアントのローカル書込は Phase 4 では同期(ダウンロード側の HOL は単一要求のため問題にならない)。</li></ul>",
+"steps.sync-async":"<ul><li>クライアントは要求を送ったあと、FileReady・本体・トレーラを 1 ストリーム上で順次受ける(非同期到着、エンジンは <code>Event::Bytes</code> で処理)。</li><li>サーバのファイル読み取りはブロッキングプールへの非同期要求。</li><li>クライアントのローカル書込は 初版では同期(ダウンロード側の HOL は単一要求のため問題にならない)。</li></ul>",
 "steps.state-transitions":"""<table><tr><th>GetServer 状態</th><th>遷移</th></tr>
 <tr><td>Start</td><td>検証 OK → Prefix(offset&gt;0) / Body(offset=0)</td></tr>
 <tr><td>Prefix</td><td>ReadDone で残り 0 → Body</td></tr>

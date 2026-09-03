@@ -3,7 +3,7 @@ OUT="/tmp/claude-0/-home-user-qftp/96263040-8562-5047-8304-4e5f08fbf7fd/scratchp
 S=[]
 def cases(rows): return table(["ID","前提","手順","期待"],rows)
 S.append(("scope","位置づけとフィクスチャ",f"""
-<p>本書は自動テストの受け入れ条件です。ID は実装のテスト名(<code>#[test] fn e2e_get_02_resume_prefix()</code> など)に対応させ、CI で全件が緑であることを各フェーズの完了条件とします。</p>
+<p>本書は自動テストの受け入れ条件です。ID は実装のテスト名(<code>#[test] fn e2e_get_02_resume_prefix()</code> など)に対応させ、CI で全件が緑であることを受け入れ条件とします。</p>
 {table(["層","場所","実行方法"],[
  ["WIRE","<code>qftp-wire/tests/conformance.rs</code> + proptest","<code>cargo test -p qftp-wire</code>"],
  ["CORE","<code>qftp-core/tests/</code>(純メモリホスト <code>ScriptHost</code>)","<code>cargo test -p qftp-core</code>"],

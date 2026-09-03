@@ -28,7 +28,7 @@ qftp-server --check-config [--config <path>] [フラグ…]
 qftp-server --generate-completions <bash|zsh|fish|powershell>
 qftp-server --version | --long-version''')}
 <p>フラグは設定リファレンスのキーと 1:1 で対応します(例: <code>limits.max_connections</code> → <code>--max-connections</code>)。フラグは設定ファイルの値を上書きします。終了コード: 0 正常終了(シグナルによる graceful を含む)、1 設定 / 起動失敗、2 実行時致命エラー(bind 喪失など)。</p>
-{table(["シグナル","動作"],[["SIGTERM / SIGINT","graceful shutdown(新規拒否 → 転送完了待ち → <code>shutdown_timeout</code> で強制)"],["SIGHUP","将来: users.toml 再読込。MVP では無視"]])}
+{table(["シグナル","動作"],[["SIGTERM / SIGINT","graceful shutdown(新規拒否 → 転送完了待ち → <code>shutdown_timeout</code> で強制)"],["SIGHUP","将来: users.toml 再読込。コア区分では無視"]])}
 """))
 S.append(("client-global","qftp-client: 起動形態とグローバルフラグ",f"""
 {code('''qftp-client [フラグ…] [TARGET]                       # REPL(TARGET 省略時は 127.0.0.1:4433)
@@ -62,14 +62,14 @@ S.append(("oneshot","qftp-client: one-shot サブコマンド",f"""
 {table(["サブコマンド","引数","オプション","動作"],[
  ["<code>ls</code>","REMOTE","<code>-l</code>(詳細)、<code>-a</code>(temp を含めない、常に)","全ページを取得して表示"],
  ["<code>stat</code>","REMOTE","","1 件のメタデータ"],
- ["<code>get</code>","REMOTE [LOCAL]","<code>-r</code>(Phase 5)、<code>-n/--no-clobber</code>、<code>-f/--force</code>、<code>-i/--interactive</code>、<code>--dry-run</code>","LOCAL 省略時はリモートの basename。既存があれば上書き規則に従い、規則が「再開」なら自動再開"],
+ ["<code>get</code>","REMOTE [LOCAL]","<code>-r</code>(拡張区分)、<code>-n/--no-clobber</code>、<code>-f/--force</code>、<code>-i/--interactive</code>、<code>--dry-run</code>","LOCAL 省略時はリモートの basename。既存があれば上書き規則に従い、規則が「再開」なら自動再開"],
  ["<code>put</code>","LOCAL… REMOTE","同上","REMOTE が <code>/</code> で終わる、または LOCAL が複数ならディレクトリ扱い。partial があれば再開"],
  ["<code>mkdir</code> / <code>rmdir</code> / <code>rm</code>","REMOTE","",""],
  ["<code>rename</code>","FROM TO","","同一ホスト(同一 alias または同一 host:port)必須"],
  ["<code>chmod</code>","MODE REMOTE","","8 進"],
  ["<code>quota</code>","REMOTE(ホストのみ)","",""],
- ["<code>sync</code>(Phase 6)","LOCAL_DIR REMOTE","<code>--delete</code>、<code>--dry-run</code>","ローカル → リモート一方向。<code>.qftpignore</code>。<code>--checksum</code> はない(ADR-010)"],
- ["<code>watch</code>(Phase 6)","LOCAL_DIR REMOTE","<code>--debounce &lt;dur&gt;</code>","変更を反映(Mkdir を含む)。再接続バックオフ 1→30 s"],
+ ["<code>sync</code>(同期区分)","LOCAL_DIR REMOTE","<code>--delete</code>、<code>--dry-run</code>","ローカル → リモート一方向。<code>.qftpignore</code>。<code>--checksum</code> はない(ADR-010)"],
+ ["<code>watch</code>(同期区分)","LOCAL_DIR REMOTE","<code>--debounce &lt;dur&gt;</code>","変更を反映(Mkdir を含む)。再接続バックオフ 1→30 s"],
 ])}
 <h3>上書き規則(get / put 共通)</h3>
 {table(["指定","既存ローカル(get)/ 既存リモート(put)","動作"],[

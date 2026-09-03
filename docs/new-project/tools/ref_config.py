@@ -6,7 +6,7 @@ S.append(("precedence","優先順位と読み込み規則",f"""
  ["qftp-server","<code>/etc/qftp/server.toml</code>(<code>--config</code> で上書き。ファイルがなければ既定値のみ)","CLI フラグ &gt; 設定ファイル &gt; 組込既定"],
  ["qftp-client","<code>~/.qftp/config.toml</code>(<code>--config</code>)","CLI フラグ &gt; コマンドライン URL &gt; <code>[host.alias]</code> の明示キー &gt; <code>[host.alias].endpoint</code> &gt; <code>[defaults]</code> &gt; 組込既定"],
  ["qftp-admin","<code>/etc/qftp/users.toml</code>、<code>/etc/qftp/tokens.toml</code>(<code>--users</code>、<code>--tokens</code>)","CLI フラグのみ"],
- ["qftp-web-bridge(Phase 7)","<code>/etc/qftp/web-bridge.toml</code>","サーバと同じ"],
+ ["qftp-web-bridge(Web 区分)","<code>/etc/qftp/web-bridge.toml</code>","サーバと同じ"],
 ])}
 {table(["規則","内容"],[
  ["未知キー","エラー(<code>deny_unknown_fields</code>)。綴り間違いを黙って無視しない"],
@@ -128,7 +128,7 @@ S.append(("admin","qftp-admin / qftp-web-bridge",f"""
  ["qftp-admin","<code>--tokens &lt;path&gt;</code>","<code>/etc/qftp/tokens.toml</code>"],
  ["qftp-admin","<code>--mode &lt;octal&gt;</code>","0600(書込後のファイルモード)"],
 ])}
-{code('''# /etc/qftp/web-bridge.toml(Phase 7)
+{code('''# /etc/qftp/web-bridge.toml(Web 区分)
 bind = "0.0.0.0:4433"
 http_bind = "127.0.0.1:8080"      # 開発用 SPA 配信。省略時は無効
 root = "/srv/qftp"

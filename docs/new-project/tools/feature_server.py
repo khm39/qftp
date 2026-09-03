@@ -19,8 +19,8 @@ ANSWERS={
 "impact.affected-features":"<ul><li>転送エンジン(ホスト実装)。</li><li>qftp-admin(users.toml スキーマ互換)。</li><li>Web ブリッジ(同じ root / users.toml を共有。クォータは別プロセスで独立する制約を運用設計書に記載)。</li></ul>",
 "impact.external-systems":"<p>Prometheus、ログ集約、systemd。</p>",
 "impact.data-changes":"<p>ファイルシステムのみ。temp 規則はプロトタイプ互換。永続自己署名の保存先はプロトタイプ互換。</p>",
-"risks.risks":"<ul><li>quiche の early data 受理と 1-RTT ゲートの組み合わせを新構造で再現できるか(Phase 0 spike)。</li><li><code>spawn_blocking</code> の往復コストが小さな要求(Stat 等)で支配的にならないか。Phase 3 の e2e で計測し、必要なら小さなメタデータ操作はドライバタスク上で同期実行する。</li><li>GSO 送信を tokio の <code>UdpSocket::try_io</code> 経由で行う実装の検証(Phase 0 spike)。</li><li>Ls ページング中にエントリが増減した場合、名前順で「次」の意味は保たれるが、名前が変わったエントリは重複・欠落し得る(仕様上許容)。</li></ul>",
-"risks.alternatives":"<ul><li>tokio-quiche による非同期化(spike 次第)。</li><li>複数イベントループ + SO_REUSEPORT: QUIC の CID ルーティングと相性が悪く不採用。</li></ul>",
+"risks.risks":"<ul><li>quiche の early data 受理と 1-RTT ゲートの組み合わせを新構造で再現できるか(実装前の技術検証)。</li><li><code>spawn_blocking</code> の往復コストが小さな要求(Stat 等)で支配的にならないか。e2e で計測し、必要なら小さなメタデータ操作はドライバタスク上で同期実行する。</li><li>GSO 送信を tokio の <code>UdpSocket::try_io</code> 経由で行う実装の検証(実装前の技術検証)。</li><li>Ls ページング中にエントリが増減した場合、名前順で「次」の意味は保たれるが、名前が変わったエントリは重複・欠落し得る(仕様上許容)。</li></ul>",
+"risks.alternatives":"<ul><li>tokio-quiche による非同期化(技術検証の結果次第)。</li><li>複数イベントループ + SO_REUSEPORT: QUIC の CID ルーティングと相性が悪く不採用。</li></ul>",
 "references.docs":"<ul><li><a href=\"architecture-qftp.html\">アーキテクチャ設計書</a></li><li><a href=\"../40-reference/config-reference.html\">設定リファレンス</a>、<a href=\"../40-reference/cli-reference.html\">CLI リファレンス</a>、<a href=\"../40-reference/file-formats.html\">ファイル形式リファレンス</a>、<a href=\"../40-reference/e2e-test-spec.html\">e2e テスト仕様</a></li><li><a href=\"feature-transfer-engine.html\">転送エンジン</a></li><li><a href=\"sequence-connection-setup.html\">接続確立シーケンス</a></li><li><a href=\"operations-qftp-server.html\">運用設計書</a></li><li><a href=\"../10-protocol/qftp-protocol.md\">qftp-protocol.md</a></li></ul>",
 "references.artifacts":"<p>N/A</p>",
 }

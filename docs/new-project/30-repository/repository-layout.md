@@ -9,10 +9,10 @@
 | 3 | `qftp-quic` | lib | quiche 設定、TLS モード、stateless retry、SCID 導出、0-RTT ポリシー、tokio(current_thread)上の quiche ドライバ、quiche ストリーム上のフレーム送受信、GSO、接続上限・レートバケット | wire |
 | 4 | `qftp-server` | lib + bin | 設定、受付、コネクション / ストリーム dispatch、転送エンジンのホスト(ファイル I/O は `spawn_blocking`)、メトリクス、シャットダウン。`run(config)` を公開。`test-util` feature でプロセス内フィクスチャを公開し、`tests/` に e2e、`benches/` に criterion ベンチ(`test = false`)を置く(ADR-007) | core, quic(dev: client-core, rcgen, criterion) |
 | 5 | `qftp-client-core` | lib | Session API、サーバ信頼ポリシー(CA / TOFU / insecure)、セッションチケット、設定解決、再開ロジック、クライアント側エンジンのホスト | core, quic |
-| 6 | `qftp-client` | bin | CLI、REPL、one-shot、出力整形と終了コード。Phase 6: sync / watch | client-core |
+| 6 | `qftp-client` | bin | CLI、REPL、one-shot、出力整形と終了コード。同期区分: sync / watch | client-core |
 | 7 | `qftp-admin` | bin | users.toml / tokens.toml 編集 | core |
 
-補助: `fuzz/`(cargo-fuzz、ワークスペース内、`publish = false`。stable では `cargo check` のみ)。Phase 7 で `qftp-web-bridge`(bin、自クレートの `tests/` に e2e)を 8 番目として追加する。
+補助: `fuzz/`(cargo-fuzz、ワークスペース内、`publish = false`。stable では `cargo check` のみ)。Web 区分で `qftp-web-bridge`(bin、自クレートの `tests/` に e2e)を 8 番目として追加する。
 
 ### 統合した(作らない)クレート
 
@@ -43,8 +43,8 @@ qftp/
 ├── docs/
 │   ├── adr/                   # 00-background/decisions.md を 1 ADR 1 ファイルに分割
 │   ├── design/                # 20-design/*.html
-│   ├── background/            # prototype-assessment.md
-│   └── plan/                  # roadmap.md、本ファイル
+│   ├── reference/             # 40-reference/*.html
+│   └── repository-layout.md   # 本ファイル
 ├── crates/
 │   ├── qftp-wire/
 │   │   ├── src/{lib,message,codec,limits,validate}.rs
@@ -103,7 +103,7 @@ qftp-wire, qftp-core ◀── fuzz
 | `qftp-quic` | `config`(transport parameters、サーバ / クライアント)、`tls`(materials / self_signed / modes)、`retry`、`scid`、`zero_rtt`、`driver`(tokio current_thread、UDP 受送信、timers)、`framing`、`egress`(GSO)、`limits` |
 | `qftp-server` | `config`、`accept`、`connection`、`dispatch`、`host`、`metrics`、`health`、`shutdown` |
 | `qftp-client-core` | `session`、`trust`、`tickets`、`config`、`resume`、`host`、`options` |
-| `qftp-client` | `cli`、`repl::{parser, commands, completer}`、`oneshot`、`output`、Phase 6: `sync`、`watch` |
+| `qftp-client` | `cli`、`repl::{parser, commands, completer}`、`oneshot`、`output`、同期区分: `sync`、`watch` |
 | `qftp-server::test_util`(feature) | `fixture`(プロセス内 `run`、ポート自動割当、停止)、`certs`(rcgen: CA / サーバ / クライアント)、`fs`(一時ディレクトリ、乱数ファイル、破損 partial) |
 
 ## CI 構成

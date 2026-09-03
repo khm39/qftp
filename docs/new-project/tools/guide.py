@@ -244,7 +244,7 @@ sec("get","Get(ダウンロード)", f"""
 {getseq}{getlay}
 {table(["ケース","本体","トレーラ","FIN"],[
  ["Identity、size &gt; 0","ちょうど size バイト","checksum_follows なら 32 B","トレーラの最後(なければ本体の最後)"],
- ["Identity、size == 0","なし(本体フェーズをスキップ)","空の平文に対するダイジェスト","トレーラの最後(なければ空ストリーム)"],
+ ["Identity、size == 0","なし(本体区分をスキップ)","空の平文に対するダイジェスト","トレーラの最後(なければ空ストリーム)"],
  ["Zstd","1 個の自己終端 zstd フレーム(復号結果が plaintext_size バイト)。<code>size</code> はワイヤ長ではない","同上","同上"],
  ["Zstd、size == 0","空の zstd フレームを送る(受信側がフレーム境界を観測できるように)","同上","同上"],
  ["エラー","<code>FileReady</code> の代わりに <code>Response::Err</code> 1 つ、ストリーム終了","なし","Err の後"],
